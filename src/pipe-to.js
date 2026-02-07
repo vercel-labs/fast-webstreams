@@ -125,13 +125,14 @@ export function specPipeTo(source, dest, options = {}) {
             currentWrite = writer.write(value);
             currentWrite.catch(() => {}); // Error handled by writer.closed
             pendingWrites.push(currentWrite);
+            const w = currentWrite;
             currentWrite.then(
-              () => { const idx = pendingWrites.indexOf(currentWrite); if (idx !== -1) pendingWrites.splice(idx, 1); },
-              () => { const idx = pendingWrites.indexOf(currentWrite); if (idx !== -1) pendingWrites.splice(idx, 1); }
+              () => { const idx = pendingWrites.indexOf(w); if (idx !== -1) pendingWrites.splice(idx, 1); },
+              () => { const idx = pendingWrites.indexOf(w); if (idx !== -1) pendingWrites.splice(idx, 1); }
             );
-            return currentWrite.then(() => {
-              pipeLoop();
-            }, () => {});
+            // Per spec: don't wait for write to complete. Continue pump loop
+            // immediately. Backpressure is handled by writer.ready.
+            pipeLoop();
           },
           () => {} // Error handled by reader.closed
         );
