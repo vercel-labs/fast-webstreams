@@ -659,6 +659,7 @@ export class FastReadableStream {
   }
 
   get locked() {
+    if (this[kNativeOnly] && this[kMaterialized]) return this[kMaterialized].locked;
     return this[kLock] !== null;
   }
 
