@@ -130,7 +130,22 @@ export class FastTransformStreamDefaultController {
     if (this.#terminated) return;
     this.#terminated = true;
     this.#errored = true;
-    this.#nodeTransform.destroy(e);
+    // Error the readable side directly (set stored error + reject reader)
+    if (this.#transformStream) {
+      const readable = this.#transformStream.readable;
+      if (readable && !readable._errored) {
+        readable._storedError = e;
+        readable._errored = true;
+        const reader = readable[kLock];
+        if (reader) {
+          if (reader._settleClosedFromError) reader._settleClosedFromError(e);
+          if (reader._errorReadRequests) reader._errorReadRequests(e);
+        }
+      }
+    }
+    if (!this.#nodeTransform.destroyed) {
+      this.#nodeTransform.destroy(e);
+    }
     // Also error the writable side
     if (this.#transformStream && this.#transformStream._errorWritable) {
       this.#transformStream._errorWritable(e);

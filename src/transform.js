@@ -299,7 +299,24 @@ export class FastTransformStream {
         this.#writable._sinkAbort = (reason) => {
           if (transformSelf._cancelCalled) return undefined;
           transformSelf._cancelCalled = true;
-          return Reflect.apply(cancelFn, transformerObj, [reason]);
+          // Per spec: also error the readable side
+          const readable = transformSelf.readable;
+          try {
+            const result = Reflect.apply(cancelFn, transformerObj, [reason]);
+            // Normal path: error readable with abort reason
+            if (readable && readable._errored !== true) {
+              const ctrl = transformSelf._controller;
+              if (ctrl) try { ctrl.error(reason); } catch {}
+            }
+            return result;
+          } catch (e) {
+            // Cancel threw: error readable with THROWN error
+            if (readable && readable._errored !== true) {
+              const ctrl = transformSelf._controller;
+              if (ctrl) try { ctrl.error(e); } catch {}
+            }
+            throw e; // Propagate to abort rejection
+          }
         };
         this.#writable._underlyingSink = transformerObj;
       } else {
