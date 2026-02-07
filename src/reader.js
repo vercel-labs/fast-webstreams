@@ -13,6 +13,16 @@ function unwrapError(err) {
   return err;
 }
 
+/**
+ * Create a resolved promise with a read result { value, done }.
+ * Note: In pure JS, Promise.resolve() triggers the thenable check on the
+ * result object. This means WPT then-interception tests cannot pass in
+ * pure JS (native impls use internal FulfillPromise that bypasses this).
+ */
+function _resolveReadResult(value, done) {
+  return Promise.resolve({ value, done });
+}
+
 export class FastReadableStreamDefaultReader {
   #stream;
   #nodeReadable;
@@ -123,19 +133,20 @@ export class FastReadableStreamDefaultReader {
 
     // Check if destroyed (closed)
     if (nodeReadable.destroyed) {
-      return Promise.resolve({ value: undefined, done: true });
+      return _resolveReadResult(undefined, true);
     }
 
     // Tier 1: sync fast path — data already in buffer
     const chunk = nodeReadable.read();
     if (chunk !== null) {
-      // Node's internal maybeReadMore handles re-triggering pull after consumption
-      return Promise.resolve({ value: chunk, done: false });
+      // Notify transform controller that data was consumed (may clear backpressure)
+      if (stream._onPull) stream._onPull();
+      return _resolveReadResult(chunk, false);
     }
 
     // Check if ended
     if (nodeReadable.readableEnded) {
-      return Promise.resolve({ value: undefined, done: true });
+      return _resolveReadResult(undefined, true);
     }
 
     // Data not available yet — wait for 'readable', 'end', or 'close'
@@ -144,6 +155,10 @@ export class FastReadableStreamDefaultReader {
       const entry = { reject: null, cleanup: null };
       this.#pendingReads.push(entry);
 
+      // Notify transform controller that there's a pending read (clears backpressure)
+      // Must be called AFTER pushing to pendingReads so _pendingReadCount() is accurate
+      if (stream._onPull) stream._onPull();
+
       const onReadable = () => {
         cleanup();
         // Detach from pendingReads BEFORE read() to prevent _errorReadRequests
@@ -151,6 +166,7 @@ export class FastReadableStreamDefaultReader {
         removePending();
         const data = nodeReadable.read();
         if (data !== null) {
+          if (stream._onPull) stream._onPull();
           resolve({ value: data, done: false });
         } else if (nodeReadable.readableEnded || nodeReadable.destroyed) {
           resolve({ value: undefined, done: true });
@@ -247,6 +263,14 @@ export class FastReadableStreamDefaultReader {
       if (entry.reject) entry.reject(error);
     }
     this.#pendingReads = [];
+  }
+
+  /**
+   * Returns the number of pending read requests. Used by transform controller
+   * to compute accurate desiredSize (pending reads consume enqueued chunks).
+   */
+  _pendingReadCount() {
+    return this.#pendingReads.length;
   }
 
   /**

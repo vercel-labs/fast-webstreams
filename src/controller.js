@@ -125,6 +125,29 @@ export class FastTransformStreamDefaultController {
       throw new TypeError('Cannot enqueue to an errored stream');
     }
     this.#nodeTransform.push(chunk);
+    // Update transform backpressure after enqueue
+    this._updateBackpressure();
+  }
+
+  /**
+   * Update backpressure flag on the writable shell based on readable desiredSize.
+   * Per spec: TransformStreamSetBackpressure
+   */
+  _updateBackpressure() {
+    if (!this.#transformStream) return;
+    const writable = this.#transformStream.writable;
+    if (!writable || !writable._isTransformShell) return;
+    const t = this.#nodeTransform;
+    const desiredSize = t.readableHighWaterMark - t.readableLength;
+    const pendingReads = this.#transformStream.readable?.[kLock]?._pendingReadCount?.() || 0;
+    const effectiveDesiredSize = desiredSize + pendingReads;
+    const backpressure = effectiveDesiredSize <= 0;
+    if (writable._transformBackpressure !== backpressure) {
+      writable._transformBackpressure = backpressure;
+      if (!backpressure && writable._transformBackpressureResolve) {
+        writable._transformBackpressureResolve();
+      }
+    }
   }
 
   error(e) {
@@ -160,7 +183,11 @@ export class FastTransformStreamDefaultController {
     if (this.#terminated) return;
     this.#terminated = true;
     this.#nodeTransform.push(null);
-    // Per spec: terminate also errors the writable side
+    // Per spec: terminate also errors the writable side,
+    // UNLESS we're inside flush (writable is already closing)
+    if (this.#transformStream && this.#transformStream._flushStarted) {
+      return; // During flush, terminate only closes readable (writable close proceeds)
+    }
     const terminateError = new TypeError('TransformStream terminated');
     if (this.#transformStream && this.#transformStream._errorWritable) {
       this.#transformStream._errorWritable(terminateError);
@@ -176,7 +203,14 @@ export class FastTransformStreamDefaultController {
   get desiredSize() {
     const t = this.#nodeTransform;
     if (this.#terminated) return 0;
-    return t.readableHighWaterMark - t.readableLength;
+    const queueSize = t.readableLength;
+    // Account for pending reads that will consume chunks synchronously
+    // (per spec, enqueue with a pending read bypasses the queue).
+    const pendingReads = this.#transformStream
+      ? (this.#transformStream.readable?.[kLock]?._pendingReadCount?.() || 0)
+      : 0;
+    const effectiveQueueSize = Math.max(0, queueSize - pendingReads);
+    return t.readableHighWaterMark - effectiveQueueSize;
   }
 }
 

@@ -13,6 +13,19 @@ import { kWritableState, kStoredError, kNodeReadable } from './utils.js';
 
 const noop = () => {};
 
+/**
+ * Wait for all promises in a set to settle, resolving to undefined (not an array).
+ * Unlike Promise.all(), this avoids creating an intermediate array result that would
+ * trigger observable thenable resolution on Object.prototype.then monkey-patching.
+ */
+function _waitForAll(promiseSet) {
+  let p = Promise.resolve();
+  for (const w of promiseSet) {
+    p = p.then(() => w, () => w).then(noop, noop);
+  }
+  return p;
+}
+
 export function specPipeTo(source, dest, options = {}) {
   // Options are pre-evaluated by caller (pipeTo/pipeThrough) in spec order
   const preventClose = !!options.preventClose;
@@ -39,8 +52,18 @@ export function specPipeTo(source, dest, options = {}) {
       abortAlgorithm = () => {
         const error = signal.reason;
         const actions = [];
-        if (!preventAbort) actions.push(() => writer.abort(error));
-        if (!preventCancel) actions.push(() => reader.cancel(error));
+        if (!preventAbort) actions.push(() => {
+          // Abort on already-errored writable resolves (spec: no-op)
+          const state = dest[kWritableState];
+          if (state === 'closed' || state === 'errored') return Promise.resolve();
+          return writer.abort(error);
+        });
+        if (!preventCancel) actions.push(() => {
+          // Cancel on already-errored/closed readable resolves to avoid
+          // the automatic rejection overriding the abort signal error.
+          if (source._errored || source._closed) return Promise.resolve();
+          return reader.cancel(error);
+        });
         shutdownWithAction(
           () => Promise.all(actions.map(a => a())),
           true,
@@ -85,17 +108,7 @@ export function specPipeTo(source, dest, options = {}) {
       (storedError) => {
         // Source errored
         if (shuttingDown) return;
-        // Per spec: if dest already errored/erroring, dest error takes precedence
-        const destState = dest[kWritableState];
-        const destIsErroring = destState === 'erroring' || destState === 'errored';
-        if (destIsErroring || destErrored) {
-          const destErr = destErrored ? destStoredError : dest[kStoredError];
-          if (!preventCancel) {
-            shutdownWithAction(() => reader.cancel(destErr), true, destErr);
-          } else {
-            shutdown(true, destErr);
-          }
-        } else if (!preventAbort) {
+        if (!preventAbort) {
           shutdownWithAction(() => writer.abort(storedError), true, storedError);
         } else {
           shutdown(true, storedError);
@@ -183,7 +196,7 @@ export function specPipeTo(source, dest, options = {}) {
       };
 
       // Wait for all in-flight writes to complete before running action
-      const allWrites = pendingWrites.size > 0 ? Promise.all(pendingWrites).catch(noop) : currentWrite;
+      const allWrites = pendingWrites.size > 0 ? _waitForAll(pendingWrites) : currentWrite;
       allWrites.then(doAction, doAction);
     }
 
@@ -191,7 +204,7 @@ export function specPipeTo(source, dest, options = {}) {
     function shutdown(isError = false, error) {
       if (shuttingDown) return;
       shuttingDown = true;
-      const allWrites = pendingWrites.size > 0 ? Promise.all(pendingWrites).catch(noop) : currentWrite;
+      const allWrites = pendingWrites.size > 0 ? _waitForAll(pendingWrites) : currentWrite;
       allWrites.then(
         () => finalize(isError, error),
         () => finalize(isError, error)

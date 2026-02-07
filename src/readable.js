@@ -383,8 +383,6 @@ export class FastReadableStream {
 
       // Tier 1: pipeThrough chain with upstream links → pipeline()
       // Only when kUpstream is set (from pipeThrough Tier 1 linking).
-      // For standalone pipeTo, specPipeTo is already 10x faster than native
-      // because our reader/writer are sync — the JS pump loop costs nothing.
       const isDefaultOpts = !preventAbort && !preventCancel && !preventClose && !signal;
       if (isDefaultOpts && this[kUpstream] && isFastWritable(destination) &&
           !destination[kNativeOnly] && destination[kNodeWritable]) {

@@ -209,6 +209,12 @@ export class FastTransformStream {
 
     const onStartCompleted = () => {
       self._startCompleted = true;
+      // Per spec: after start, update backpressure based on readable desiredSize.
+      // If readable has room (desiredSize > 0), clear backpressure to allow writes.
+      // Do this BEFORE advancing the queue so write processing sees correct backpressure.
+      if (self._controller) {
+        self._controller._updateBackpressure();
+      }
       // If writable shell was already created, set kStarted and advance queue
       if (self.#writable && !self.#writable[kStarted]) {
         self.#writable[kStarted] = true;
@@ -255,8 +261,15 @@ export class FastTransformStream {
       this.#readable[kUpstream] = null;
       this.#readable[kNativeOnly] = false;
 
-      // Wire cancel: readable.cancel() → transformer.cancel() + error writable
+      // Wire pull notification: clears transform backpressure when reader demands data
       const transformSelf = this;
+      this.#readable._onPull = () => {
+        if (transformSelf._controller) {
+          transformSelf._controller._updateBackpressure();
+        }
+      };
+
+      // Wire cancel: readable.cancel() → transformer.cancel() + error writable
       this.#readable._cancel = (reason) => {
         // Mark controller as errored (prevents enqueue after cancel)
         if (transformSelf._controller && transformSelf._controller._markErrored) {
@@ -269,6 +282,9 @@ export class FastTransformStream {
           return 'SKIP_DESTROY';
         }
 
+        // Track writable state before cancel to detect if cancel handler caused writable error
+        const writableBefore = transformSelf.writable[kWritableState];
+
         let cancelResult;
         if (cancelFn && !transformSelf._cancelCalled) {
           transformSelf._cancelCalled = true;
@@ -280,17 +296,32 @@ export class FastTransformStream {
             return Promise.reject(e);
           }
         }
-        // Defer erroring the writable side to allow controller.error() to fire first
-        // (per spec: error() after cancel should take priority if called synchronously)
-        queueMicrotask(() => _errorTransformWritable(transformSelf, reason));
+
+        // Per spec: after cancel resolves, check if writable entered error state
+        // as a result of the cancel handler. If so, throw the writable's stored error.
+        const checkWritableError = () => {
+          const writable = transformSelf.writable;
+          const writableState = writable[kWritableState];
+          // Only throw if the writable was errored DURING the cancel handler
+          if (writableBefore === 'writable' &&
+              (writableState === 'errored' || writableState === 'erroring')) {
+            const storedError = writable[kStoredError];
+            if (storedError !== undefined) {
+              throw storedError;
+            }
+          }
+          // Error writable with cancel reason if not already errored
+          _errorTransformWritable(transformSelf, reason);
+        };
+
         if (cancelResult && typeof cancelResult.then === 'function') {
-          // Handle async cancel rejection: error writable with thrown error
-          return cancelResult.catch((e) => {
+          return cancelResult.then(checkWritableError, (e) => {
             _errorTransformWritable(transformSelf, e);
             throw e;
           });
         }
-        return undefined;
+        // Sync cancel: defer writable error check to next microtask
+        return Promise.resolve().then(checkWritableError);
       };
     }
     return this.#readable;
@@ -323,6 +354,10 @@ export class FastTransformStream {
       this.#writable._controller = null;
       this.#writable._isTransformShell = true;
       this.#writable._transformReadable = () => this.readable;
+      // Per spec: TransformStream starts with backpressure=true
+      // Backpressure is cleared when the readable side has room (read request arrives)
+      this.#writable._transformBackpressure = true;
+      this.#writable._transformBackpressureResolve = null;
 
       // Wire transformer.cancel as the abort handler for the writable side
       const transformSelf = this;

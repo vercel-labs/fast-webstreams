@@ -6,7 +6,7 @@
 
 import { Writable } from 'node:stream';
 import {
-  kNodeWritable, kState, kLock, kMaterialized, kNativeOnly, resolveHWM,
+  kNodeWritable, kNodeReadable, kState, kLock, kMaterialized, kNativeOnly, resolveHWM,
   kWritableState, kStoredError,
 } from './utils.js';
 import { FastWritableStreamDefaultController, kWrappedError, kControllerBrand } from './controller.js';
@@ -485,6 +485,29 @@ function _processWrite(stream) {
  * can be delayed by readable-side backpressure, we use the internal _write mechanism.
  */
 function _processWriteTransform(stream, writeRequest, nodeWritable, chunk) {
+  // Per WHATWG spec: TransformStreamDefaultSinkWriteAlgorithm
+  // If backpressure is true (readable desiredSize <= 0 and no pending reads),
+  // defer transform until readable side is drained.
+  if (stream._transformBackpressure) {
+    // Wait for backpressure to be released (by a read consuming data)
+    stream._transformBackpressureResolve = () => {
+      stream._transformBackpressureResolve = null;
+      // Re-check: stream may have errored while waiting
+      if (stream[kWritableState] === 'erroring' || stream[kWritableState] === 'errored') {
+        stream[kInFlightWriteRequest] = null;
+        writeRequest.reject(stream[kStoredError]);
+        if (stream[kWritableState] === 'erroring') _finishErroring(stream);
+        return;
+      }
+      _doTransformWrite(stream, writeRequest, nodeWritable, chunk);
+    };
+    return;
+  }
+
+  _doTransformWrite(stream, writeRequest, nodeWritable, chunk);
+}
+
+function _doTransformWrite(stream, writeRequest, nodeWritable, chunk) {
   // For transforms, we hook into the Node internal callback mechanism.
   // The transform's _transform function gets called synchronously by write(),
   // and its callback signals completion. We'll intercept via a one-time wrapper.
@@ -561,26 +584,51 @@ function _processClose(stream) {
 
   const nodeWritable = stream[kNodeWritable];
 
-  // For transform shells, use 'finish' event since end() callback may not fire
+  // For transform shells, call flush directly instead of nodeWritable.end().
+  // Node Transform's end() blocks on readable-side backpressure, but the spec
+  // says close should complete once flush is done regardless of readable consumption.
   if (stream._isTransformShell) {
-    const onFinish = () => {
-      cleanup();
-      _handleCloseSuccess(stream, closeRequest);
+    const flush = nodeWritable._flush;
+    const flushCallback = (err) => {
+      // Check if stream errored during flush (e.g., controller.error() was called)
+      const state = stream[kWritableState];
+      if (state === 'erroring' || state === 'errored') {
+        err = err || stream[kStoredError];
+      }
+      if (err) {
+        stream[kInFlightCloseRequest] = null;
+        const unwrapped = _unwrapError(err);
+        closeRequest.reject(unwrapped);
+        _handleCloseError(stream, unwrapped);
+        // For transforms: also error the readable side (TransformStreamError)
+        if (stream._transformReadable) {
+          const readable = stream._transformReadable();
+          if (readable && !readable._errored) {
+            readable._storedError = unwrapped;
+            readable._errored = true;
+            if (readable[kNodeReadable] && !readable[kNodeReadable].destroyed) {
+              readable[kNodeReadable].destroy(unwrapped);
+            }
+            const readableReader = readable[kLock];
+            if (readableReader) {
+              if (readableReader._settleClosedFromError) readableReader._settleClosedFromError(unwrapped);
+              if (readableReader._errorReadRequests) readableReader._errorReadRequests(unwrapped);
+            }
+          }
+        }
+      } else {
+        _handleCloseSuccess(stream, closeRequest);
+      }
     };
-    const onError = (err) => {
-      cleanup();
-      stream[kInFlightCloseRequest] = null;
-      const unwrapped = _unwrapError(err);
-      closeRequest.reject(unwrapped);
-      _handleCloseError(stream, unwrapped);
-    };
-    const cleanup = () => {
-      nodeWritable.removeListener('finish', onFinish);
-      nodeWritable.removeListener('error', onError);
-    };
-    nodeWritable.on('finish', onFinish);
-    nodeWritable.on('error', onError);
-    nodeWritable.end();
+    if (flush) {
+      try {
+        flush.call(nodeWritable, flushCallback);
+      } catch (e) {
+        flushCallback(e);
+      }
+    } else {
+      flushCallback(null);
+    }
     return;
   }
 
