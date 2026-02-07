@@ -580,12 +580,16 @@ function _handleCloseSuccess(stream, closeRequest) {
 
   stream[kWritableState] = 'closed';
 
-  // For transform shells: after close succeeds, the transform's flush has completed
-  // and push(null) was called on the readable side. Call resume() to trigger 'end'.
+  // For transform shells: after close succeeds, the transform's flush has completed.
+  // Ensure the readable side closes: push null if not ended, then resume.
   if (stream._isTransformShell && stream[kNodeWritable]) {
     const nodeTransform = stream[kNodeWritable];
-    if (nodeTransform.readableLength === 0 && !nodeTransform.readableEnded) {
-      nodeTransform.resume();
+    if (!nodeTransform.readableEnded) {
+      // Push null to signal end of readable side
+      try { nodeTransform.push(null); } catch {}
+      if (nodeTransform.readableLength === 0) {
+        nodeTransform.resume();
+      }
     }
   }
 
