@@ -483,22 +483,102 @@ export class FastReadableStream {
   }
 
   /**
-   * tee() — Tier 2: delegate to native, wrap results in Fast shells
+   * tee() — Pure JS implementation of ReadableStreamDefaultTee
+   * Preserves error identity and cancel reason aggregation.
    */
   tee() {
-    const [branch1, branch2] = materializeReadable(this).tee();
-    // Wrap native branches in Fast shells so constructor identity checks pass
-    const wrap = (native) => {
-      const fast = Object.create(FastReadableStream.prototype);
-      fast[kMaterialized] = native;
-      fast[kNodeReadable] = null;
-      fast[kLock] = null;
-      fast[kState] = 'idle';
-      fast[kNativeOnly] = true;
-      fast[kUpstream] = null;
-      return fast;
-    };
-    return [wrap(branch1), wrap(branch2)];
+    if (this[kLock]) {
+      throw new TypeError('ReadableStream is locked');
+    }
+
+    // For native-only streams, delegate
+    if (this[kNativeOnly]) {
+      const [b1, b2] = materializeReadable(this).tee();
+      const wrap = (native) => {
+        const fast = Object.create(FastReadableStream.prototype);
+        fast[kMaterialized] = native;
+        fast[kNodeReadable] = null;
+        fast[kLock] = null;
+        fast[kState] = 'idle';
+        fast[kNativeOnly] = true;
+        fast[kUpstream] = null;
+        return fast;
+      };
+      return [wrap(b1), wrap(b2)];
+    }
+
+    const reader = this.getReader();
+    let canceled1 = false;
+    let canceled2 = false;
+    let reason1, reason2;
+    let branch1Controller, branch2Controller;
+    let cancelResolve;
+    const cancelPromise = new Promise(resolve => { cancelResolve = resolve; });
+
+    function cancel1Algorithm(reason) {
+      canceled1 = true;
+      reason1 = reason;
+      if (canceled2) {
+        const compositeReason = [reason1, reason2];
+        const cancelResult = reader.cancel(compositeReason);
+        cancelResolve(cancelResult);
+      }
+      return cancelPromise;
+    }
+
+    function cancel2Algorithm(reason) {
+      canceled2 = true;
+      reason2 = reason;
+      if (canceled1) {
+        const compositeReason = [reason1, reason2];
+        const cancelResult = reader.cancel(compositeReason);
+        cancelResolve(cancelResult);
+      }
+      return cancelPromise;
+    }
+
+    const branch1 = new FastReadableStream({
+      start(c) { branch1Controller = c; },
+      pull() { return readLoop(); },
+      cancel(reason) { return cancel1Algorithm(reason); },
+    }, { highWaterMark: 0 });
+
+    const branch2 = new FastReadableStream({
+      start(c) { branch2Controller = c; },
+      pull() { return readLoop(); },
+      cancel(reason) { return cancel2Algorithm(reason); },
+    }, { highWaterMark: 0 });
+
+    let reading = false;
+    function readLoop() {
+      if (reading) return Promise.resolve();
+      reading = true;
+      return reader.read().then(
+        ({ value, done }) => {
+          reading = false;
+          if (done) {
+            try { if (!canceled1 && branch1Controller) branch1Controller.close(); } catch {}
+            try { if (!canceled2 && branch2Controller) branch2Controller.close(); } catch {}
+            return;
+          }
+          try { if (!canceled1 && branch1Controller) branch1Controller.enqueue(value); } catch {}
+          try { if (!canceled2 && branch2Controller) branch2Controller.enqueue(value); } catch {}
+        },
+        (r) => {
+          reading = false;
+          try { if (!canceled1 && branch1Controller) branch1Controller.error(r); } catch {}
+          try { if (!canceled2 && branch2Controller) branch2Controller.error(r); } catch {}
+        }
+      );
+    }
+
+    // Propagate source errors to both branches
+    reader.closed.catch((r) => {
+      try { if (!canceled1 && branch1Controller) branch1Controller.error(r); } catch {}
+      try { if (!canceled2 && branch2Controller) branch2Controller.error(r); } catch {}
+    });
+
+    return [branch1, branch2];
   }
 
   /**
