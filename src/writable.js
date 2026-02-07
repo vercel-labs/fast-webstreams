@@ -7,16 +7,14 @@
 import { Writable } from 'node:stream';
 import {
   kNodeWritable, kState, kLock, kMaterialized, kNativeOnly, resolveHWM,
+  kWritableState, kStoredError,
 } from './utils.js';
 import { FastWritableStreamDefaultController, kWrappedError, kControllerBrand } from './controller.js';
 import { FastWritableStreamDefaultWriter } from './writer.js';
 import { materializeWritable } from './materialize.js';
 
-/**
- * Internal state symbols for the writable state machine.
- */
-export const kWritableState = Symbol('kWritableState');
-export const kStoredError = Symbol('kStoredError');
+// Re-export shared symbols
+export { kWritableState, kStoredError };
 export const kPendingAbortRequest = Symbol('kPendingAbortRequest');
 export const kInFlightWriteRequest = Symbol('kInFlightWriteRequest');
 export const kInFlightCloseRequest = Symbol('kInFlightCloseRequest');

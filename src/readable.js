@@ -10,6 +10,7 @@ import { Readable, pipeline } from 'node:stream';
 import {
   kNodeReadable, kNodeWritable, kState, kLock, kMaterialized, kUpstream,
   isFastReadable, isFastWritable, isFastTransform, resolveHWM, kNativeOnly,
+  kWritableState,
 } from './utils.js';
 import { FastReadableStreamDefaultController } from './controller.js';
 import { FastReadableStreamDefaultReader } from './reader.js';
@@ -131,14 +132,8 @@ function fastPipelineTo(source, dest) {
       // Sync closed state after pipeline completes
       if (!err) {
         source._closed = true;
-        // Mark dest as closed if it has a state machine (writable shell)
-        // Use Object.getOwnPropertySymbols to find kWritableState
-        const syms = Object.getOwnPropertySymbols(dest);
-        for (const s of syms) {
-          if (s.description === 'kWritableState') {
-            dest[s] = 'closed';
-            break;
-          }
+        if (kWritableState in dest) {
+          dest[kWritableState] = 'closed';
         }
       }
       if (err) reject(err);

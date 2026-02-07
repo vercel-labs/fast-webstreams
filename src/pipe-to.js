@@ -9,6 +9,8 @@
  * https://streams.spec.whatwg.org/#readable-stream-pipe-to
  */
 
+import { kWritableState, kStoredError } from './utils.js';
+
 export function specPipeTo(source, dest, options = {}) {
   // Options are pre-evaluated by caller (pipeTo/pipeThrough) in spec order
   const preventClose = !!options.preventClose;
@@ -79,7 +81,17 @@ export function specPipeTo(source, dest, options = {}) {
       (storedError) => {
         // Source errored
         if (shuttingDown) return;
-        if (!preventAbort) {
+        // Per spec: if dest already errored/erroring, dest error takes precedence
+        const destState = dest[kWritableState];
+        const destIsErroring = destState === 'erroring' || destState === 'errored';
+        if (destIsErroring || destErrored) {
+          const destErr = destErrored ? destStoredError : dest[kStoredError];
+          if (!preventCancel) {
+            shutdownWithAction(() => reader.cancel(destErr), true, destErr);
+          } else {
+            shutdown(true, destErr);
+          }
+        } else if (!preventAbort) {
           shutdownWithAction(() => writer.abort(storedError), true, storedError);
         } else {
           shutdown(true, storedError);

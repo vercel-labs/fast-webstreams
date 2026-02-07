@@ -8,6 +8,10 @@ export const kMaterialized  = Symbol('kMaterialized');
 export const kUpstream      = Symbol('kUpstream');
 export const kNativeOnly    = Symbol('kNativeOnly');
 
+// Writable state symbols (shared to avoid circular deps)
+export const kWritableState   = Symbol('kWritableState');
+export const kStoredError     = Symbol('kStoredError');
+
 // Instance checks
 export const isFastReadable  = (s) => s != null && kNodeReadable in s;
 export const isFastWritable  = (s) => s != null && kNodeWritable in s;
