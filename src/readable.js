@@ -327,6 +327,10 @@ export class FastReadableStream {
    */
   pipeTo(destination, options) {
     try {
+      // Brand check: must have internal state (not just Object.create(prototype))
+      if (!(kNodeReadable in this) && !(kMaterialized in this)) {
+        throw new TypeError('pipeTo called on non-ReadableStream');
+      }
       // Validate destination
       if (!_isWritableStream(destination)) {
         throw new TypeError('pipeTo destination must be a WritableStream');
