@@ -172,7 +172,8 @@ export class FastReadableStream {
     }
 
     // NOW access underlying source properties (method body per spec)
-    const type = underlyingSource.type;
+    const typeRaw = underlyingSource.type;
+    const type = typeRaw === undefined ? undefined : String(typeRaw);
     const pull = underlyingSource.pull;
     const start = underlyingSource.start;
     const cancel = underlyingSource.cancel;
@@ -480,12 +481,13 @@ export class FastReadableStream {
     if (options !== undefined && options !== null && typeof options !== 'object') {
       throw new TypeError('options must be an object');
     }
-    if (options && options.mode === 'byob') {
+    const mode = options ? (options.mode === undefined ? undefined : String(options.mode)) : undefined;
+    if (mode === 'byob') {
       // Tier 2: BYOB requires native byte stream support
       return materializeReadable(this).getReader({ mode: 'byob' });
     }
-    if (options && options.mode !== undefined) {
-      throw new TypeError(`Invalid mode: ${options.mode}`);
+    if (mode !== undefined) {
+      throw new TypeError(`Invalid mode: ${mode}`);
     }
 
     // Fix 1: For native-only streams (byte, custom size), delegate reader too
