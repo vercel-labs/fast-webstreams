@@ -108,6 +108,7 @@ export class FastTransformStreamDefaultController {
   #nodeTransform;
   #terminated = false;
   #errored = false;
+  #enqueueBlocked = false;
   #transformStream = null;
 
   constructor(nodeTransform) {
@@ -120,7 +121,7 @@ export class FastTransformStreamDefaultController {
   }
 
   enqueue(chunk) {
-    if (this.#terminated || this.#errored) {
+    if (this.#terminated || this.#errored || this.#enqueueBlocked) {
       throw new TypeError('Cannot enqueue to an errored stream');
     }
     this.#nodeTransform.push(chunk);
@@ -166,9 +167,10 @@ export class FastTransformStreamDefaultController {
     }
   }
 
-  // Mark as errored (called by readable cancel to prevent subsequent enqueue)
+  // Mark as enqueue-blocked (called by readable cancel to prevent subsequent enqueue)
+  // Does NOT set #errored — error() should still work after cancel
   _markErrored() {
-    this.#errored = true;
+    this.#enqueueBlocked = true;
   }
 
   get desiredSize() {

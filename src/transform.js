@@ -280,8 +280,9 @@ export class FastTransformStream {
             return Promise.reject(e);
           }
         }
-        // Error the writable side with the cancel reason
-        _errorTransformWritable(transformSelf, reason);
+        // Defer erroring the writable side to allow controller.error() to fire first
+        // (per spec: error() after cancel should take priority if called synchronously)
+        queueMicrotask(() => _errorTransformWritable(transformSelf, reason));
         if (cancelResult && typeof cancelResult.then === 'function') {
           return cancelResult;
         }
