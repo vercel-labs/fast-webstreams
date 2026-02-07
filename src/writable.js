@@ -585,10 +585,20 @@ function _handleCloseSuccess(stream, closeRequest) {
   if (stream._isTransformShell && stream[kNodeWritable]) {
     const nodeTransform = stream[kNodeWritable];
     if (!nodeTransform.readableEnded) {
-      // Push null to signal end of readable side
       try { nodeTransform.push(null); } catch {}
       if (nodeTransform.readableLength === 0) {
         nodeTransform.resume();
+      }
+    }
+    // Synchronously mark readable shell as closed and resolve reader.closed
+    if (stream._transformReadable) {
+      const readable = stream._transformReadable();
+      if (readable) {
+        readable._closed = true;
+        const readableReader = readable[kLock];
+        if (readableReader && readableReader._resolveClosedFromCancel) {
+          readableReader._resolveClosedFromCancel();
+        }
       }
     }
   }

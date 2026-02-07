@@ -285,6 +285,7 @@ export class FastTransformStream {
       this.#writable._sinkClose = null;
       this.#writable._controller = null;
       this.#writable._isTransformShell = true;
+      this.#writable._transformReadable = () => this.readable;
 
       // Wire transformer.cancel as the abort handler for the writable side
       const transformSelf = this;
