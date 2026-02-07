@@ -100,6 +100,7 @@ export { kWrappedError, kControllerBrand };
 export class FastTransformStreamDefaultController {
   #nodeTransform;
   #terminated = false;
+  #errored = false;
   #transformStream = null;
 
   constructor(nodeTransform) {
@@ -112,8 +113,8 @@ export class FastTransformStreamDefaultController {
   }
 
   enqueue(chunk) {
-    if (this.#terminated) {
-      throw new TypeError('Cannot enqueue after terminate');
+    if (this.#terminated || this.#errored) {
+      throw new TypeError('Cannot enqueue to an errored stream');
     }
     this.#nodeTransform.push(chunk);
   }
@@ -121,6 +122,7 @@ export class FastTransformStreamDefaultController {
   error(e) {
     if (this.#terminated) return;
     this.#terminated = true;
+    this.#errored = true;
     this.#nodeTransform.destroy(e);
     // Also error the writable side
     if (this.#transformStream && this.#transformStream._errorWritable) {
@@ -137,6 +139,12 @@ export class FastTransformStreamDefaultController {
     if (this.#transformStream && this.#transformStream._errorWritable) {
       this.#transformStream._errorWritable(terminateError);
     }
+  }
+
+  // Mark as errored (called by readable cancel to prevent subsequent enqueue)
+  _markErrored() {
+    this.#errored = true;
+    this.#terminated = true;
   }
 
   get desiredSize() {

@@ -224,6 +224,7 @@ export class FastTransformStream {
     this._transformer = transformer;
     this._cancelCalled = false;
     this._flushStarted = false;
+    this._controller = controller;
 
     // Method for controller.terminate() and controller.error() to error the writable side
     this._errorWritable = (reason) => _errorTransformWritable(this, reason);
@@ -256,6 +257,11 @@ export class FastTransformStream {
       // Wire cancel: readable.cancel() → transformer.cancel() + error writable
       const transformSelf = this;
       this.#readable._cancel = (reason) => {
+        // Mark controller as errored (prevents enqueue after cancel)
+        if (transformSelf._controller && transformSelf._controller._markErrored) {
+          transformSelf._controller._markErrored();
+        }
+
         let cancelResult;
         // Skip cancel if flush is already in progress
         if (cancelFn && !transformSelf._cancelCalled && !transformSelf._flushStarted) {
