@@ -11,6 +11,8 @@
 
 import { kWritableState, kStoredError, kNodeReadable } from './utils.js';
 
+const noop = () => {};
+
 export function specPipeTo(source, dest, options = {}) {
   // Options are pre-evaluated by caller (pipeTo/pipeThrough) in spec order
   const preventClose = !!options.preventClose;
@@ -22,7 +24,7 @@ export function specPipeTo(source, dest, options = {}) {
 
   let shuttingDown = false;
   let currentWrite = Promise.resolve();
-  const pendingWrites = [];
+  const pendingWrites = new Set();
 
   // Track dest state for WritableStreamDefaultWriterCloseWithErrorPropagation
   let destClosed = false;
@@ -145,20 +147,20 @@ export function specPipeTo(source, dest, options = {}) {
             if (done) { sourceClosed = true; return; } // Source close handled by reader.closed
 
             currentWrite = writer.write(value);
-            currentWrite.catch(() => {}); // Error handled by writer.closed
-            pendingWrites.push(currentWrite);
+            currentWrite.catch(noop); // Error handled by writer.closed
+            pendingWrites.add(currentWrite);
             const w = currentWrite;
             currentWrite.then(
-              () => { const idx = pendingWrites.indexOf(w); if (idx !== -1) pendingWrites.splice(idx, 1); },
-              () => { const idx = pendingWrites.indexOf(w); if (idx !== -1) pendingWrites.splice(idx, 1); }
+              () => pendingWrites.delete(w),
+              () => pendingWrites.delete(w)
             );
             // Per spec: don't wait for write to complete. Continue pump loop
             // immediately. Backpressure is handled by writer.ready.
             pipeLoop();
           },
-          () => {} // Error handled by reader.closed
+          noop // Error handled by reader.closed
         );
-      }, () => {}); // Error handled by writer.closed
+      }, noop); // Error handled by writer.closed
     }
 
     // --- Shutdown with action (spec: shutdownWithAction) ---
@@ -181,7 +183,7 @@ export function specPipeTo(source, dest, options = {}) {
       };
 
       // Wait for all in-flight writes to complete before running action
-      const allWrites = pendingWrites.length > 0 ? Promise.all(pendingWrites).catch(() => {}) : currentWrite;
+      const allWrites = pendingWrites.size > 0 ? Promise.all(pendingWrites).catch(noop) : currentWrite;
       allWrites.then(doAction, doAction);
     }
 
@@ -189,7 +191,7 @@ export function specPipeTo(source, dest, options = {}) {
     function shutdown(isError = false, error) {
       if (shuttingDown) return;
       shuttingDown = true;
-      const allWrites = pendingWrites.length > 0 ? Promise.all(pendingWrites).catch(() => {}) : currentWrite;
+      const allWrites = pendingWrites.size > 0 ? Promise.all(pendingWrites).catch(noop) : currentWrite;
       allWrites.then(
         () => finalize(isError, error),
         () => finalize(isError, error)

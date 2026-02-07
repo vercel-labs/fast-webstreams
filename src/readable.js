@@ -108,12 +108,13 @@ function _isWritableStream(obj) {
 function collectPipelineChain(readable, destination) {
   const chain = [];
 
-  // Walk upstream from this readable
+  // Walk upstream from this readable (build forward, reverse once — O(n) vs O(n²))
   let current = readable;
   while (current) {
-    chain.unshift(current[kNodeReadable]);
+    chain.push(current[kNodeReadable]);
     current = current[kUpstream];
   }
+  chain.reverse();
 
   // Add destination
   chain.push(destination[kNodeWritable]);
