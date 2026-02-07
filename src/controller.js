@@ -29,7 +29,7 @@ export class FastReadableStreamDefaultController {
     if (this.#errored) {
       throw new TypeError('Cannot enqueue to an errored stream');
     }
-    if (this.#closed) {
+    if (this.#closed || (this._stream && this._stream._closed)) {
       throw new TypeError('Cannot enqueue to a closed stream');
     }
     this.#nodeReadable.push(chunk);
@@ -39,7 +39,7 @@ export class FastReadableStreamDefaultController {
     if (this.#errored) {
       throw new TypeError('Cannot close an errored stream');
     }
-    if (this.#closed) {
+    if (this.#closed || (this._stream && this._stream._closed)) {
       throw new TypeError('Cannot close an already closed stream');
     }
     this.#closed = true;
