@@ -16,6 +16,7 @@ import { FastReadableStreamDefaultController } from './controller.js';
 import { FastReadableStreamDefaultReader } from './reader.js';
 import { materializeReadable, materializeWritable } from './materialize.js';
 import { specPipeTo } from './pipe-to.js';
+import { FastReadableStreamBYOBReader } from './byob-reader.js';
 
 // ReadableStreamAsyncIteratorPrototype — shared by all async iterators
 // Per spec: extends AsyncIteratorPrototype, has next() and return() methods on the prototype
@@ -495,7 +496,8 @@ export class FastReadableStream {
     const mode = options ? (options.mode === undefined ? undefined : String(options.mode)) : undefined;
     if (mode === 'byob') {
       // Tier 2: BYOB requires native byte stream support
-      return materializeReadable(this).getReader({ mode: 'byob' });
+      // Use FastReadableStreamBYOBReader so constructor checks work with FastReadableStream
+      return new FastReadableStreamBYOBReader(this);
     }
     if (mode !== undefined) {
       throw new TypeError(`Invalid mode: ${mode}`);

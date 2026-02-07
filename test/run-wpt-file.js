@@ -46,13 +46,14 @@ async function run() {
       TransformStream: globalThis.TransformStream,
     };
   } else {
-    const { FastReadableStream, FastWritableStream, FastTransformStream, FastReadableStreamDefaultReader, FastWritableStreamDefaultWriter } = await import('../src/index.js');
+    const { FastReadableStream, FastWritableStream, FastTransformStream, FastReadableStreamDefaultReader, FastWritableStreamDefaultWriter, FastReadableStreamBYOBReader } = await import('../src/index.js');
     streamGlobals = {
       ReadableStream: FastReadableStream,
       WritableStream: FastWritableStream,
       TransformStream: FastTransformStream,
       ReadableStreamDefaultReader: FastReadableStreamDefaultReader,
       WritableStreamDefaultWriter: FastWritableStreamDefaultWriter,
+      ReadableStreamBYOBReader: FastReadableStreamBYOBReader,
     };
   }
 

@@ -381,7 +381,7 @@ export function createHarnessGlobals(streamGlobals) {
     WeakMap,
     BigUint64Array: globalThis.BigUint64Array,
     BigInt64Array: globalThis.BigInt64Array,
-    ReadableStreamBYOBReader: globalThis.ReadableStreamBYOBReader,
+    ReadableStreamBYOBReader: streamGlobals.ReadableStreamBYOBReader || globalThis.ReadableStreamBYOBReader,
     ReadableByteStreamController: globalThis.ReadableByteStreamController,
     ReadableStreamDefaultController: globalThis.ReadableStreamDefaultController,
     ReadableStreamDefaultReader: streamGlobals.ReadableStreamDefaultReader || globalThis.ReadableStreamDefaultReader,

@@ -78,7 +78,7 @@ export function specPipeTo(source, dest, options = {}) {
       signal.addEventListener('abort', abortAlgorithm);
     }
 
-    // --- Track dest state (registered FIRST to fire before source handlers) ---
+    // --- Track dest state ---
     writer.closed.then(
       () => { destClosed = true; },
       (err) => { destErrored = true; destStoredError = err; }
