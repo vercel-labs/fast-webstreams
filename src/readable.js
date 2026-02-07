@@ -128,6 +128,19 @@ function fastPipelineTo(source, dest) {
   const chain = collectPipelineChain(source, dest);
   return new Promise((resolve, reject) => {
     pipeline(...chain, (err) => {
+      // Sync closed state after pipeline completes
+      if (!err) {
+        source._closed = true;
+        // Mark dest as closed if it has a state machine (writable shell)
+        // Use Object.getOwnPropertySymbols to find kWritableState
+        const syms = Object.getOwnPropertySymbols(dest);
+        for (const s of syms) {
+          if (s.description === 'kWritableState') {
+            dest[s] = 'closed';
+            break;
+          }
+        }
+      }
       if (err) reject(err);
       else resolve(undefined);
     });
