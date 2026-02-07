@@ -642,10 +642,14 @@ export class FastReadableStream {
       }
       return Promise.reject(e);
     }
-    if (this[kNodeReadable] && !this[kNodeReadable].destroyed) {
-      this[kNodeReadable].destroy(null);
+    // Skip destroy if cancel handler signals not to (e.g., transform during flush)
+    if (cancelResult !== 'SKIP_DESTROY') {
+      if (this[kNodeReadable] && !this[kNodeReadable].destroyed) {
+        this[kNodeReadable].destroy(null);
+      }
     }
-    return Promise.resolve(cancelResult).then(() => undefined);
+    const resolvedResult = cancelResult === 'SKIP_DESTROY' ? undefined : cancelResult;
+    return Promise.resolve(resolvedResult).then(() => undefined);
   }
 
   /**

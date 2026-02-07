@@ -232,9 +232,14 @@ export class FastTransformStream {
           transformSelf._controller._markErrored();
         }
 
+        // If flush is already in progress, skip cancel and don't error writable.
+        // Return a special signal to _cancelInternal to NOT destroy the node stream.
+        if (transformSelf._flushStarted) {
+          return 'SKIP_DESTROY';
+        }
+
         let cancelResult;
-        // Skip cancel if flush is already in progress
-        if (cancelFn && !transformSelf._cancelCalled && !transformSelf._flushStarted) {
+        if (cancelFn && !transformSelf._cancelCalled) {
           transformSelf._cancelCalled = true;
           try {
             cancelResult = Reflect.apply(cancelFn, transformerObj, [reason]);
