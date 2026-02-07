@@ -269,12 +269,12 @@ export class FastTransformStream {
           try {
             cancelResult = Reflect.apply(cancelFn, transformerObj, [reason]);
           } catch (e) {
-            // Error the writable side with the cancel error
+            // Error the writable side with the thrown error
             _errorTransformWritable(transformSelf, e);
             return Promise.reject(e);
           }
         }
-        // Error the writable side
+        // Error the writable side with the cancel reason
         _errorTransformWritable(transformSelf, reason);
         if (cancelResult && typeof cancelResult.then === 'function') {
           return cancelResult;
