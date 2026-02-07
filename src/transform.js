@@ -166,7 +166,11 @@ export class FastTransformStream {
         }
       },
       destroy(err, callback) {
-        if (err && cancel && typeof cancel === 'function' && !self._cancelCalled) {
+        // Only call cancel from destroy if there's no pending abort that will
+        // handle it via sinkAbort (which needs to catch thrown errors).
+        const writable = self.writable;
+        const hasPendingAbort = writable && writable[kPendingAbortRequest];
+        if (err && cancel && typeof cancel === 'function' && !self._cancelCalled && !hasPendingAbort) {
           self._cancelCalled = true;
           try {
             const result = Reflect.apply(cancel, transformer, [err]);
