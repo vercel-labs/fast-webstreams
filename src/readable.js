@@ -329,8 +329,14 @@ export class FastReadableStream {
         signal = options.signal;
       }
 
-      if (signal !== undefined && !(signal instanceof AbortSignal)) {
-        throw new TypeError('options.signal must be an AbortSignal');
+      if (signal !== undefined) {
+        try {
+          if (signal === null || typeof signal !== 'object' || typeof signal.aborted !== 'boolean') {
+            throw new TypeError('options.signal must be an AbortSignal');
+          }
+        } catch {
+          throw new TypeError('options.signal must be an AbortSignal');
+        }
       }
 
       // Tier 0: kNativeOnly source → delegate to native pipeTo (C++ speed)
@@ -407,8 +413,14 @@ export class FastReadableStream {
       signal = options.signal;
     }
 
-    if (signal !== undefined && !(signal instanceof AbortSignal)) {
-      throw new TypeError('options.signal must be an AbortSignal');
+    if (signal !== undefined) {
+      try {
+        if (signal === null || typeof signal !== 'object' || typeof signal.aborted !== 'boolean') {
+          throw new TypeError('options.signal must be an AbortSignal');
+        }
+      } catch {
+        throw new TypeError('options.signal must be an AbortSignal');
+      }
     }
 
     // Tier 0: kNativeOnly source → delegate to native pipeThrough

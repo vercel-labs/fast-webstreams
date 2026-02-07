@@ -38,7 +38,7 @@ function _errorTransformWritable(transformSelf, reason) {
   // Per spec: WritableStreamDefaultControllerErrorIfNeeded only errors if state === 'writable'
   if (state !== 'writable') return;
 
-  // Don't error if close is in flight (during flush)
+  // Don't error if close/flush is in flight — let it complete
   if (writable[kInFlightCloseRequest]) return;
 
   writable[kWritableState] = 'errored';
@@ -167,6 +167,12 @@ export class FastTransformStream {
         }
       },
       flush(callback) {
+        // If cancel was already called (from readable.cancel()), skip flush
+        if (self._cancelCalled) {
+          callback();
+          return;
+        }
+        self._flushStarted = true;
         const doFlush = () => {
           if (!flush) {
             callback();
@@ -217,6 +223,7 @@ export class FastTransformStream {
     this._transformerCancel = cancel || null;
     this._transformer = transformer;
     this._cancelCalled = false;
+    this._flushStarted = false;
 
     // Method for controller.terminate() and controller.error() to error the writable side
     this._errorWritable = (reason) => _errorTransformWritable(this, reason);
@@ -250,7 +257,8 @@ export class FastTransformStream {
       const transformSelf = this;
       this.#readable._cancel = (reason) => {
         let cancelResult;
-        if (cancelFn && !transformSelf._cancelCalled) {
+        // Skip cancel if flush is already in progress
+        if (cancelFn && !transformSelf._cancelCalled && !transformSelf._flushStarted) {
           transformSelf._cancelCalled = true;
           try {
             cancelResult = Reflect.apply(cancelFn, transformerObj, [reason]);

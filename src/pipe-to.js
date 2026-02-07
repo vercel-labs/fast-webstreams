@@ -20,6 +20,7 @@ export function specPipeTo(source, dest, options = {}) {
 
   let shuttingDown = false;
   let currentWrite = Promise.resolve();
+  const pendingWrites = [];
 
   // Track dest state for WritableStreamDefaultWriterCloseWithErrorPropagation
   let destClosed = false;
@@ -123,6 +124,11 @@ export function specPipeTo(source, dest, options = {}) {
 
             currentWrite = writer.write(value);
             currentWrite.catch(() => {}); // Error handled by writer.closed
+            pendingWrites.push(currentWrite);
+            currentWrite.then(
+              () => { const idx = pendingWrites.indexOf(currentWrite); if (idx !== -1) pendingWrites.splice(idx, 1); },
+              () => { const idx = pendingWrites.indexOf(currentWrite); if (idx !== -1) pendingWrites.splice(idx, 1); }
+            );
             return currentWrite.then(() => {
               pipeLoop();
             }, () => {});
@@ -151,15 +157,17 @@ export function specPipeTo(source, dest, options = {}) {
         );
       };
 
-      // Wait for any in-flight write to complete before running action
-      currentWrite.then(doAction, doAction);
+      // Wait for all in-flight writes to complete before running action
+      const allWrites = pendingWrites.length > 0 ? Promise.all(pendingWrites).catch(() => {}) : currentWrite;
+      allWrites.then(doAction, doAction);
     }
 
     // --- Shutdown without action ---
     function shutdown(isError = false, error) {
       if (shuttingDown) return;
       shuttingDown = true;
-      currentWrite.then(
+      const allWrites = pendingWrites.length > 0 ? Promise.all(pendingWrites).catch(() => {}) : currentWrite;
+      allWrites.then(
         () => finalize(isError, error),
         () => finalize(isError, error)
       );
