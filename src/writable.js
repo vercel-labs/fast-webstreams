@@ -481,13 +481,12 @@ function _processWriteTransform(stream, writeRequest, nodeWritable, chunk) {
 
     // Call original, preserving the data argument (callback(null, data) === push + callback)
     origTransform.call(this, c, enc, (err, data) => {
-      // Pass through to Node's internal callback (including optional data to push)
+      // Pass through to Node's internal callback FIRST (so Node knows transform is done)
       cb(err, data);
 
-      // Defer state machine update to match spec timing.
-      // In the spec, transform completion fires asynchronously.
-      // Without this, desiredSize returns to HWM immediately.
-      queueMicrotask(() => {
+      // Then update our state machine (deferred to maintain desiredSize semantics)
+      // This must happen BEFORE flush runs, which Node defers to nextTick
+      Promise.resolve().then(() => {
         stream[kInFlightWriteRequest] = null;
         if (err) {
           const unwrapped = _unwrapError(err);
