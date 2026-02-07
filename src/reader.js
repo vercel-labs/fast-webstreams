@@ -146,15 +146,17 @@ export class FastReadableStreamDefaultReader {
 
       const onReadable = () => {
         cleanup();
+        // Detach from pendingReads BEFORE read() to prevent _errorReadRequests
+        // from rejecting this entry if read() triggers a pull that errors.
+        removePending();
         const data = nodeReadable.read();
         if (data !== null) {
-          removePending();
           resolve({ value: data, done: false });
         } else if (nodeReadable.readableEnded || nodeReadable.destroyed) {
-          removePending();
           resolve({ value: undefined, done: true });
         } else {
-          // Re-listen
+          // No data yet, re-register
+          this.#pendingReads.push(entry);
           nodeReadable.once('readable', onReadable);
           nodeReadable.once('end', onEnd);
           nodeReadable.once('error', onError);
@@ -210,6 +212,21 @@ export class FastReadableStreamDefaultReader {
       // in case a previous sync pull didn't push data (reading stays true).
       nodeReadable._readableState.reading = false;
       nodeReadable.read(0);
+
+      // If pull pushed data synchronously, consume it now before any
+      // error callbacks can fire (avoids race with maybeReadMore).
+      const immediateData = nodeReadable.read();
+      if (immediateData !== null) {
+        cleanup();
+        removePending();
+        resolve({ value: immediateData, done: false });
+        return;
+      }
+      // Check if stream errored during the read(0) call
+      if (stream._errored) {
+        // Already handled by _errorReadRequests — nothing more to do
+        return;
+      }
     });
   }
 

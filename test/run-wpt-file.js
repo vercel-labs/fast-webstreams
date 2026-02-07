@@ -16,8 +16,8 @@ import { createHarnessGlobals } from './wpt-harness.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WPT_ROOT = resolve(__dirname, '..', 'vendor', 'wpt', 'streams');
 
-process.on('unhandledRejection', () => {});
-process.on('uncaughtException', () => {});
+process.on('unhandledRejection', (e) => { console.error('unhandledRejection', e); });
+process.on('uncaughtException', (e) => { console.error('uncaughtException', e); });
 
 const TEST_TIMEOUT = 2000;
 
