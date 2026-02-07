@@ -575,6 +575,8 @@ export class FastReadableStream {
           if (done) {
             try { if (!canceled1 && branch1Controller) branch1Controller.close(); } catch {}
             try { if (!canceled2 && branch2Controller) branch2Controller.close(); } catch {}
+            // Resolve any pending cancel promise (source is done)
+            cancelResolve(undefined);
             return;
           }
           try { if (!canceled1 && branch1Controller) branch1Controller.enqueue(value); } catch {}
@@ -584,6 +586,8 @@ export class FastReadableStream {
           reading = false;
           try { if (!canceled1 && branch1Controller) branch1Controller.error(r); } catch {}
           try { if (!canceled2 && branch2Controller) branch2Controller.error(r); } catch {}
+          // Resolve any pending cancel promise (source errored)
+          cancelResolve(undefined);
         }
       );
     }
@@ -594,11 +598,13 @@ export class FastReadableStream {
         // Source closed — close both branches
         try { if (!canceled1 && branch1Controller) branch1Controller.close(); } catch {}
         try { if (!canceled2 && branch2Controller) branch2Controller.close(); } catch {}
+        cancelResolve(undefined);
       },
       (r) => {
         // Source errored — error both branches
         try { if (!canceled1 && branch1Controller) branch1Controller.error(r); } catch {}
         try { if (!canceled2 && branch2Controller) branch2Controller.error(r); } catch {}
+        cancelResolve(undefined);
       }
     );
 
