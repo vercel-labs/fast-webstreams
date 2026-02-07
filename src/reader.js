@@ -214,30 +214,6 @@ export class FastReadableStreamDefaultReader {
         nodeReadable._readableState.reading = false;
       }
       nodeReadable.read(0);
-
-      // If data was pushed synchronously by pull, consume it now
-      // to avoid race with maybeReadMore triggering error paths.
-      if (nodeReadable.readableLength > 0) {
-        const immediateData = nodeReadable.read();
-        if (immediateData !== null) {
-          cleanup();
-          removePending();
-          resolve({ value: immediateData, done: false });
-          return;
-        }
-      }
-      // Check if stream errored or closed during the read(0) call
-      if (stream._errored) return;
-      if (nodeReadable.readableEnded || nodeReadable.destroyed) {
-        cleanup();
-        removePending();
-        if (stream._errored) {
-          reject(stream._storedError);
-        } else {
-          resolve({ value: undefined, done: true });
-        }
-        return;
-      }
     });
   }
 
