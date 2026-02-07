@@ -256,20 +256,7 @@ export class FastReadableStream {
     // Fix 10: Store cancel callback for later use
     this._cancel = cancel;
 
-    // Synchronous close/error notification for reader.closed promise identity
-    this._notifyReaderClose = () => {
-      this._closed = true;
-      const reader = this[kLock];
-      if (reader && reader._settleClosedSync) {
-        reader._settleClosedSync(true);
-      }
-    };
-    this._notifyReaderError = (e) => {
-      const reader = this[kLock];
-      if (reader && reader._settleClosedSync) {
-        reader._settleClosedSync(false, e);
-      }
-    };
+    this._storedError = undefined;
 
     if (start) {
       const startResult = start.call(underlyingSource, controller);

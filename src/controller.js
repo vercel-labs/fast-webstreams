@@ -43,9 +43,9 @@ export class FastReadableStreamDefaultController {
     if (r.readableLength === 0) {
       r.resume();
     }
-    // Notify reader synchronously so closed promise settles before releaseLock
-    if (this._stream && this._stream._notifyReaderClose) {
-      this._stream._notifyReaderClose();
+    // Track close state on the stream for releaseLock to use
+    if (this._stream) {
+      this._stream._closed = true;
     }
   }
 
@@ -59,9 +59,9 @@ export class FastReadableStreamDefaultController {
     } else {
       this.#nodeReadable.destroy(e);
     }
-    // Notify reader synchronously so closed promise settles before releaseLock
-    if (this._stream && this._stream._notifyReaderError) {
-      this._stream._notifyReaderError(e);
+    // Track error state on the stream for releaseLock to use
+    if (this._stream) {
+      this._stream._storedError = e;
     }
   }
 

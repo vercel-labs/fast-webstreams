@@ -189,6 +189,7 @@ export class FastReadableStreamDefaultReader {
     if (!this.#stream) return;
     if (!this.#released) {
       this.#released = true;
+      const stream = this.#stream;
 
       // Reject all pending read requests
       const releasedError = new TypeError('Reader was released');
@@ -198,18 +199,30 @@ export class FastReadableStreamDefaultReader {
       }
       this.#pendingReads = [];
 
-      // Per spec: if closed was NOT settled, reject the existing promise.
-      // Then ALWAYS replace with a new rejected promise (new identity).
+      // Check if the stream closed or errored since the promise was created.
+      // If so, settle the original promise before replacing it.
       if (!this.#closedSettled) {
-        this.#closedReject(new TypeError('Reader was released'));
-        this.#closedPromise.catch(() => {});
-        this.#closedSettled = true;
+        if (stream._closed) {
+          // Stream was closed — resolve the original promise
+          this.#closedResolve(undefined);
+          this.#closedSettled = true;
+        } else if (stream._storedError !== undefined) {
+          // Stream errored — reject the original promise with the stored error
+          this.#closedReject(stream._storedError);
+          this.#closedPromise.catch(() => {});
+          this.#closedSettled = true;
+        } else {
+          // Stream still open — reject as released
+          this.#closedReject(releasedError);
+          this.#closedPromise.catch(() => {});
+          this.#closedSettled = true;
+        }
       }
-      // Replace with a new promise for post-release access
+      // Replace with a new rejected promise for post-release access
       this.#closedPromise = Promise.reject(new TypeError('Reader was released'));
       this.#closedPromise.catch(() => {});
 
-      this.#stream[kLock] = null;
+      stream[kLock] = null;
     }
   }
 
@@ -217,11 +230,4 @@ export class FastReadableStreamDefaultReader {
     return this.#closedPromise;
   }
 
-  /**
-   * Called synchronously by the stream when controller.close()/error() is invoked.
-   * Ensures the closed promise settles BEFORE any subsequent releaseLock() call.
-   */
-  _settleClosedSync(success, err) {
-    this.#settleClose(success, err);
-  }
 }
