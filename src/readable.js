@@ -54,22 +54,20 @@ export class FastReadableStream {
 
   constructor(underlyingSource, strategy) {
     // Fix 4: Spec-compliant argument validation
-    if (underlyingSource === null) {
-      underlyingSource = null; // will be converted to object below
-    }
-    if (underlyingSource === undefined) {
+    // Per WebIDL, null and missing arguments become empty dictionaries
+    if (underlyingSource === null || underlyingSource === undefined) {
       underlyingSource = {};
     }
-    if (typeof underlyingSource === 'string' || typeof underlyingSource === 'number' ||
-        typeof underlyingSource === 'boolean') {
+    // Non-objects are also treated as empty dictionaries
+    if (typeof underlyingSource !== 'object' && typeof underlyingSource !== 'function') {
       underlyingSource = {};
     }
 
     // Fix 4: Eagerly access getters per spec (throwing getters throw during construction)
-    const type = underlyingSource !== null ? underlyingSource.type : undefined;
-    const pull = underlyingSource !== null ? underlyingSource.pull : undefined;
-    const start = underlyingSource !== null ? underlyingSource.start : undefined;
-    const cancel = underlyingSource !== null ? underlyingSource.cancel : undefined;
+    const type = underlyingSource.type;
+    const pull = underlyingSource.pull;
+    const start = underlyingSource.start;
+    const cancel = underlyingSource.cancel;
 
     // Fix 4: Validate type
     if (type === 'bytes') {
@@ -127,17 +125,23 @@ export class FastReadableStream {
         if (pull) {
           if (pullCallback) return;
 
-          const result = pull.call(underlyingSource, controller);
-          if (result && typeof result.then === 'function') {
-            pullCallback = result;
-            result.then(
-              () => {
-                pullCallback = null;
-                // Fix 11: Trigger next pull after previous resolves
-                if (!nodeReadable.destroyed) nodeReadable.read(0);
-              },
-              (err) => { pullCallback = null; nodeReadable.destroy(err); }
-            );
+          try {
+            const result = pull.call(underlyingSource, controller);
+            if (result && typeof result.then === 'function') {
+              pullCallback = result;
+              result.then(
+                () => {
+                  pullCallback = null;
+                  if (!nodeReadable.destroyed) nodeReadable.read(0);
+                },
+                (err) => {
+                  pullCallback = null;
+                  if (!nodeReadable.destroyed) nodeReadable.destroy(err);
+                }
+              );
+            }
+          } catch (e) {
+            if (!nodeReadable.destroyed) nodeReadable.destroy(e);
           }
         }
       },
@@ -164,12 +168,11 @@ export class FastReadableStream {
       if (startResult && typeof startResult.then === 'function') {
         startResult.then(
           () => {
-            // Trigger initial pull after async start completes (WHATWG spec behavior)
             if (pull && !nodeReadable.destroyed) {
               nodeReadable.read(0);
             }
           },
-          (err) => { nodeReadable.destroy(err); }
+          (err) => { if (!nodeReadable.destroyed) nodeReadable.destroy(err); }
         );
       } else if (pull) {
         // Trigger initial pull after sync start (WHATWG spec behavior)

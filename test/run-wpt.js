@@ -20,7 +20,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const WPT_ROOT = resolve(__dirname, '..', 'vendor', 'wpt', 'streams');
 const RUNNER = resolve(__dirname, 'run-wpt-file.js');
 
-const FILE_TIMEOUT = 10000; // 10s per file subprocess
+const FILE_TIMEOUT = 30000; // 30s per file subprocess (some files have 60+ tests)
 
 const SKIP_FILES = new Set([
   'idlharness.any.js',
