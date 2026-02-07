@@ -413,7 +413,7 @@ function _rejectCloseAndClosedPromiseIfNeeded(stream, storedError) {
   }
 }
 
-function _advanceQueueIfNeeded(stream) {
+export function _advanceQueueIfNeeded(stream) {
   if (!stream[kStarted]) return;
   const state = stream[kWritableState];
   if (state === 'errored' || state === 'closed') return;

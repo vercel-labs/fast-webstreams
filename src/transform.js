@@ -18,6 +18,7 @@ import {
   kInFlightWriteRequest, kInFlightCloseRequest,
   kWriteRequests, kCloseRequest, kStarted,
   _controllerError as _writableControllerError,
+  _advanceQueueIfNeeded,
 } from './writable.js';
 import { kWrappedError } from './controller.js';
 
@@ -203,14 +204,35 @@ export class FastTransformStream {
     // Method for controller.terminate() and controller.error() to error the writable side
     this._errorWritable = (reason) => _errorTransformWritable(this, reason);
 
+    // Track start completion for writable shell's kStarted
+    this._startCompleted = false;
+
+    const onStartCompleted = () => {
+      self._startCompleted = true;
+      // If writable shell was already created, set kStarted and advance queue
+      if (self.#writable && !self.#writable[kStarted]) {
+        self.#writable[kStarted] = true;
+        _advanceQueueIfNeeded(self.#writable);
+      }
+    };
+
     if (start) {
       const startResult = Reflect.apply(start, transformer, [controller]);
       if (startResult && typeof startResult.then === 'function') {
         startPromise = startResult;
-        startResult.catch((err) => {
-          if (!nodeTransform.destroyed) nodeTransform.destroy(err || new Error('start() failed'));
-        });
+        startResult.then(
+          () => { queueMicrotask(onStartCompleted); },
+          (err) => {
+            if (!nodeTransform.destroyed) nodeTransform.destroy(err || new Error('start() failed'));
+            queueMicrotask(onStartCompleted); // Still set kStarted so erroring can finish
+          }
+        );
+      } else {
+        // Sync start — defer completion via microtask (per spec)
+        queueMicrotask(onStartCompleted);
       }
+    } else {
+      queueMicrotask(onStartCompleted);
     }
   }
 
@@ -282,7 +304,8 @@ export class FastTransformStream {
       this.#writable[kInFlightCloseRequest] = null;
       this.#writable[kWriteRequests] = [];
       this.#writable[kCloseRequest] = null;
-      this.#writable[kStarted] = true;
+      // Per spec: kStarted reflects start completion. If start already completed, set true.
+      this.#writable[kStarted] = this._startCompleted;
       this.#writable._startPromise = null;
       this.#writable._hwm = nodeTransform.writableHighWaterMark;
       this.#writable._sinkWrite = null;
