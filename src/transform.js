@@ -223,8 +223,13 @@ export class FastTransformStream {
         startResult.then(
           () => { queueMicrotask(onStartCompleted); },
           (err) => {
-            if (!nodeTransform.destroyed) nodeTransform.destroy(err || new Error('start() failed'));
-            queueMicrotask(onStartCompleted); // Still set kStarted so erroring can finish
+            const e = err || new Error('start() failed');
+            // Error both sides per spec
+            if (self._controller) {
+              try { self._controller.error(e); } catch {}
+            }
+            if (!nodeTransform.destroyed) nodeTransform.destroy(e);
+            queueMicrotask(onStartCompleted);
           }
         );
       } else {
