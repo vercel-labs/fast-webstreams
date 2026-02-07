@@ -21,6 +21,7 @@ export class FastReadableStreamDefaultReader {
   #closedReject;
   #closedSettled = false;
   #released = false;
+  #pendingReads = []; // Track pending reads for releaseLock
 
   constructor(stream) {
     if (stream[kLock]) {
@@ -115,12 +116,18 @@ export class FastReadableStreamDefaultReader {
 
     // Data not available yet — wait for 'readable', 'end', or 'close'
     return new Promise((resolve, reject) => {
+      // Track this pending read for releaseLock
+      const entry = { reject: null, cleanup: null };
+      this.#pendingReads.push(entry);
+
       const onReadable = () => {
         cleanup();
         const data = nodeReadable.read();
         if (data !== null) {
+          removePending();
           resolve({ value: data, done: false });
         } else if (nodeReadable.readableEnded || nodeReadable.destroyed) {
+          removePending();
           resolve({ value: undefined, done: true });
         } else {
           // Re-listen
@@ -132,14 +139,17 @@ export class FastReadableStreamDefaultReader {
       };
       const onEnd = () => {
         cleanup();
+        removePending();
         resolve({ value: undefined, done: true });
       };
       const onError = (err) => {
         cleanup();
+        removePending();
         reject(unwrapError(err));
       };
       const onClose = () => {
         cleanup();
+        removePending();
         if (nodeReadable.errored) {
           reject(unwrapError(nodeReadable.errored));
         } else {
@@ -152,6 +162,13 @@ export class FastReadableStreamDefaultReader {
         nodeReadable.removeListener('error', onError);
         nodeReadable.removeListener('close', onClose);
       };
+      const removePending = () => {
+        const idx = this.#pendingReads.indexOf(entry);
+        if (idx !== -1) this.#pendingReads.splice(idx, 1);
+      };
+
+      entry.reject = reject;
+      entry.cleanup = cleanup;
 
       nodeReadable.once('readable', onReadable);
       nodeReadable.once('end', onEnd);
@@ -164,31 +181,47 @@ export class FastReadableStreamDefaultReader {
     if (this.#released) {
       return Promise.reject(new TypeError('Reader has been released'));
     }
-    this.#nodeReadable.destroy(reason || null);
-    return this.#closedPromise.then(() => undefined, () => undefined);
+    // Call the stream's internal cancel (bypasses lock check, calls underlyingSource.cancel)
+    return this.#stream._cancelInternal(reason);
   }
 
   releaseLock() {
     if (!this.#stream) return;
     if (!this.#released) {
       this.#released = true;
-      // Fix 6: After releaseLock(), reader.closed must return a NEW rejected promise
-      // (different identity from the pre-release promise per spec)
-      const oldSettled = this.#closedSettled;
-      if (!oldSettled) {
-        // Reject the old promise first
+
+      // Reject all pending read requests
+      const releasedError = new TypeError('Reader was released');
+      for (const entry of this.#pendingReads) {
+        if (entry.cleanup) entry.cleanup();
+        if (entry.reject) entry.reject(releasedError);
+      }
+      this.#pendingReads = [];
+
+      // Per spec: if closed was NOT settled, reject the existing promise.
+      // Then ALWAYS replace with a new rejected promise (new identity).
+      if (!this.#closedSettled) {
         this.#closedReject(new TypeError('Reader was released'));
         this.#closedPromise.catch(() => {});
+        this.#closedSettled = true;
       }
-      // Create a new rejected promise with different identity
+      // Replace with a new promise for post-release access
       this.#closedPromise = Promise.reject(new TypeError('Reader was released'));
       this.#closedPromise.catch(() => {});
-      this.#closedSettled = true;
+
       this.#stream[kLock] = null;
     }
   }
 
   get closed() {
     return this.#closedPromise;
+  }
+
+  /**
+   * Called synchronously by the stream when controller.close()/error() is invoked.
+   * Ensures the closed promise settles BEFORE any subsequent releaseLock() call.
+   */
+  _settleClosedSync(success, err) {
+    this.#settleClose(success, err);
   }
 }

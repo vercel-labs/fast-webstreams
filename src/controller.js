@@ -2,23 +2,21 @@
  * Controller adapters that bridge WHATWG controller API to Node stream internals.
  */
 
-/**
- * ReadableStreamDefaultController adapter.
- * Wraps a Node.js Readable so that WHATWG underlyingSource callbacks
- * can use the familiar controller.enqueue/close/error API.
- */
 // Sentinel for wrapping falsy error values that Node.js would lose
 const kWrappedError = Symbol('kWrappedError');
 
+/**
+ * ReadableStreamDefaultController adapter.
+ */
 export class FastReadableStreamDefaultController {
   #nodeReadable;
   #closed = false;
   #errored = false;
   #originalHWM;
+  _stream = null; // Set by the stream constructor
 
   constructor(nodeReadable, originalHWM) {
     this.#nodeReadable = nodeReadable;
-    // Fix 8: Track original HWM for Infinity handling
     this.#originalHWM = originalHWM !== undefined ? originalHWM : nodeReadable.readableHighWaterMark;
   }
 
@@ -45,19 +43,25 @@ export class FastReadableStreamDefaultController {
     if (r.readableLength === 0) {
       r.resume();
     }
+    // Notify reader synchronously so closed promise settles before releaseLock
+    if (this._stream && this._stream._notifyReaderClose) {
+      this._stream._notifyReaderClose();
+    }
   }
 
   error(e) {
     if (this.#errored) return;
     this.#errored = true;
-    // Node.js treats destroy(undefined/null/falsy) as destroy() (no error),
-    // so wrap falsy values in an object that preserves the original
     if (e == null || e === false || e === 0 || e === '') {
       const wrapped = new Error('wrapped');
       wrapped[kWrappedError] = e;
       this.#nodeReadable.destroy(wrapped);
     } else {
       this.#nodeReadable.destroy(e);
+    }
+    // Notify reader synchronously so closed promise settles before releaseLock
+    if (this._stream && this._stream._notifyReaderError) {
+      this._stream._notifyReaderError(e);
     }
   }
 
@@ -76,15 +80,19 @@ export { kWrappedError };
 
 /**
  * TransformStreamDefaultController adapter.
- * Wraps a Node.js Transform so that WHATWG transformer callbacks
- * can use controller.enqueue/error/terminate.
  */
 export class FastTransformStreamDefaultController {
   #nodeTransform;
   #terminated = false;
+  #transformStream = null;
 
   constructor(nodeTransform) {
     this.#nodeTransform = nodeTransform;
+  }
+
+  // Called by FastTransformStream to wire up the reference
+  _setTransformStream(ts) {
+    this.#transformStream = ts;
   }
 
   enqueue(chunk) {
@@ -95,14 +103,24 @@ export class FastTransformStreamDefaultController {
   }
 
   error(e) {
+    if (this.#terminated) return;
     this.#terminated = true;
     this.#nodeTransform.destroy(e);
+    // Also error the writable side
+    if (this.#transformStream && this.#transformStream._errorWritable) {
+      this.#transformStream._errorWritable(e);
+    }
   }
 
   terminate() {
     if (this.#terminated) return;
     this.#terminated = true;
     this.#nodeTransform.push(null);
+    // Per spec: terminate also errors the writable side
+    const terminateError = new TypeError('TransformStream terminated');
+    if (this.#transformStream && this.#transformStream._errorWritable) {
+      this.#transformStream._errorWritable(terminateError);
+    }
   }
 
   get desiredSize() {
@@ -114,26 +132,31 @@ export class FastTransformStreamDefaultController {
 
 /**
  * WritableStreamDefaultController adapter.
- * Minimal controller passed to underlyingSink.start().
+ * Receives a controllerError callback at construction to avoid circular imports.
  */
 export class FastWritableStreamDefaultController {
   #nodeWritable;
   #abortController;
+  #controllerErrorFn;
+  #stream;
 
-  constructor(nodeWritable) {
+  constructor(nodeWritable, stream, controllerErrorFn) {
     this.#nodeWritable = nodeWritable;
+    this.#stream = stream;
+    this.#controllerErrorFn = controllerErrorFn;
     this.#abortController = new AbortController();
-
-    // When the Node writable is destroyed (abort), signal the AbortController
-    nodeWritable.on('close', () => {
-      if (nodeWritable.errored && !this.#abortController.signal.aborted) {
-        this.#abortController.abort(nodeWritable.errored);
-      }
-    });
   }
 
   error(e) {
-    this.#nodeWritable.destroy(e);
+    if (this.#controllerErrorFn) {
+      this.#controllerErrorFn(this.#stream, e);
+    }
+  }
+
+  _abortSignal(reason) {
+    if (!this.#abortController.signal.aborted) {
+      this.#abortController.abort(reason);
+    }
   }
 
   get signal() {

@@ -13,9 +13,14 @@ export const isFastReadable  = (s) => s != null && kNodeReadable in s;
 export const isFastWritable  = (s) => s != null && kNodeWritable in s;
 export const isFastTransform = (s) => s != null && kNodeTransform in s;
 
-// Extract highWaterMark from a strategy.
+// Extract highWaterMark from a strategy, converting via ToNumber per spec.
 // WHATWG default is CountQueuingStrategy with highWaterMark = 1.
 export function resolveHWM(strategy, defaultHWM = 1) {
   if (!strategy) return defaultHWM;
-  return typeof strategy.highWaterMark === 'number' ? strategy.highWaterMark : defaultHWM;
+  if (!('highWaterMark' in strategy)) return defaultHWM;
+  const h = Number(strategy.highWaterMark);
+  if (Number.isNaN(h) || h < 0) {
+    throw new RangeError('Invalid highWaterMark');
+  }
+  return h;
 }

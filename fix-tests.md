@@ -1,11 +1,12 @@
 # WPT Fix Strategy
 
 ## Current State
-- Baseline: 487/1019 (47.8%)
-- After fixes so far: ~779/1082 (72%)
+- Original baseline: 487/1019 (47.8%)
+- After first round of fixes: ~779/1082 (72%)
+- **Current: 905/1082 (83.6%)**
 - Target: 95%+ (968/1019)
 
-## What's Been Done
+## What's Been Done (Round 1)
 1. **Byte streams**: Delegate to native, don't lock via Readable.fromWeb()
 2. **pipeTo**: Always materialize and delegate to native pipeTo for spec compliance
 3. **ReadableStream.from()**: Delegate to native, wrap result in Fast shell
@@ -18,9 +19,29 @@
 10. **Cancel semantics**: Call underlyingSource.cancel(reason) and return result
 11. **Misc**: Pull re-trigger after resolve, close-after-error throws, this binding for callbacks, error wrapping for falsy values, AbortController signal on writable controller
 
-## Remaining Failure Areas (by impact)
+## What's Been Done (Round 2 — 779→883 = +104 tests)
+12. **Spec-compliant pipeTo**: Own implementation preserving error identity via reader/writer (not native delegation)
+13. **pipeThrough validation**: Correct getter order (readable→writable→locked→options), brand checks, internal pipeTo
+14. **tee() wrapping**: Wrap native tee branches in Fast shells for constructor identity
+15. **pipeTo option getters**: Evaluated in alphabetical order (preventAbort→preventCancel→preventClose→signal)
+16. **reader.cancel()**: Now calls stream._cancelInternal() which calls underlyingSource.cancel()
+17. **writer.abort()**: Propagates underlyingSink.abort() rejection via destroy handler callback mechanism
+18. **Writable destroy**: Only calls abort during explicit _abortInternal, not on write/close failures
+19. **Constructor strategy order**: Strategy converted at IDL layer before underlying sink/source
+20. **Size validation**: TypeError for non-function strategy.size
+21. **Type validation**: TypeError (not RangeError) for invalid stream types
+22. **HWM 0 pull**: Don't auto-pull when highWaterMark is 0
+23. **Transform cancel**: Wire readable._cancel → transformer.cancel() with double-call prevention
+24. **Reader releaseLock**: Reject pending read requests on release
+25. **Constructor garbage**: Throw TypeError for non-object underlying source
+26. **HWM ToNumber conversion**: resolveHWM converts via Number(), validates with RangeError
+27. **WritableStream close on errored**: TypeError for close() on errored/destroyed streams
+28. **controller.signal**: Only abort on explicit _abortInternal, not on write/close failures
+29. **Transform start error**: Preserve original rejection error identity
 
-### Piping (~93 failures across 7 files)
+## Remaining Failure Areas (177 failures)
+
+### Piping (~20 failures across 7 files) — MOSTLY FIXED
 **Root cause**: Materialization wraps errors — native pipeTo sees wrapped errors instead of originals. Tests use `promise_rejects_exactly()` which checks object identity.
 
 **Fix strategy**: Don't delegate pipeTo to native. Implement our own spec-compliant pipeTo that:

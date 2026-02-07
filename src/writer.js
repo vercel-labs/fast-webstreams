@@ -1,17 +1,14 @@
 /**
  * FastWritableStreamDefaultWriter
- * Bridges writer.write() to Node Writable (Tier 1).
+ * Bridges writer.write() to the writable state machine.
  */
 
 import { kNodeWritable, kLock } from './utils.js';
-import { kWrappedError } from './controller.js';
-
-function unwrapError(err) {
-  if (err && typeof err === 'object' && kWrappedError in err) {
-    return err[kWrappedError];
-  }
-  return err;
-}
+import {
+  kWritableState, kStoredError, kPendingAbortRequest,
+  kInFlightWriteRequest, kWriteRequests, kCloseRequest, kInFlightCloseRequest,
+  _abortInternal, _writeInternal, _closeFromWriter, _getDesiredSize,
+} from './writable.js';
 
 export class FastWritableStreamDefaultWriter {
   #stream;
@@ -19,10 +16,12 @@ export class FastWritableStreamDefaultWriter {
   #closedPromise;
   #closedResolve;
   #closedReject;
+  #closedSettled = false;
   #readyPromise;
+  #readyResolve;
+  #readyReject;
+  #readySettled = false;
   #released = false;
-  #startPromise = null;
-  #originalHWM;
 
   constructor(stream) {
     if (stream[kLock]) {
@@ -32,50 +31,64 @@ export class FastWritableStreamDefaultWriter {
     this.#nodeWritable = stream[kNodeWritable];
     stream[kLock] = this;
 
-    // Fix 9: Get start promise from stream
-    this.#startPromise = stream._startPromise || null;
-
-    // Fix 8: Track original HWM for Infinity handling
-    this.#originalHWM = this.#nodeWritable.writableHighWaterMark;
-
-    // Fix 9: If start is pending, ready should wait for it
-    if (this.#startPromise) {
-      this.#readyPromise = this.#startPromise.then(() => undefined);
-    } else {
-      this.#readyPromise = Promise.resolve(undefined);
-    }
-
+    // Set up closed promise
     this.#closedPromise = new Promise((resolve, reject) => {
       this.#closedResolve = resolve;
       this.#closedReject = reject;
     });
 
-    const nodeWritable = this.#nodeWritable;
+    const state = stream[kWritableState];
 
-    const onFinish = () => {
-      cleanup();
-      if (!this.#released) {
-        this.#closedResolve(undefined);
+    if (state === 'writable') {
+      // Check if there's backpressure or close pending
+      if (!_defaultWriterReadyPromiseIsSettled(stream)) {
+        // Pending ready (backpressure or not started)
+        this.#readyPromise = new Promise((resolve, reject) => {
+          this.#readyResolve = resolve;
+          this.#readyReject = reject;
+        });
+        this.#readySettled = false;
+      } else {
+        this.#readyPromise = Promise.resolve(undefined);
+        this.#readySettled = true;
+        this.#readyResolve = null;
+        this.#readyReject = null;
       }
-    };
-    const onError = (err) => {
-      cleanup();
-      if (!this.#released) {
-        this.#closedReject(unwrapError(err));
-      }
-    };
-    const cleanup = () => {
-      nodeWritable.removeListener('finish', onFinish);
-      nodeWritable.removeListener('error', onError);
-    };
-
-    if (nodeWritable.writableFinished) {
+    } else if (state === 'erroring') {
+      this.#readyPromise = Promise.reject(stream[kStoredError]);
+      this.#readyPromise.catch(() => {});
+      this.#readySettled = true;
+      this.#readyResolve = null;
+      this.#readyReject = null;
+    } else if (state === 'closed') {
+      this.#readyPromise = Promise.resolve(undefined);
+      this.#readySettled = true;
+      this.#readyResolve = null;
+      this.#readyReject = null;
       this.#closedResolve(undefined);
-    } else if (nodeWritable.errored) {
-      this.#closedReject(unwrapError(nodeWritable.errored));
-    } else {
-      nodeWritable.on('finish', onFinish);
-      nodeWritable.on('error', onError);
+      this.#closedSettled = true;
+    } else if (state === 'errored') {
+      const storedError = stream[kStoredError];
+      this.#readyPromise = Promise.reject(storedError);
+      this.#readyPromise.catch(() => {});
+      this.#readySettled = true;
+      this.#readyResolve = null;
+      this.#readyReject = null;
+      this.#closedReject(storedError);
+      this.#closedPromise.catch(() => {});
+      this.#closedSettled = true;
+    }
+
+    // If start is pending, ready should wait for it
+    if (stream._startPromise && state === 'writable' && !this.#readySettled) {
+      // Already have a pending ready promise, good
+    } else if (stream._startPromise && state === 'writable' && this.#readySettled) {
+      // Need to convert to pending
+      this.#readyPromise = new Promise((resolve, reject) => {
+        this.#readyResolve = resolve;
+        this.#readyReject = reject;
+      });
+      this.#readySettled = false;
     }
   }
 
@@ -83,99 +96,56 @@ export class FastWritableStreamDefaultWriter {
     if (this.#released) {
       return Promise.reject(new TypeError('Writer has been released'));
     }
-
-    const nodeWritable = this.#nodeWritable;
-
-    if (nodeWritable.errored) {
-      return Promise.reject(unwrapError(nodeWritable.errored));
-    }
-
-    if (nodeWritable.writableEnded) {
-      return Promise.reject(new TypeError('Cannot write to a closed stream'));
-    }
-
-    const doWrite = () => {
-      return new Promise((resolve, reject) => {
-        if (nodeWritable.errored) {
-          reject(unwrapError(nodeWritable.errored));
-          return;
-        }
-        if (nodeWritable.writableEnded) {
-          reject(new TypeError('Cannot write to a closed stream'));
-          return;
-        }
-        const ok = nodeWritable.write(chunk, (err) => {
-          if (err) reject(unwrapError(err));
-          else resolve(undefined);
-        });
-        if (!ok) {
-          this.#readyPromise = new Promise((res) => {
-            nodeWritable.once('drain', () => {
-              this.#readyPromise = Promise.resolve(undefined);
-              res(undefined);
-            });
-          });
-        }
-      });
-    };
-
-    // Fix 9: Chain writes behind start() promise
-    if (this.#startPromise) {
-      return this.#startPromise.then(doWrite);
-    }
-
-    return doWrite();
+    return _writeInternal(this.#stream, chunk);
   }
 
   close() {
     if (this.#released) {
       return Promise.reject(new TypeError('Writer has been released'));
     }
-
-    const nodeWritable = this.#nodeWritable;
-
-    if (nodeWritable.writableEnded) {
-      return Promise.reject(new TypeError('Stream already closed'));
-    }
-
-    const doClose = () => {
-      return new Promise((resolve, reject) => {
-        if (nodeWritable.writableEnded) {
-          reject(new TypeError('Stream already closed'));
-          return;
-        }
-        nodeWritable.end((err) => {
-          if (err) reject(err);
-          else resolve(undefined);
-        });
-      });
-    };
-
-    // Fix 9: Chain close behind start() promise
-    if (this.#startPromise) {
-      return this.#startPromise.then(doClose);
-    }
-
-    return doClose();
+    const stream = this.#stream;
+    return _closeFromWriter(stream);
   }
 
   abort(reason) {
     if (this.#released) {
       return Promise.reject(new TypeError('Writer has been released'));
     }
-    this.#nodeWritable.destroy(reason instanceof Error ? reason : new Error(reason || 'aborted'));
-    return this.#closedPromise.then(() => undefined, () => undefined);
+    return _abortInternal(this.#stream, reason);
   }
 
   releaseLock() {
     if (!this.#stream) return;
     if (!this.#released) {
       this.#released = true;
-      if (!this.#nodeWritable.writableFinished && !this.#nodeWritable.errored) {
-        this.#closedReject(new TypeError('Writer was released'));
+      const stream = this.#stream;
+
+      if (!this.#closedSettled) {
+        const typeError = new TypeError('Writer was released');
+
+        // Reject ready FIRST (so ready handlers fire before closed handlers)
+        if (!this.#readySettled) {
+          this.#readyReject(typeError);
+          this.#readyPromise.catch(() => {});
+          this.#readySettled = true;
+        } else {
+          this.#readyPromise = Promise.reject(typeError);
+          this.#readyPromise.catch(() => {});
+        }
+
+        // Then reject closed
+        this.#closedReject(typeError);
+        this.#closedPromise.catch(() => {});
+        this.#closedSettled = true;
+      } else {
+        const typeError = new TypeError('Writer was released');
+        this.#readyPromise = Promise.reject(typeError);
+        this.#readyPromise.catch(() => {});
+        this.#closedPromise = Promise.reject(typeError);
         this.#closedPromise.catch(() => {});
       }
-      this.#stream[kLock] = null;
+
+      stream[kLock] = null;
     }
   }
 
@@ -188,15 +158,148 @@ export class FastWritableStreamDefaultWriter {
   }
 
   get desiredSize() {
-    const w = this.#nodeWritable;
-    // Fix 8: desiredSize should return 0 when closed
-    if (w.writableEnded) return 0;
-    if (w.errored) return null;
-    // Fix 8: Return Infinity when original HWM is Infinity
-    if (this.#originalHWM === 0x7FFFFFFF && w.writableHighWaterMark === 0x7FFFFFFF) {
-      // Check if it was set to MAX because of Infinity
-      return Infinity;
+    if (this.#released) {
+      throw new TypeError('Cannot get desiredSize of a released writer');
     }
-    return w.writableHighWaterMark - w.writableLength;
+    return _getDesiredSize(this.#stream);
   }
+
+  // --- Internal methods called by the stream state machine ---
+
+  /**
+   * Reject the ready promise if it's pending (called on transition to erroring).
+   */
+  _rejectReadyIfPending(reason) {
+    if (!this.#readySettled && this.#readyReject) {
+      this.#readyReject(reason);
+      this.#readyPromise.catch(() => {});
+      this.#readySettled = true;
+      this.#readyResolve = null;
+      this.#readyReject = null;
+    } else if (this.#readySettled) {
+      // Replace with a new rejected promise
+      this.#readyPromise = Promise.reject(reason);
+      this.#readyPromise.catch(() => {});
+    }
+  }
+
+  /**
+   * Resolve the ready promise (called when close is requested or backpressure relieved).
+   */
+  _resolveReady() {
+    if (!this.#readySettled && this.#readyResolve) {
+      this.#readyResolve(undefined);
+      this.#readySettled = true;
+      this.#readyResolve = null;
+      this.#readyReject = null;
+    }
+  }
+
+  /**
+   * Reject the closed promise (called when stream transitions to errored).
+   */
+  _rejectClosed(error) {
+    if (this.#released) return;
+    if (!this.#closedSettled) {
+      this.#closedReject(error);
+      this.#closedPromise.catch(() => {});
+      this.#closedSettled = true;
+    }
+  }
+
+  /**
+   * Reject the ready promise unconditionally (e.g., on close error).
+   */
+  _rejectReady(error) {
+    if (this.#released) return;
+    if (!this.#readySettled && this.#readyReject) {
+      this.#readyReject(error);
+      this.#readyPromise.catch(() => {});
+      this.#readySettled = true;
+      this.#readyResolve = null;
+      this.#readyReject = null;
+    } else {
+      this.#readyPromise = Promise.reject(error);
+      this.#readyPromise.catch(() => {});
+      this.#readySettled = true;
+    }
+  }
+
+  /**
+   * Resolve the closed promise (called when stream transitions to closed).
+   */
+  _resolveClosed() {
+    if (this.#released) return;
+    if (!this.#closedSettled) {
+      this.#closedResolve(undefined);
+      this.#closedSettled = true;
+    }
+  }
+
+  /**
+   * Update the ready promise based on backpressure.
+   * If there's backpressure, ready should be pending. Otherwise resolved.
+   */
+  _updateReadyForBackpressure(stream) {
+    if (this.#released) return;
+    const desiredSize = _getDesiredSize(stream);
+    if (desiredSize !== null && desiredSize <= 0) {
+      // Backpressure — make ready pending if currently settled
+      if (this.#readySettled) {
+        this.#readyPromise = new Promise((resolve, reject) => {
+          this.#readyResolve = resolve;
+          this.#readyReject = reject;
+        });
+        this.#readySettled = false;
+      }
+    } else {
+      // No backpressure — resolve ready if pending
+      if (!this.#readySettled && this.#readyResolve) {
+        this.#readyResolve(undefined);
+        this.#readySettled = true;
+        this.#readyResolve = null;
+        this.#readyReject = null;
+      } else if (!this.#readySettled) {
+        this.#readyPromise = Promise.resolve(undefined);
+        this.#readySettled = true;
+      }
+    }
+  }
+
+  /**
+   * Set ready to a new pending promise (backpressure from Node write returning false).
+   */
+  _setReadyPending(stream) {
+    if (this.#released) return;
+    if (this.#readySettled) {
+      this.#readyPromise = new Promise((resolve, reject) => {
+        this.#readyResolve = resolve;
+        this.#readyReject = reject;
+      });
+      this.#readySettled = false;
+
+      // Listen for drain to resolve it
+      const nodeWritable = stream[kNodeWritable];
+      nodeWritable.once('drain', () => {
+        if (!this.#released && !this.#readySettled) {
+          this.#readyResolve(undefined);
+          this.#readySettled = true;
+          this.#readyResolve = null;
+          this.#readyReject = null;
+        }
+      });
+    }
+  }
+}
+
+/**
+ * Check if the writer's ready promise should be initially settled.
+ * Ready should be pending if the stream hasn't started or if there's backpressure.
+ */
+function _defaultWriterReadyPromiseIsSettled(stream) {
+  // If start is pending, ready should be pending
+  if (stream._startPromise) return false;
+  // If desiredSize <= 0, there's backpressure
+  const desiredSize = _getDesiredSize(stream);
+  return desiredSize !== null && desiredSize > 0;
 }

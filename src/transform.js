@@ -12,19 +12,81 @@ import {
 } from './utils.js';
 import { FastTransformStreamDefaultController } from './controller.js';
 import { FastReadableStream } from './readable.js';
-import { FastWritableStream } from './writable.js';
+import {
+  FastWritableStream,
+  kWritableState, kStoredError, kPendingAbortRequest,
+  kInFlightWriteRequest, kInFlightCloseRequest,
+  kWriteRequests, kCloseRequest, kStarted,
+} from './writable.js';
+import { kWrappedError } from './controller.js';
+
+function _unwrapError(err) {
+  if (err && typeof err === 'object' && kWrappedError in err) {
+    return err[kWrappedError];
+  }
+  return err;
+}
+
+/**
+ * Error the transform's writable side via the state machine.
+ * Called when readable.cancel() is invoked on a transform's readable.
+ */
+function _errorTransformWritable(transformSelf, reason) {
+  const writable = transformSelf.writable;
+  const state = writable[kWritableState];
+
+  // Per spec: WritableStreamDefaultControllerErrorIfNeeded only errors if state === 'writable'
+  if (state !== 'writable') return;
+
+  // Don't error if close is in flight (during flush)
+  if (writable[kInFlightCloseRequest]) return;
+
+  writable[kWritableState] = 'errored';
+  writable[kStoredError] = reason;
+
+  // Reject all queued writes
+  const writeRequests = writable[kWriteRequests];
+  writable[kWriteRequests] = [];
+  for (const req of writeRequests) {
+    req.reject(reason);
+  }
+
+  // Reject close request
+  if (writable[kCloseRequest]) {
+    writable[kCloseRequest].reject(reason);
+    writable[kCloseRequest] = null;
+  }
+
+  // Reject in-flight write
+  if (writable[kInFlightWriteRequest]) {
+    writable[kInFlightWriteRequest].reject(reason);
+    writable[kInFlightWriteRequest] = null;
+  }
+
+  // Reject writer's ready and closed
+  const writer = writable[kLock];
+  if (writer) {
+    writer._rejectReadyIfPending(reason);
+    writer._rejectClosed(reason);
+  }
+
+  // Handle pending abort
+  const abortRequest = writable[kPendingAbortRequest];
+  if (abortRequest) {
+    writable[kPendingAbortRequest] = null;
+    abortRequest.reject(reason);
+  }
+}
 
 export class FastTransformStream {
   #readable = null;
   #writable = null;
 
   constructor(transformer = {}, writableStrategy, readableStrategy) {
-    // Fix 4: Validate transformer
     if (transformer === null) {
       transformer = {};
     }
 
-    // Fix 4: Eagerly access getters per spec
     const transform = transformer.transform;
     const flush = transformer.flush;
     const start = transformer.start;
@@ -32,7 +94,6 @@ export class FastTransformStream {
     const readableType = transformer.readableType;
     const writableType = transformer.writableType;
 
-    // Fix 4: readableType and writableType must be undefined
     if (readableType !== undefined) {
       throw new RangeError(`Invalid readableType: ${readableType}`);
     }
@@ -40,7 +101,6 @@ export class FastTransformStream {
       throw new RangeError(`Invalid writableType: ${writableType}`);
     }
 
-    // Fix 4: Validate callbacks
     if (transform !== undefined && typeof transform !== 'function') {
       throw new TypeError('transform must be a function');
     }
@@ -51,7 +111,7 @@ export class FastTransformStream {
       throw new TypeError('start must be a function');
     }
 
-    // Fix 5: If either strategy has a custom size(), delegate to native
+    // If either strategy has a custom size(), delegate to native
     if ((writableStrategy && typeof writableStrategy.size === 'function') ||
         (readableStrategy && typeof readableStrategy.size === 'function')) {
       const native = new TransformStream(transformer, writableStrategy, readableStrategy);
@@ -77,6 +137,7 @@ export class FastTransformStream {
     const writableHWM = resolveHWM(writableStrategy);
     let controller;
     let startPromise = null;
+    const self = this;
 
     const nodeTransform = new Transform({
       objectMode: true,
@@ -85,7 +146,6 @@ export class FastTransformStream {
       transform(chunk, encoding, callback) {
         const doTransform = () => {
           if (!transform) {
-            // Identity transform
             callback(null, chunk);
             return;
           }
@@ -100,7 +160,6 @@ export class FastTransformStream {
             callback(e);
           }
         };
-        // Queue behind start() if pending
         if (startPromise) {
           startPromise.then(doTransform, callback);
         } else {
@@ -130,9 +189,9 @@ export class FastTransformStream {
           doFlush();
         }
       },
-      // Fix 7: Handle destroy to support cancel/abort
       destroy(err, callback) {
-        if (err && cancel && typeof cancel === 'function') {
+        if (err && cancel && typeof cancel === 'function' && !self._cancelCalled) {
+          self._cancelCalled = true;
           try {
             const result = cancel.call(transformer, err);
             if (result && typeof result.then === 'function') {
@@ -140,7 +199,7 @@ export class FastTransformStream {
               return;
             }
           } catch {
-            // ignore errors from cancel
+            // ignore errors from cancel in destroy
           }
         }
         callback(err);
@@ -151,15 +210,23 @@ export class FastTransformStream {
     nodeTransform.on('error', () => {});
 
     controller = new FastTransformStreamDefaultController(nodeTransform);
+    controller._setTransformStream(this);
 
     this[kNodeTransform] = nodeTransform;
+
+    this._transformerCancel = cancel || null;
+    this._transformer = transformer;
+    this._cancelCalled = false;
+
+    // Method for controller.terminate() and controller.error() to error the writable side
+    this._errorWritable = (reason) => _errorTransformWritable(this, reason);
 
     if (start) {
       const startResult = start.call(transformer, controller);
       if (startResult && typeof startResult.then === 'function') {
         startPromise = startResult;
-        startResult.catch(() => {
-          nodeTransform.destroy(new Error('start() failed'));
+        startResult.catch((err) => {
+          if (!nodeTransform.destroyed) nodeTransform.destroy(err || new Error('start() failed'));
         });
       }
     }
@@ -167,25 +234,84 @@ export class FastTransformStream {
 
   get readable() {
     if (!this.#readable) {
+      const transform = this[kNodeTransform];
+      const cancelFn = this._transformerCancel;
+      const transformerObj = this._transformer;
+
       this.#readable = Object.create(FastReadableStream.prototype);
-      this.#readable[kNodeReadable] = this[kNodeTransform];
+      this.#readable[kNodeReadable] = transform;
       this.#readable[kLock] = null;
       this.#readable[kState] = 'idle';
       this.#readable[kMaterialized] = null;
       this.#readable[kUpstream] = null;
       this.#readable[kNativeOnly] = false;
+
+      // Wire cancel: readable.cancel() → transformer.cancel() + error writable
+      const transformSelf = this;
+      this.#readable._cancel = (reason) => {
+        let cancelResult;
+        if (cancelFn && !transformSelf._cancelCalled) {
+          transformSelf._cancelCalled = true;
+          try {
+            cancelResult = cancelFn.call(transformerObj, reason);
+          } catch (e) {
+            // Error the writable side with the cancel error
+            _errorTransformWritable(transformSelf, e);
+            return Promise.reject(e);
+          }
+        }
+        // Error the writable side
+        _errorTransformWritable(transformSelf, reason);
+        if (cancelResult && typeof cancelResult.then === 'function') {
+          return cancelResult;
+        }
+        return undefined;
+      };
     }
     return this.#readable;
   }
 
   get writable() {
     if (!this.#writable) {
+      const nodeTransform = this[kNodeTransform];
       this.#writable = Object.create(FastWritableStream.prototype);
-      this.#writable[kNodeWritable] = this[kNodeTransform];
+      this.#writable[kNodeWritable] = nodeTransform;
       this.#writable[kLock] = null;
       this.#writable[kState] = 'idle';
       this.#writable[kMaterialized] = null;
       this.#writable[kNativeOnly] = false;
+
+      // Initialize state machine fields for the writable shell
+      this.#writable[kWritableState] = 'writable';
+      this.#writable[kStoredError] = undefined;
+      this.#writable[kPendingAbortRequest] = null;
+      this.#writable[kInFlightWriteRequest] = null;
+      this.#writable[kInFlightCloseRequest] = null;
+      this.#writable[kWriteRequests] = [];
+      this.#writable[kCloseRequest] = null;
+      this.#writable[kStarted] = true;
+      this.#writable._startPromise = null;
+      this.#writable._hwm = nodeTransform.writableHighWaterMark;
+      this.#writable._sinkWrite = null;
+      this.#writable._sinkClose = null;
+      this.#writable._controller = null;
+      this.#writable._isTransformShell = true;
+
+      // Wire transformer.cancel as the abort handler for the writable side
+      const transformSelf = this;
+      if (this._transformerCancel) {
+        const cancelFn = this._transformerCancel;
+        const transformerObj = this._transformer;
+        this.#writable._sinkAbort = (reason) => {
+          if (transformSelf._cancelCalled) return undefined;
+          transformSelf._cancelCalled = true;
+          return cancelFn.call(transformerObj, reason);
+        };
+        this.#writable._underlyingSink = transformerObj;
+      } else {
+        this.#writable._sinkAbort = null;
+        this.#writable._underlyingSink = {};
+      }
     }
     return this.#writable;
   }

@@ -167,6 +167,7 @@ export default {
       name: 'fast-pipeTo',
       fn: async ({ chunkSize, totalBytes, highWaterMark }) => {
         const chunk = makeChunk(chunkSize);
+        const countHWM = Math.max(1, Math.ceil(highWaterMark / chunkSize));
         let remaining = totalBytes;
         const readable = new FastReadableStream(
           {
@@ -181,7 +182,7 @@ export default {
               controller.enqueue(buf);
             },
           },
-          new ByteLengthQueuingStrategy({ highWaterMark })
+          { highWaterMark: countHWM }
         );
         let bytesWritten = 0;
         const writable = new FastWritableStream(
@@ -190,7 +191,7 @@ export default {
               bytesWritten += c.length;
             },
           },
-          new ByteLengthQueuingStrategy({ highWaterMark })
+          { highWaterMark: countHWM }
         );
 
         await readable.pipeTo(writable);
@@ -202,6 +203,7 @@ export default {
       name: 'fast-pipeThrough',
       fn: async ({ chunkSize, totalBytes, highWaterMark }) => {
         const chunk = makeChunk(chunkSize);
+        const countHWM = Math.max(1, Math.ceil(highWaterMark / chunkSize));
         let remaining = totalBytes;
         const readable = new FastReadableStream(
           {
@@ -216,12 +218,12 @@ export default {
               controller.enqueue(buf);
             },
           },
-          new ByteLengthQueuingStrategy({ highWaterMark })
+          { highWaterMark: countHWM }
         );
         const transform = new FastTransformStream(
           {},
-          new ByteLengthQueuingStrategy({ highWaterMark }),
-          new ByteLengthQueuingStrategy({ highWaterMark })
+          { highWaterMark: countHWM },
+          { highWaterMark: countHWM }
         );
         let bytesWritten = 0;
         const writable = new FastWritableStream(
@@ -230,7 +232,7 @@ export default {
               bytesWritten += c.length;
             },
           },
-          new ByteLengthQueuingStrategy({ highWaterMark })
+          { highWaterMark: countHWM }
         );
 
         await readable.pipeThrough(transform).pipeTo(writable);
