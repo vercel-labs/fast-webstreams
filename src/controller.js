@@ -151,7 +151,6 @@ export class FastTransformStreamDefaultController {
   // Mark as errored (called by readable cancel to prevent subsequent enqueue)
   _markErrored() {
     this.#errored = true;
-    this.#terminated = true;
   }
 
   get desiredSize() {
