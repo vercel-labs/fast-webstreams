@@ -1,12 +1,24 @@
-# Plan: WPT Compliance Push — 90.4% → 98.2% (Match Native)
+# Plan: WPT Compliance Push — 90.4% → 99%+ (Match Native)
 
-## Current State
+## Current State (Updated)
 
-- **Fast**: 978/1082 (90.4%)
+- **Fast**: 1051/1103 (95.3%) — up from 978/1082 (90.4%), +73 tests fixed
 - **Native**: 1096/1116 (98.2%)
-- **Gap**: 104 fast-only failures (native fails 20 tests that don't apply to us)
-- **Shared failures**: ~8 tests fail in both native and fast (owning-type: 5, queuing-strategies: 2, async-iterator prototype: 1). These are Node.js platform limitations.
-- **True target**: ~96 fast-only failures to fix → brings us to ~1074/1082 ≈ 99.3% (matching native's effective pass rate on shared tests)
+- **Total test count**: 1103 (was 1082, bad-underlying-sources now reports 22 tests)
+- **Remaining failures**: 52 (was 104)
+- **Platform limits**: ~10 unfixable (owning-type: 5, queuing-strategies: 2, async-iter prototype: 1, then-interception: 2)
+- **Shared with native**: tee species pattern (7 tests)
+
+### Completed Phases
+- Phase E: Writable abort edge cases (+8) ✓
+- Phase G: Reader/stream error identity (+8) ✓
+- Phase D: Readable pull timing (+5) ✓
+- Phase H: Async iterator ordering (+6) ✓
+- Phase A: Transform desiredSize (partial, +2) ✓
+- Phase C: Tee implementation (partial, +3) ✓
+- Phase F: pipeTo pump loop fix (+6) ✓
+- Phase B: Transform cancel/errors (partial, ongoing)
+- Various: AbortSignal validation, ToString, locked getter, controller.close() sync (+10) ✓
 
 ---
 
