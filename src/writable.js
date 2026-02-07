@@ -517,8 +517,13 @@ function _doTransformWrite(stream, writeRequest, nodeWritable, chunk) {
     // Restore original transform
     nodeWritable._transform = origTransform;
 
+    // Track that we're inside a transform callback (for _errorTransformWritable)
+    const ts = stream._transformStream;
+    if (ts) ts._inTransformCallback = true;
+
     // Call original, preserving the data argument (callback(null, data) === push + callback)
     origTransform.call(this, c, enc, (err, data) => {
+      if (ts) ts._inTransformCallback = false;
       // Pass through to Node's internal callback FIRST (so Node knows transform is done)
       cb(err, data);
 

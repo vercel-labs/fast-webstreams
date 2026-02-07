@@ -40,7 +40,10 @@ function _errorTransformWritable(transformSelf, reason) {
   // For transform shells: clear in-flight write that may never complete
   // (Node transform callbacks don't fire after destroy).
   // Must clear BEFORE _controllerError so _finishErroring can run.
-  if (writable._isTransformShell && writable[kInFlightWriteRequest]) {
+  // But DON'T clear if we're inside an active transform callback —
+  // the callback will fire and should handle the write rejection.
+  if (writable._isTransformShell && writable[kInFlightWriteRequest] &&
+      !transformSelf._inTransformCallback) {
     const req = writable[kInFlightWriteRequest];
     writable[kInFlightWriteRequest] = null;
     req.reject(reason);
@@ -199,6 +202,7 @@ export class FastTransformStream {
     this._transformer = transformer;
     this._cancelCalled = false;
     this._flushStarted = false;
+    this._inTransformCallback = false;
     this._controller = controller;
 
     // Method for controller.terminate() and controller.error() to error the writable side
@@ -358,6 +362,7 @@ export class FastTransformStream {
       this.#writable._controller = null;
       this.#writable._isTransformShell = true;
       this.#writable._transformReadable = () => this.readable;
+      this.#writable._transformStream = this;
       // Per spec: TransformStream starts with backpressure=true
       // Backpressure is cleared when the readable side has room (read request arrives)
       this.#writable._transformBackpressure = true;
