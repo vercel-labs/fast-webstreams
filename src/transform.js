@@ -282,8 +282,8 @@ export class FastTransformStream {
           return 'SKIP_DESTROY';
         }
 
-        // Track writable state before cancel to detect if cancel handler caused writable error
-        const writableBefore = transformSelf.writable[kWritableState];
+        // Capture writable error state BEFORE cancel handler runs
+        const errorBefore = transformSelf.writable[kStoredError];
 
         let cancelResult;
         if (cancelFn && !transformSelf._cancelCalled) {
@@ -297,18 +297,22 @@ export class FastTransformStream {
           }
         }
 
-        // Per spec: after cancel resolves, check if writable entered error state
-        // as a result of the cancel handler. If so, throw the writable's stored error.
+        // Capture writable error state AFTER cancel handler ran.
+        // Only if the cancel handler CAUSED a new error (e.g., by calling
+        // writable.abort()), should we propagate it.
+        const errorAfterCancel = transformSelf.writable[kStoredError];
+        const cancelCausedError = errorAfterCancel !== errorBefore;
+
+        // Per spec (TransformStreamDefaultSourceCancelAlgorithm step 7):
+        // After cancel resolves, if writable is errored due to the cancel handler,
+        // throw the writable's stored error.
         const checkWritableError = () => {
           const writable = transformSelf.writable;
           const writableState = writable[kWritableState];
-          // Only throw if the writable was errored DURING the cancel handler
-          if (writableBefore === 'writable' &&
-              (writableState === 'errored' || writableState === 'erroring')) {
-            const storedError = writable[kStoredError];
-            if (storedError !== undefined) {
-              throw storedError;
-            }
+          if (cancelCausedError &&
+              (writableState === 'errored' || writableState === 'erroring') &&
+              writable[kStoredError] !== undefined) {
+            throw writable[kStoredError];
           }
           // Error writable with cancel reason if not already errored
           _errorTransformWritable(transformSelf, reason);
