@@ -107,7 +107,16 @@ export class FastWritableStream {
         try {
           const result = Reflect.apply(write, underlyingSink, [chunk, controller]);
           if (result && typeof result.then === 'function') {
-            result.then(() => callback(), callback);
+            result.then(() => callback(), (err) => {
+              // Wrap falsy errors so Node treats rejection as error (not success)
+              if (err == null || err === false || err === 0 || err === '') {
+                const wrapped = new Error('write rejected');
+                wrapped[kWrappedError] = err;
+                callback(wrapped);
+              } else {
+                callback(err);
+              }
+            });
           } else {
             callback();
           }
@@ -123,7 +132,15 @@ export class FastWritableStream {
         try {
           const result = Reflect.apply(close, underlyingSink, []);
           if (result && typeof result.then === 'function') {
-            result.then(() => callback(), callback);
+            result.then(() => callback(), (err) => {
+              if (err == null || err === false || err === 0 || err === '') {
+                const wrapped = new Error('close rejected');
+                wrapped[kWrappedError] = err;
+                callback(wrapped);
+              } else {
+                callback(err);
+              }
+            });
           } else {
             callback();
           }
