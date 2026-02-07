@@ -586,11 +586,19 @@ export class FastReadableStream {
       );
     }
 
-    // Propagate source errors to both branches
-    reader.closed.catch((r) => {
-      try { if (!canceled1 && branch1Controller) branch1Controller.error(r); } catch {}
-      try { if (!canceled2 && branch2Controller) branch2Controller.error(r); } catch {}
-    });
+    // Propagate source close/errors to both branches
+    reader.closed.then(
+      () => {
+        // Source closed — close both branches
+        try { if (!canceled1 && branch1Controller) branch1Controller.close(); } catch {}
+        try { if (!canceled2 && branch2Controller) branch2Controller.close(); } catch {}
+      },
+      (r) => {
+        // Source errored — error both branches
+        try { if (!canceled1 && branch1Controller) branch1Controller.error(r); } catch {}
+        try { if (!canceled2 && branch2Controller) branch2Controller.error(r); } catch {}
+      }
+    );
 
     return [branch1, branch2];
   }
