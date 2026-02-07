@@ -484,20 +484,24 @@ function _processWriteTransform(stream, writeRequest, nodeWritable, chunk) {
       // Pass through to Node's internal callback (including optional data to push)
       cb(err, data);
 
-      // Handle completion in our state machine
-      stream[kInFlightWriteRequest] = null;
-      if (err) {
-        const unwrapped = _unwrapError(err);
-        writeRequest.reject(unwrapped);
-        _handleWriteError(stream, unwrapped);
-      } else {
-        writeRequest.resolve(undefined);
-        const writer = stream[kLock];
-        if (writer && stream[kWritableState] === 'writable') {
-          writer._updateReadyForBackpressure(stream);
+      // Defer state machine update to match spec timing.
+      // In the spec, transform completion fires asynchronously.
+      // Without this, desiredSize returns to HWM immediately.
+      queueMicrotask(() => {
+        stream[kInFlightWriteRequest] = null;
+        if (err) {
+          const unwrapped = _unwrapError(err);
+          writeRequest.reject(unwrapped);
+          _handleWriteError(stream, unwrapped);
+        } else {
+          writeRequest.resolve(undefined);
+          const writer = stream[kLock];
+          if (writer && stream[kWritableState] === 'writable') {
+            writer._updateReadyForBackpressure(stream);
+          }
+          _advanceQueueIfNeeded(stream);
         }
-        _advanceQueueIfNeeded(stream);
-      }
+      });
     });
   };
 
@@ -693,12 +697,6 @@ export function _getDesiredSize(stream) {
   if (state === 'closed') return 0;
   if (stream._hwm === Infinity) return Infinity;
 
-  // For transform shells, use the Node stream's actual writable state
-  if (stream._isTransformShell) {
-    const nodeWritable = stream[kNodeWritable];
-    if (!nodeWritable) return null;
-    return nodeWritable.writableHighWaterMark - nodeWritable.writableLength;
-  }
-
+  // Use state-machine formula for all streams (including transform shells)
   return stream._hwm - stream[kWriteRequests].length - (stream[kInFlightWriteRequest] ? 1 : 0);
 }
