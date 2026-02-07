@@ -275,7 +275,7 @@ export class FastTransformStream {
           try {
             cancelResult = Reflect.apply(cancelFn, transformerObj, [reason]);
           } catch (e) {
-            // Error the writable side with the thrown error
+            // Sync throw: error writable immediately
             _errorTransformWritable(transformSelf, e);
             return Promise.reject(e);
           }
@@ -284,7 +284,11 @@ export class FastTransformStream {
         // (per spec: error() after cancel should take priority if called synchronously)
         queueMicrotask(() => _errorTransformWritable(transformSelf, reason));
         if (cancelResult && typeof cancelResult.then === 'function') {
-          return cancelResult;
+          // Handle async cancel rejection: error writable with thrown error
+          return cancelResult.catch((e) => {
+            _errorTransformWritable(transformSelf, e);
+            throw e;
+          });
         }
         return undefined;
       };
