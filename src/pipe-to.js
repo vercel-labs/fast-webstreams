@@ -9,7 +9,7 @@
  * https://streams.spec.whatwg.org/#readable-stream-pipe-to
  */
 
-import { kWritableState, kStoredError } from './utils.js';
+import { kWritableState, kStoredError, kNodeReadable } from './utils.js';
 
 export function specPipeTo(source, dest, options = {}) {
   // Options are pre-evaluated by caller (pipeTo/pipeThrough) in spec order
@@ -28,6 +28,7 @@ export function specPipeTo(source, dest, options = {}) {
   let destClosed = false;
   let destErrored = false;
   let destStoredError;
+  let sourceClosed = false;
 
   return new Promise((resolve, reject) => {
     // --- Abort signal handling ---
@@ -62,6 +63,7 @@ export function specPipeTo(source, dest, options = {}) {
     reader.closed.then(
       () => {
         // Source closed
+        sourceClosed = true;
         if (shuttingDown) return;
         if (!preventClose) {
           shutdownWithAction(() => {
@@ -116,7 +118,11 @@ export function specPipeTo(source, dest, options = {}) {
       (storedError) => {
         // Dest errored
         if (shuttingDown) return;
-        if (!preventCancel) {
+        // Per spec: don't cancel source if it's already closed/closing
+        const nodeReadable = source[kNodeReadable];
+        const srcAlreadyClosed = sourceClosed || source._closed ||
+          (nodeReadable && (nodeReadable.readableEnded || nodeReadable._readableState?.ended));
+        if (!preventCancel && !srcAlreadyClosed) {
           shutdownWithAction(() => reader.cancel(storedError), true, storedError);
         } else {
           shutdown(true, storedError);
@@ -136,7 +142,7 @@ export function specPipeTo(source, dest, options = {}) {
         return reader.read().then(
           ({ value, done }) => {
             if (shuttingDown) return;
-            if (done) return; // Source close handled by reader.closed
+            if (done) { sourceClosed = true; return; } // Source close handled by reader.closed
 
             currentWrite = writer.write(value);
             currentWrite.catch(() => {}); // Error handled by writer.closed
