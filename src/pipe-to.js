@@ -66,7 +66,11 @@ export function specPipeTo(source, dest, options = {}) {
             // WritableStreamDefaultWriterCloseWithErrorPropagation
             if (destErrored) return Promise.reject(destStoredError);
             if (destClosed) return Promise.resolve();
-            return writer.close();
+            // writer.close() may reject if already closed; treat as success
+            return writer.close().catch((e) => {
+              if (e instanceof TypeError) return; // Already closed/closing
+              throw e;
+            });
           });
         } else {
           shutdown();
