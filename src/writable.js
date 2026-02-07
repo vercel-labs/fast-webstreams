@@ -507,6 +507,19 @@ function _processWriteTransform(stream, writeRequest, nodeWritable, chunk) {
           const unwrapped = _unwrapError(err);
           writeRequest.reject(unwrapped);
           _handleWriteError(stream, unwrapped);
+          // For transforms: also error the readable side (TransformStreamError)
+          if (stream._transformReadable) {
+            const readable = stream._transformReadable();
+            if (readable && !readable._errored) {
+              readable._storedError = unwrapped;
+              readable._errored = true;
+              const readableReader = readable[kLock];
+              if (readableReader) {
+                if (readableReader._settleClosedFromError) readableReader._settleClosedFromError(unwrapped);
+                if (readableReader._errorReadRequests) readableReader._errorReadRequests(unwrapped);
+              }
+            }
+          }
         } else {
           writeRequest.resolve(undefined);
           const writer = stream[kLock];
