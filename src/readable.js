@@ -21,6 +21,7 @@ import { specPipeTo } from './pipe-to.js';
 const kIterReader = Symbol('kIterReader');
 const kIterDone = Symbol('kIterDone');
 const kIterPreventCancel = Symbol('kIterPreventCancel');
+const kIterOngoing = Symbol('kIterOngoing');
 
 let _readableStreamAsyncIteratorPrototype = null;
 function _getAsyncIteratorPrototype() {
@@ -30,36 +31,49 @@ function _getAsyncIteratorPrototype() {
     ));
     _readableStreamAsyncIteratorPrototype = Object.create(asyncIterProto);
 
+    // Helper: chain operation behind ongoing promise
+    function chainOperation(iter, op) {
+      const ongoing = iter[kIterOngoing];
+      iter[kIterOngoing] = ongoing
+        ? ongoing.then(op, op)
+        : op();
+      return iter[kIterOngoing];
+    }
+
     // Define methods with correct name, length, and enumerable properties
     async function next() {
-      if (this[kIterDone]) return { value: undefined, done: true };
-      try {
-        const result = await this[kIterReader].read();
-        if (result.done) {
+      return chainOperation(this, async () => {
+        if (this[kIterDone]) return { value: undefined, done: true };
+        try {
+          const result = await this[kIterReader].read();
+          if (result.done) {
+            this[kIterDone] = true;
+            this[kIterReader].releaseLock();
+          }
+          return result;
+        } catch (e) {
           this[kIterDone] = true;
           this[kIterReader].releaseLock();
+          throw e;
         }
-        return result;
-      } catch (e) {
-        this[kIterDone] = true;
-        this[kIterReader].releaseLock();
-        throw e;
-      }
+      });
     }
 
     // return needs length = 1, so we use an explicit parameter
     const returnFn = async function(value) {
-      if (!this[kIterDone]) {
-        this[kIterDone] = true;
-        if (!this[kIterPreventCancel]) {
-          const cancelResult = this[kIterReader].cancel(value);
-          this[kIterReader].releaseLock();
-          await cancelResult;
-        } else {
-          this[kIterReader].releaseLock();
+      return chainOperation(this, async () => {
+        if (!this[kIterDone]) {
+          this[kIterDone] = true;
+          if (!this[kIterPreventCancel]) {
+            const cancelResult = this[kIterReader].cancel(value);
+            this[kIterReader].releaseLock();
+            await cancelResult;
+          } else {
+            this[kIterReader].releaseLock();
+          }
         }
-      }
-      return { value, done: true };
+        return { value, done: true };
+      });
     };
     Object.defineProperty(returnFn, 'name', { value: 'return' });
 
@@ -647,6 +661,7 @@ export class FastReadableStream {
     iterator[kIterReader] = reader;
     iterator[kIterDone] = false;
     iterator[kIterPreventCancel] = preventCancel;
+    iterator[kIterOngoing] = null;
 
     return iterator;
   }
