@@ -124,7 +124,7 @@ async function run() {
       }
     } catch (err) {
       failed++;
-      errors.push(`${t.description}: ${err.message}`);
+      errors.push(`${t.description}: ${err?.message ?? String(err)}`);
     }
   }
 
