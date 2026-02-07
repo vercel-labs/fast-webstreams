@@ -60,6 +60,8 @@ export class FastReadableStreamDefaultController {
 
   error(e) {
     if (this.#errored) return;
+    // Per spec: error is no-op if stream is already closed
+    if (this.#closed || (this._stream && this._stream._closed)) return;
     this.#errored = true;
     if (e == null || e === false || e === 0 || e === '') {
       const wrapped = new Error('wrapped');
