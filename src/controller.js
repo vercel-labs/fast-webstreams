@@ -54,6 +54,11 @@ export class FastReadableStreamDefaultController {
     if (this._stream) {
       if (r.readableLength === 0) {
         this._stream._closed = true;
+        // Synchronously resolve reader.closed (don't wait for Node 'end' event)
+        const reader = this._stream[kLock];
+        if (reader && reader._resolveClosedFromCancel) {
+          reader._resolveClosedFromCancel();
+        }
       }
     }
   }
