@@ -2,8 +2,13 @@
  * Controller adapters that bridge WHATWG controller API to Node stream internals.
  */
 
+import { kLock } from './utils.js';
+
 // Sentinel for wrapping falsy error values that Node.js would lose
 const kWrappedError = Symbol('kWrappedError');
+
+// Brand token for internal-only construction
+const kControllerBrand = Symbol('kControllerBrand');
 
 /**
  * ReadableStreamDefaultController adapter.
@@ -43,9 +48,13 @@ export class FastReadableStreamDefaultController {
     if (r.readableLength === 0) {
       r.resume();
     }
-    // Track close state on the stream for releaseLock to use
+    // Track close state on the stream. Only set _closed if no buffered data
+    // (per spec: state transitions to "closed" only when queue is empty).
+    // When data is buffered, _closed is set later when 'end' fires.
     if (this._stream) {
-      this._stream._closed = true;
+      if (r.readableLength === 0) {
+        this._stream._closed = true;
+      }
     }
   }
 
@@ -62,6 +71,13 @@ export class FastReadableStreamDefaultController {
     // Track error state on the stream for releaseLock to use
     if (this._stream) {
       this._stream._storedError = e;
+      this._stream._errored = true;
+      // Per spec: synchronously settle closed FIRST, then reject pending reads
+      const reader = this._stream[kLock];
+      if (reader) {
+        if (reader._settleClosedFromError) reader._settleClosedFromError(e);
+        if (reader._errorReadRequests) reader._errorReadRequests(e);
+      }
     }
   }
 
@@ -76,7 +92,7 @@ export class FastReadableStreamDefaultController {
   }
 }
 
-export { kWrappedError };
+export { kWrappedError, kControllerBrand };
 
 /**
  * TransformStreamDefaultController adapter.
@@ -140,7 +156,10 @@ export class FastWritableStreamDefaultController {
   #controllerErrorFn;
   #stream;
 
-  constructor(nodeWritable, stream, controllerErrorFn) {
+  constructor(nodeWritable, stream, controllerErrorFn, brand) {
+    if (brand !== kControllerBrand) {
+      throw new TypeError('Illegal constructor');
+    }
     this.#nodeWritable = nodeWritable;
     this.#stream = stream;
     this.#controllerErrorFn = controllerErrorFn;

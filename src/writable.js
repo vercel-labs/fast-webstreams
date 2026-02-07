@@ -8,7 +8,7 @@ import { Writable } from 'node:stream';
 import {
   kNodeWritable, kState, kLock, kMaterialized, kNativeOnly, resolveHWM,
 } from './utils.js';
-import { FastWritableStreamDefaultController, kWrappedError } from './controller.js';
+import { FastWritableStreamDefaultController, kWrappedError, kControllerBrand } from './controller.js';
 import { FastWritableStreamDefaultWriter } from './writer.js';
 import { materializeWritable } from './materialize.js';
 
@@ -105,7 +105,7 @@ export class FastWritableStream {
           return;
         }
         try {
-          const result = write.call(underlyingSink, chunk, controller);
+          const result = Reflect.apply(write, underlyingSink, [chunk, controller]);
           if (result && typeof result.then === 'function') {
             result.then(() => callback(), callback);
           } else {
@@ -121,7 +121,7 @@ export class FastWritableStream {
           return;
         }
         try {
-          const result = close.call(underlyingSink);
+          const result = Reflect.apply(close, underlyingSink, []);
           if (result && typeof result.then === 'function') {
             result.then(() => callback(), callback);
           } else {
@@ -139,7 +139,7 @@ export class FastWritableStream {
     // Prevent unhandled 'error' events from crashing
     nodeWritable.on('error', () => {});
 
-    controller = new FastWritableStreamDefaultController(nodeWritable, self, _controllerError);
+    controller = new FastWritableStreamDefaultController(nodeWritable, self, _controllerError, kControllerBrand);
 
     this[kNodeWritable] = nodeWritable;
     this[kLock] = null;
@@ -157,7 +157,7 @@ export class FastWritableStream {
     let startResult;
     if (start) {
       try {
-        startResult = start.call(underlyingSink, controller);
+        startResult = Reflect.apply(start, underlyingSink, [controller]);
       } catch (e) {
         throw e;
       }
@@ -231,15 +231,11 @@ function _isCloseAllowed(stream) {
 }
 
 function _closeInternal(stream) {
-  const state = stream[kWritableState];
-  if (state === 'erroring' || state === 'errored') {
-    return Promise.reject(stream[kStoredError] || new TypeError('Cannot close an errored WritableStream'));
-  }
   return new Promise((resolve, reject) => {
     stream[kCloseRequest] = { resolve, reject };
-    // If writer exists, signal that close is requested (ready resolves immediately)
+    // Per spec: only resolve ready if state is 'writable' (not erroring)
     const writer = stream[kLock];
-    if (writer && writer._resolveReady) {
+    if (writer && writer._resolveReady && stream[kWritableState] === 'writable') {
       writer._resolveReady();
     }
     _advanceQueueIfNeeded(stream);
@@ -339,18 +335,10 @@ function _finishErroring(stream) {
     req.reject(storedError);
   }
 
-  // Reject close request if any
-  if (stream[kCloseRequest]) {
-    stream[kCloseRequest].reject(storedError);
-    stream[kCloseRequest] = null;
-  }
-
   const abortRequest = stream[kPendingAbortRequest];
   if (!abortRequest) {
-    const writer = stream[kLock];
-    if (writer) {
-      writer._rejectClosed(storedError);
-    }
+    // No abort — reject close and closed immediately
+    _rejectCloseAndClosedPromiseIfNeeded(stream, storedError);
     return;
   }
 
@@ -358,10 +346,7 @@ function _finishErroring(stream) {
 
   if (abortRequest.wasAlreadyErroring) {
     abortRequest.reject(storedError);
-    const writer = stream[kLock];
-    if (writer) {
-      writer._rejectClosed(storedError);
-    }
+    _rejectCloseAndClosedPromiseIfNeeded(stream, storedError);
     return;
   }
 
@@ -369,45 +354,45 @@ function _finishErroring(stream) {
   const sinkAbort = stream._sinkAbort;
   if (!sinkAbort) {
     abortRequest.resolve();
-    const writer = stream[kLock];
-    if (writer) {
-      writer._rejectClosed(storedError);
-    }
+    _rejectCloseAndClosedPromiseIfNeeded(stream, storedError);
     return;
   }
 
   try {
-    const result = sinkAbort.call(stream._underlyingSink, abortRequest.reason);
+    const result = Reflect.apply(sinkAbort, stream._underlyingSink, [abortRequest.reason]);
     if (result && typeof result.then === 'function') {
       result.then(
         () => {
           abortRequest.resolve();
-          const writer = stream[kLock];
-          if (writer) {
-            writer._rejectClosed(storedError);
-          }
+          _rejectCloseAndClosedPromiseIfNeeded(stream, storedError);
         },
         (e) => {
           abortRequest.reject(e);
-          const writer = stream[kLock];
-          if (writer) {
-            writer._rejectClosed(storedError);
-          }
+          _rejectCloseAndClosedPromiseIfNeeded(stream, storedError);
         }
       );
     } else {
       abortRequest.resolve();
-      const writer = stream[kLock];
-      if (writer) {
-        writer._rejectClosed(storedError);
-      }
+      _rejectCloseAndClosedPromiseIfNeeded(stream, storedError);
     }
   } catch (e) {
     abortRequest.reject(e);
-    const writer = stream[kLock];
-    if (writer) {
-      writer._rejectClosed(storedError);
-    }
+    _rejectCloseAndClosedPromiseIfNeeded(stream, storedError);
+  }
+}
+
+/**
+ * Per spec: WritableStreamRejectCloseAndClosedPromiseIfNeeded
+ * Reject close request and writer.closed AFTER abort handling.
+ */
+function _rejectCloseAndClosedPromiseIfNeeded(stream, storedError) {
+  if (stream[kCloseRequest]) {
+    stream[kCloseRequest].reject(storedError);
+    stream[kCloseRequest] = null;
+  }
+  const writer = stream[kLock];
+  if (writer) {
+    writer._rejectClosed(storedError);
   }
 }
 
@@ -416,7 +401,10 @@ function _advanceQueueIfNeeded(stream) {
   const state = stream[kWritableState];
   if (state === 'errored' || state === 'closed') return;
   if (state === 'erroring') {
-    _finishErroring(stream);
+    // Per spec: only finish erroring when no in-flight operations
+    if (!_hasOperationMarkedInFlight(stream)) {
+      _finishErroring(stream);
+    }
     return;
   }
 
@@ -618,7 +606,8 @@ function _handleCloseError(stream, error) {
   const writer = stream[kLock];
   if (writer) {
     writer._rejectReady(error);
-    writer._rejectClosed(error);
+    // Per spec: when abort is pending, closed rejects with abort reason
+    writer._rejectClosed(abortRequest ? abortRequest.reason : error);
   }
 }
 
@@ -685,14 +674,13 @@ export function _closeFromWriter(stream) {
     return Promise.reject(new TypeError('Cannot close stream'));
   }
 
-  if (state === 'erroring') {
-    return Promise.reject(stream[kStoredError]);
-  }
-
+  // Per spec: check close queued/in-flight BEFORE erroring state
   if (stream[kCloseRequest] || stream[kInFlightCloseRequest]) {
     return Promise.reject(new TypeError('Cannot close an already-closing stream'));
   }
 
+  // Per spec: state is 'writable' or 'erroring' — proceed with close.
+  // Close will be rejected later by _finishErroring if erroring.
   return _closeInternal(stream);
 }
 

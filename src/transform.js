@@ -150,7 +150,7 @@ export class FastTransformStream {
             return;
           }
           try {
-            const result = transform.call(transformer, chunk, controller);
+            const result = Reflect.apply(transform, transformer, [chunk, controller]);
             if (result && typeof result.then === 'function') {
               result.then(() => callback(), callback);
             } else {
@@ -173,7 +173,7 @@ export class FastTransformStream {
             return;
           }
           try {
-            const result = flush.call(transformer, controller);
+            const result = Reflect.apply(flush, transformer, [controller]);
             if (result && typeof result.then === 'function') {
               result.then(() => callback(), callback);
             } else {
@@ -193,7 +193,7 @@ export class FastTransformStream {
         if (err && cancel && typeof cancel === 'function' && !self._cancelCalled) {
           self._cancelCalled = true;
           try {
-            const result = cancel.call(transformer, err);
+            const result = Reflect.apply(cancel, transformer, [err]);
             if (result && typeof result.then === 'function') {
               result.then(() => callback(err), () => callback(err));
               return;
@@ -222,7 +222,7 @@ export class FastTransformStream {
     this._errorWritable = (reason) => _errorTransformWritable(this, reason);
 
     if (start) {
-      const startResult = start.call(transformer, controller);
+      const startResult = Reflect.apply(start, transformer, [controller]);
       if (startResult && typeof startResult.then === 'function') {
         startPromise = startResult;
         startResult.catch((err) => {
@@ -253,7 +253,7 @@ export class FastTransformStream {
         if (cancelFn && !transformSelf._cancelCalled) {
           transformSelf._cancelCalled = true;
           try {
-            cancelResult = cancelFn.call(transformerObj, reason);
+            cancelResult = Reflect.apply(cancelFn, transformerObj, [reason]);
           } catch (e) {
             // Error the writable side with the cancel error
             _errorTransformWritable(transformSelf, e);
@@ -305,7 +305,7 @@ export class FastTransformStream {
         this.#writable._sinkAbort = (reason) => {
           if (transformSelf._cancelCalled) return undefined;
           transformSelf._cancelCalled = true;
-          return cancelFn.call(transformerObj, reason);
+          return Reflect.apply(cancelFn, transformerObj, [reason]);
         };
         this.#writable._underlyingSink = transformerObj;
       } else {

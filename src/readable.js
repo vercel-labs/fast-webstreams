@@ -208,11 +208,18 @@ export class FastReadableStream {
 
     let controller;
     let pullCallback = null;
+    let startCompleted = false;
 
     const nodeReadable = new Readable({
       objectMode: true,
       highWaterMark: hwm === Infinity ? 0x7FFFFFFF : hwm,
       read() {
+        // Per spec: pull must not be called until start completes
+        if (!startCompleted) {
+          // Reset Node's internal reading flag so read(0) works later
+          nodeReadable._readableState.reading = false;
+          return;
+        }
         if (pull) {
           if (pullCallback) return;
 
@@ -223,16 +230,20 @@ export class FastReadableStream {
               result.then(
                 () => {
                   pullCallback = null;
+                  // Reset reading flag so read(0) re-triggers _read()
+                  nodeReadable._readableState.reading = false;
                   if (!nodeReadable.destroyed) nodeReadable.read(0);
                 },
                 (err) => {
                   pullCallback = null;
-                  if (!nodeReadable.destroyed) nodeReadable.destroy(err);
+                  if (!nodeReadable.destroyed) controller.error(err);
                 }
               );
             }
+            // For sync pull: don't touch reading flag.
+            // Node's internal maybeReadMore handles re-triggering after push.
           } catch (e) {
-            if (!nodeReadable.destroyed) nodeReadable.destroy(e);
+            if (!nodeReadable.destroyed) controller.error(e);
           }
         }
       },
@@ -252,6 +263,7 @@ export class FastReadableStream {
     this[kUpstream] = null;
     this[kNativeOnly] = false;
     this._closed = false;
+    this._errored = false;
 
     // Fix 10: Store cancel callback for later use
     this._cancel = cancel;
@@ -263,23 +275,29 @@ export class FastReadableStream {
       if (startResult && typeof startResult.then === 'function') {
         startResult.then(
           () => {
-            // Only auto-pull if desiredSize > 0 (HWM > 0 and buffer empty)
+            startCompleted = true;
             if (pull && !nodeReadable.destroyed && hwm > 0) {
               nodeReadable.read(0);
             }
           },
-          (err) => { if (!nodeReadable.destroyed) nodeReadable.destroy(err); }
+          (err) => { controller.error(err); }
         );
-      } else if (pull && hwm > 0) {
-        // Trigger initial pull after sync start only if HWM > 0
+      } else {
+        // Sync start — per spec, start "completes" via microtask
         queueMicrotask(() => {
-          if (!nodeReadable.destroyed) nodeReadable.read(0);
+          startCompleted = true;
+          if (pull && !nodeReadable.destroyed && hwm > 0) {
+            nodeReadable.read(0);
+          }
         });
       }
-    } else if (pull && hwm > 0) {
-      // No start, trigger pull to fill buffer only if HWM > 0
+    } else {
+      // No start — per spec, start completes via resolved promise's .then()
       queueMicrotask(() => {
-        if (!nodeReadable.destroyed) nodeReadable.read(0);
+        startCompleted = true;
+        if (pull && !nodeReadable.destroyed && hwm > 0) {
+          nodeReadable.read(0);
+        }
       });
     }
   }
@@ -478,6 +496,24 @@ export class FastReadableStream {
     // For native-only streams, delegate
     if (this[kNativeOnly]) {
       return materializeReadable(this).cancel(reason);
+    }
+
+    // Per spec: if errored, reject immediately
+    if (this._errored) {
+      return Promise.reject(this._storedError);
+    }
+    // Per spec: if already closed, resolve immediately
+    if (this._closed) {
+      return Promise.resolve(undefined);
+    }
+
+    // Per spec: set state to "closed" synchronously BEFORE calling cancel
+    this._closed = true;
+
+    // Per spec: resolve reader's closedPromise synchronously
+    const reader = this[kLock];
+    if (reader && reader._resolveClosedFromCancel) {
+      reader._resolveClosedFromCancel();
     }
 
     // Call underlyingSource.cancel and return its result

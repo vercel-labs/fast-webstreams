@@ -36,43 +36,59 @@ export class FastReadableStreamDefaultReader {
       this.#closedReject = reject;
     });
 
-    const nodeReadable = this.#nodeReadable;
-
-    // Check if already done
-    if (nodeReadable.destroyed) {
-      if (nodeReadable.errored) {
-        this.#settleClose(false, unwrapError(nodeReadable.errored));
-      } else {
-        this.#settleClose(true);
-      }
-    } else if (nodeReadable.readableEnded) {
+    // Use stream-level state for initial closed/errored checks (preserves error identity)
+    if (stream._errored) {
+      this.#settleClose(false, stream._storedError);
+    } else if (stream._closed) {
       this.#settleClose(true);
     } else {
-      // Listen for close events
-      const onEnd = () => {
-        cleanup();
-        this.#settleClose(true);
-      };
-      const onError = (err) => {
-        cleanup();
-        this.#settleClose(false, unwrapError(err));
-      };
-      const onClose = () => {
-        cleanup();
+      const nodeReadable = this.#nodeReadable;
+
+      // Check Node-level state as fallback
+      if (nodeReadable.destroyed) {
         if (nodeReadable.errored) {
           this.#settleClose(false, unwrapError(nodeReadable.errored));
         } else {
           this.#settleClose(true);
         }
-      };
-      const cleanup = () => {
-        nodeReadable.removeListener('end', onEnd);
-        nodeReadable.removeListener('error', onError);
-        nodeReadable.removeListener('close', onClose);
-      };
-      nodeReadable.on('end', onEnd);
-      nodeReadable.on('error', onError);
-      nodeReadable.on('close', onClose);
+      } else if (nodeReadable.readableEnded) {
+        this.#settleClose(true);
+      } else {
+        // Listen for close events
+        const onEnd = () => {
+          cleanup();
+          stream._closed = true;
+          this.#settleClose(true);
+        };
+        const onError = (err) => {
+          cleanup();
+          // Use stream-level error if available (preserves identity)
+          if (stream._errored) {
+            this.#settleClose(false, stream._storedError);
+          } else {
+            this.#settleClose(false, unwrapError(err));
+          }
+        };
+        const onClose = () => {
+          cleanup();
+          if (stream._errored) {
+            this.#settleClose(false, stream._storedError);
+          } else if (nodeReadable.errored) {
+            this.#settleClose(false, unwrapError(nodeReadable.errored));
+          } else {
+            stream._closed = true;
+            this.#settleClose(true);
+          }
+        };
+        const cleanup = () => {
+          nodeReadable.removeListener('end', onEnd);
+          nodeReadable.removeListener('error', onError);
+          nodeReadable.removeListener('close', onClose);
+        };
+        nodeReadable.on('end', onEnd);
+        nodeReadable.on('error', onError);
+        nodeReadable.on('close', onClose);
+      }
     }
   }
 
@@ -83,6 +99,7 @@ export class FastReadableStreamDefaultReader {
       this.#closedResolve(undefined);
     } else {
       this.#closedReject(err);
+      this.#closedPromise.catch(() => {});
     }
   }
 
@@ -91,9 +108,15 @@ export class FastReadableStreamDefaultReader {
       return Promise.reject(new TypeError('Reader has been released'));
     }
 
+    const stream = this.#stream;
     const nodeReadable = this.#nodeReadable;
 
-    // Check if the stream has errored
+    // Check stream-level error first (preserves error identity for falsy errors)
+    if (stream._errored) {
+      return Promise.reject(stream._storedError);
+    }
+
+    // Check if the stream has errored (Node-level fallback)
     if (nodeReadable.errored) {
       return Promise.reject(unwrapError(nodeReadable.errored));
     }
@@ -106,6 +129,7 @@ export class FastReadableStreamDefaultReader {
     // Tier 1: sync fast path — data already in buffer
     const chunk = nodeReadable.read();
     if (chunk !== null) {
+      // Node's internal maybeReadMore handles re-triggering pull after consumption
       return Promise.resolve({ value: chunk, done: false });
     }
 
@@ -145,12 +169,19 @@ export class FastReadableStreamDefaultReader {
       const onError = (err) => {
         cleanup();
         removePending();
-        reject(unwrapError(err));
+        // Use stream-level error if available
+        if (stream._errored) {
+          reject(stream._storedError);
+        } else {
+          reject(unwrapError(err));
+        }
       };
       const onClose = () => {
         cleanup();
         removePending();
-        if (nodeReadable.errored) {
+        if (stream._errored) {
+          reject(stream._storedError);
+        } else if (nodeReadable.errored) {
           reject(unwrapError(nodeReadable.errored));
         } else {
           resolve({ value: undefined, done: true });
@@ -174,6 +205,11 @@ export class FastReadableStreamDefaultReader {
       nodeReadable.once('end', onEnd);
       nodeReadable.once('error', onError);
       nodeReadable.once('close', onClose);
+
+      // Trigger _read() to request data (pull). Reset reading flag first
+      // in case a previous sync pull didn't push data (reading stays true).
+      nodeReadable._readableState.reading = false;
+      nodeReadable.read(0);
     });
   }
 
@@ -183,6 +219,42 @@ export class FastReadableStreamDefaultReader {
     }
     // Call the stream's internal cancel (bypasses lock check, calls underlyingSource.cancel)
     return this.#stream._cancelInternal(reason);
+  }
+
+  /**
+   * Called by controller.error() to synchronously settle the closedPromise.
+   * Must be called BEFORE _errorReadRequests so closed rejects before reads.
+   */
+  _settleClosedFromError(error) {
+    if (!this.#closedSettled && !this.#released) {
+      this.#closedSettled = true;
+      this.#closedReject(error);
+      this.#closedPromise.catch(() => {});
+    }
+  }
+
+  /**
+   * Called by controller.error() to synchronously reject all pending read requests.
+   * Per spec: ReadableStreamError rejects all read requests before releaseLock.
+   */
+  _errorReadRequests(error) {
+    for (const entry of this.#pendingReads) {
+      if (entry.cleanup) entry.cleanup();
+      if (entry.reject) entry.reject(error);
+    }
+    this.#pendingReads = [];
+  }
+
+  /**
+   * Called by stream._cancelInternal() to resolve closedPromise synchronously.
+   * Per spec: cancel sets stream state to "closed" and resolves reader.closedPromise
+   * before calling the cancel algorithm.
+   */
+  _resolveClosedFromCancel() {
+    if (!this.#closedSettled && !this.#released) {
+      this.#closedResolve(undefined);
+      this.#closedSettled = true;
+    }
   }
 
   releaseLock() {
@@ -199,28 +271,34 @@ export class FastReadableStreamDefaultReader {
       }
       this.#pendingReads = [];
 
-      // Check if the stream closed or errored since the promise was created.
-      // If so, settle the original promise before replacing it.
       if (!this.#closedSettled) {
+        // Per spec: if state is "readable", reject existing promise (preserve identity).
+        // If state is "closed" or "errored", the promise should already be settled
+        // from events. But if it hasn't settled yet, settle it first.
         if (stream._closed) {
-          // Stream was closed — resolve the original promise
+          // Stream closed (e.g., via cancel) — resolve, then replace
           this.#closedResolve(undefined);
           this.#closedSettled = true;
-        } else if (stream._storedError !== undefined) {
-          // Stream errored — reject the original promise with the stored error
+          this.#closedPromise = Promise.reject(releasedError);
+          this.#closedPromise.catch(() => {});
+        } else if (stream._errored) {
+          // Stream errored — reject with stored error, then replace
           this.#closedReject(stream._storedError);
           this.#closedPromise.catch(() => {});
           this.#closedSettled = true;
+          this.#closedPromise = Promise.reject(releasedError);
+          this.#closedPromise.catch(() => {});
         } else {
-          // Stream still open — reject as released
+          // Stream still readable — reject existing promise, preserve identity
           this.#closedReject(releasedError);
           this.#closedPromise.catch(() => {});
           this.#closedSettled = true;
         }
+      } else {
+        // Already settled — per spec: replace with new rejected promise
+        this.#closedPromise = Promise.reject(releasedError);
+        this.#closedPromise.catch(() => {});
       }
-      // Replace with a new rejected promise for post-release access
-      this.#closedPromise = Promise.reject(new TypeError('Reader was released'));
-      this.#closedPromise.catch(() => {});
 
       stream[kLock] = null;
     }

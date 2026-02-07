@@ -3,7 +3,7 @@
  * Bridges writer.write() to the writable state machine.
  */
 
-import { kNodeWritable, kLock } from './utils.js';
+import { kNodeWritable, kLock, isFastWritable } from './utils.js';
 import {
   kWritableState, kStoredError, kPendingAbortRequest,
   kInFlightWriteRequest, kWriteRequests, kCloseRequest, kInFlightCloseRequest,
@@ -24,6 +24,10 @@ export class FastWritableStreamDefaultWriter {
   #released = false;
 
   constructor(stream) {
+    // Brand check: must be a FastWritableStream
+    if (!isFastWritable(stream)) {
+      throw new TypeError('Illegal constructor');
+    }
     if (stream[kLock]) {
       throw new TypeError('WritableStream is already locked');
     }
@@ -40,9 +44,9 @@ export class FastWritableStreamDefaultWriter {
     const state = stream[kWritableState];
 
     if (state === 'writable') {
-      // Check if there's backpressure or close pending
+      // Per spec: ready reflects backpressure only, NOT start status.
+      // Ready is resolved unless there's backpressure (desiredSize <= 0).
       if (!_defaultWriterReadyPromiseIsSettled(stream)) {
-        // Pending ready (backpressure or not started)
         this.#readyPromise = new Promise((resolve, reject) => {
           this.#readyResolve = resolve;
           this.#readyReject = reject;
@@ -77,18 +81,6 @@ export class FastWritableStreamDefaultWriter {
       this.#closedReject(storedError);
       this.#closedPromise.catch(() => {});
       this.#closedSettled = true;
-    }
-
-    // If start is pending, ready should wait for it
-    if (stream._startPromise && state === 'writable' && !this.#readySettled) {
-      // Already have a pending ready promise, good
-    } else if (stream._startPromise && state === 'writable' && this.#readySettled) {
-      // Need to convert to pending
-      this.#readyPromise = new Promise((resolve, reject) => {
-        this.#readyResolve = resolve;
-        this.#readyReject = reject;
-      });
-      this.#readySettled = false;
     }
   }
 
@@ -297,9 +289,7 @@ export class FastWritableStreamDefaultWriter {
  * Ready should be pending if the stream hasn't started or if there's backpressure.
  */
 function _defaultWriterReadyPromiseIsSettled(stream) {
-  // If start is pending, ready should be pending
-  if (stream._startPromise) return false;
-  // If desiredSize <= 0, there's backpressure
+  // Per spec: ready reflects backpressure only (not start status)
   const desiredSize = _getDesiredSize(stream);
   return desiredSize !== null && desiredSize > 0;
 }
