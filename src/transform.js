@@ -17,6 +17,7 @@ import {
   kWritableState, kStoredError, kPendingAbortRequest,
   kInFlightWriteRequest, kInFlightCloseRequest,
   kWriteRequests, kCloseRequest, kStarted,
+  _controllerError as _writableControllerError,
 } from './writable.js';
 import { kWrappedError } from './controller.js';
 
@@ -28,54 +29,23 @@ function _unwrapError(err) {
 }
 
 /**
- * Error the transform's writable side via the state machine.
- * Called when readable.cancel() is invoked on a transform's readable.
+ * Error the transform's writable side via the proper state machine.
+ * Uses _writableControllerError which transitions through erroring → errored,
+ * properly handling in-flight writes and pending aborts.
  */
 function _errorTransformWritable(transformSelf, reason) {
   const writable = transformSelf.writable;
-  const state = writable[kWritableState];
 
-  // Per spec: WritableStreamDefaultControllerErrorIfNeeded only errors if state === 'writable'
-  if (state !== 'writable') return;
-
-  // Don't error if close/flush is in flight — let it complete
-  if (writable[kInFlightCloseRequest]) return;
-
-  writable[kWritableState] = 'errored';
-  writable[kStoredError] = reason;
-
-  // Reject all queued writes
-  const writeRequests = writable[kWriteRequests];
-  writable[kWriteRequests] = [];
-  for (const req of writeRequests) {
+  // For transform shells: clear in-flight write that may never complete
+  // (Node transform callbacks don't fire after destroy).
+  // Must clear BEFORE _controllerError so _finishErroring can run.
+  if (writable._isTransformShell && writable[kInFlightWriteRequest]) {
+    const req = writable[kInFlightWriteRequest];
+    writable[kInFlightWriteRequest] = null;
     req.reject(reason);
   }
 
-  // Reject close request
-  if (writable[kCloseRequest]) {
-    writable[kCloseRequest].reject(reason);
-    writable[kCloseRequest] = null;
-  }
-
-  // Reject in-flight write
-  if (writable[kInFlightWriteRequest]) {
-    writable[kInFlightWriteRequest].reject(reason);
-    writable[kInFlightWriteRequest] = null;
-  }
-
-  // Reject writer's ready and closed
-  const writer = writable[kLock];
-  if (writer) {
-    writer._rejectReadyIfPending(reason);
-    writer._rejectClosed(reason);
-  }
-
-  // Handle pending abort
-  const abortRequest = writable[kPendingAbortRequest];
-  if (abortRequest) {
-    writable[kPendingAbortRequest] = null;
-    abortRequest.reject(reason);
-  }
+  _writableControllerError(writable, reason);
 }
 
 export class FastTransformStream {
