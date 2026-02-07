@@ -127,7 +127,10 @@ export class FastTransformStreamDefaultController {
   }
 
   error(e) {
-    if (this.#terminated) return;
+    if (this.#errored) return;
+    // Per spec: error is no-op if readable is "closed" (fully closed, no queued data).
+    // But if terminated with queued data (closeRequested but state="readable"), error should work.
+    if (this.#terminated && this.#nodeTransform.readableLength === 0) return;
     this.#terminated = true;
     this.#errored = true;
     // Error the readable side directly (set stored error + reject reader)
