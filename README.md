@@ -43,7 +43,7 @@ These are drop-in replacements for the global `ReadableStream`, `WritableStream`
 To replace the built-in stream constructors globally:
 
 ```js
-import { patchGlobalWebStreams, unpatchGlobalWebStreams } from 'experimental-fast-webstreams/patch';
+import { patchGlobalWebStreams, unpatchGlobalWebStreams } from 'experimental-fast-webstreams';
 
 patchGlobalWebStreams();
 // globalThis.ReadableStream is now FastReadableStream

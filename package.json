@@ -1,6 +1,6 @@
 {
   "name": "experimental-fast-webstreams",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "type": "module",
   "description": "Exploring faster WebStreams for Node.js",
   "types": "./types/index.d.ts",

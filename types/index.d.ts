@@ -49,3 +49,9 @@ export declare const FastWritableStreamDefaultWriter: {
   new <W = any>(stream: WritableStream<W>): WritableStreamDefaultWriter<W>;
   prototype: WritableStreamDefaultWriter;
 };
+
+/** Replace global ReadableStream, WritableStream, TransformStream with fast alternatives. */
+export declare function patchGlobalWebStreams(): void;
+
+/** Restore the original native stream constructors. */
+export declare function unpatchGlobalWebStreams(): void;
