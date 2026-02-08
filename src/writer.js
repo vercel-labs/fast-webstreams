@@ -3,9 +3,9 @@
  * Bridges writer.write() to the writable state machine.
  */
 
-import { kNodeWritable, kLock, isFastWritable } from './utils.js';
+import { kNodeWritable, kLock, isFastWritable, kWritableState, kStoredError, noop, RESOLVED_UNDEFINED } from './utils.js';
 import {
-  kWritableState, kStoredError, kPendingAbortRequest,
+  kPendingAbortRequest,
   kInFlightWriteRequest, kWriteRequests, kCloseRequest, kInFlightCloseRequest,
   _abortInternal, _writeInternal, _closeFromWriter, _getDesiredSize,
 } from './writable.js';
@@ -53,19 +53,19 @@ export class FastWritableStreamDefaultWriter {
         });
         this.#readySettled = false;
       } else {
-        this.#readyPromise = Promise.resolve(undefined);
+        this.#readyPromise = RESOLVED_UNDEFINED;
         this.#readySettled = true;
         this.#readyResolve = null;
         this.#readyReject = null;
       }
     } else if (state === 'erroring') {
       this.#readyPromise = Promise.reject(stream[kStoredError]);
-      this.#readyPromise.catch(() => {});
+      this.#readyPromise.catch(noop);
       this.#readySettled = true;
       this.#readyResolve = null;
       this.#readyReject = null;
     } else if (state === 'closed') {
-      this.#readyPromise = Promise.resolve(undefined);
+      this.#readyPromise = RESOLVED_UNDEFINED;
       this.#readySettled = true;
       this.#readyResolve = null;
       this.#readyReject = null;
@@ -74,12 +74,12 @@ export class FastWritableStreamDefaultWriter {
     } else if (state === 'errored') {
       const storedError = stream[kStoredError];
       this.#readyPromise = Promise.reject(storedError);
-      this.#readyPromise.catch(() => {});
+      this.#readyPromise.catch(noop);
       this.#readySettled = true;
       this.#readyResolve = null;
       this.#readyReject = null;
       this.#closedReject(storedError);
-      this.#closedPromise.catch(() => {});
+      this.#closedPromise.catch(noop);
       this.#closedSettled = true;
     }
   }
@@ -118,23 +118,23 @@ export class FastWritableStreamDefaultWriter {
         // Reject ready FIRST (so ready handlers fire before closed handlers)
         if (!this.#readySettled) {
           this.#readyReject(typeError);
-          this.#readyPromise.catch(() => {});
+          this.#readyPromise.catch(noop);
           this.#readySettled = true;
         } else {
           this.#readyPromise = Promise.reject(typeError);
-          this.#readyPromise.catch(() => {});
+          this.#readyPromise.catch(noop);
         }
 
         // Then reject closed
         this.#closedReject(typeError);
-        this.#closedPromise.catch(() => {});
+        this.#closedPromise.catch(noop);
         this.#closedSettled = true;
       } else {
         const typeError = new TypeError('Writer was released');
         this.#readyPromise = Promise.reject(typeError);
-        this.#readyPromise.catch(() => {});
+        this.#readyPromise.catch(noop);
         this.#closedPromise = Promise.reject(typeError);
-        this.#closedPromise.catch(() => {});
+        this.#closedPromise.catch(noop);
       }
 
       stream[kLock] = null;
@@ -164,14 +164,14 @@ export class FastWritableStreamDefaultWriter {
   _rejectReadyIfPending(reason) {
     if (!this.#readySettled && this.#readyReject) {
       this.#readyReject(reason);
-      this.#readyPromise.catch(() => {});
+      this.#readyPromise.catch(noop);
       this.#readySettled = true;
       this.#readyResolve = null;
       this.#readyReject = null;
     } else if (this.#readySettled) {
       // Replace with a new rejected promise
       this.#readyPromise = Promise.reject(reason);
-      this.#readyPromise.catch(() => {});
+      this.#readyPromise.catch(noop);
     }
   }
 
@@ -194,7 +194,7 @@ export class FastWritableStreamDefaultWriter {
     if (this.#released) return;
     if (!this.#closedSettled) {
       this.#closedReject(error);
-      this.#closedPromise.catch(() => {});
+      this.#closedPromise.catch(noop);
       this.#closedSettled = true;
     }
   }
@@ -206,13 +206,13 @@ export class FastWritableStreamDefaultWriter {
     if (this.#released) return;
     if (!this.#readySettled && this.#readyReject) {
       this.#readyReject(error);
-      this.#readyPromise.catch(() => {});
+      this.#readyPromise.catch(noop);
       this.#readySettled = true;
       this.#readyResolve = null;
       this.#readyReject = null;
     } else {
       this.#readyPromise = Promise.reject(error);
-      this.#readyPromise.catch(() => {});
+      this.#readyPromise.catch(noop);
       this.#readySettled = true;
     }
   }
@@ -252,7 +252,7 @@ export class FastWritableStreamDefaultWriter {
         this.#readyResolve = null;
         this.#readyReject = null;
       } else if (!this.#readySettled) {
-        this.#readyPromise = Promise.resolve(undefined);
+        this.#readyPromise = RESOLVED_UNDEFINED;
         this.#readySettled = true;
       }
     }

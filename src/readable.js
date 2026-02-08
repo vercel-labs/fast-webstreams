@@ -8,9 +8,9 @@
 
 import { Readable, pipeline } from 'node:stream';
 import {
-  kNodeReadable, kNodeWritable, kState, kLock, kMaterialized, kUpstream,
-  isFastReadable, isFastWritable, isFastTransform, resolveHWM, kNativeOnly,
-  kWritableState,
+  kNodeReadable, kNodeWritable, kLock, kMaterialized, kUpstream,
+  isFastReadable, isFastWritable, isFastTransform, kNativeOnly,
+  kWritableState, kSkipDestroy, isThenable, noop,
 } from './utils.js';
 import { FastReadableStreamDefaultController } from './controller.js';
 import { FastReadableStreamDefaultReader } from './reader.js';
@@ -124,7 +124,7 @@ function collectPipelineChain(readable, destination) {
 }
 
 /**
- * Tier 1 fast path: pipe Fast→Fast via Node.js pipeline().
+ * Tier 0 fast path: pipe Fast→Fast via Node.js pipeline().
  * Walks upstream links and builds a single pipeline() call.
  */
 function fastPipelineTo(source, dest) {
@@ -144,21 +144,32 @@ function fastPipelineTo(source, dest) {
   });
 }
 
+/**
+ * Initialize a native-only readable shell (delegates everything to native ReadableStream).
+ */
+export function _initNativeReadableShell(target, nativeStream) {
+  // Property order must match FastReadableStream constructor for monomorphic hidden class
+  target[kNodeReadable] = null;
+  target[kLock] = null;
+  target[kMaterialized] = nativeStream;
+  target[kUpstream] = null;
+  target[kNativeOnly] = true;
+  target._closed = false;
+  target._errored = false;
+  target._cancel = null;
+  target._storedError = undefined;
+  target._onPull = null;
+  return target;
+}
+
 export class FastReadableStream {
   /**
-   * Static from() — delegates to native ReadableStream.from() (Fix 3)
+   * Static from() — delegates to native ReadableStream.from()
    * Wraps result in a FastReadableStream shell so .constructor checks pass
    */
   static from(asyncIterable) {
     const native = ReadableStream.from(asyncIterable);
-    const fast = Object.create(FastReadableStream.prototype);
-    fast[kMaterialized] = native;
-    fast[kNodeReadable] = null;
-    fast[kLock] = null;
-    fast[kState] = 'idle';
-    fast[kNativeOnly] = true;
-    fast[kUpstream] = null;
-    return fast;
+    return _initNativeReadableShell(Object.create(FastReadableStream.prototype), native);
   }
 
   constructor(underlyingSource, strategy) {
@@ -190,12 +201,7 @@ export class FastReadableStream {
 
     // Validate type
     if (type === 'bytes') {
-      const native = new ReadableStream(underlyingSource, strategy);
-      this[kMaterialized] = native;
-      this[kNodeReadable] = null;
-      this[kLock] = null;
-      this[kState] = 'idle';
-      this[kNativeOnly] = true;
+      _initNativeReadableShell(this, new ReadableStream(underlyingSource, strategy));
       return;
     }
     if (type !== undefined) {
@@ -215,12 +221,7 @@ export class FastReadableStream {
 
     // If strategy has a custom size(), delegate to native
     if (typeof strategySize === 'function') {
-      const native = new ReadableStream(underlyingSource, strategy);
-      this[kMaterialized] = native;
-      this[kNodeReadable] = null;
-      this[kLock] = null;
-      this[kState] = 'idle';
-      this[kNativeOnly] = true;
+      _initNativeReadableShell(this, new ReadableStream(underlyingSource, strategy));
       return;
     }
 
@@ -250,7 +251,7 @@ export class FastReadableStream {
 
           try {
             const result = pull.call(underlyingSource, controller);
-            if (result && typeof result.then === 'function') {
+            if (isThenable(result)) {
               pullCallback = result;
               result.then(
                 () => {
@@ -277,27 +278,23 @@ export class FastReadableStream {
     // Prevent unhandled 'error' events from crashing
     nodeReadable.on('error', () => {});
 
-    // Fix 8: Track original HWM for Infinity handling
     controller = new FastReadableStreamDefaultController(nodeReadable, hwm);
     controller._stream = this;
 
     this[kNodeReadable] = nodeReadable;
     this[kLock] = null;
-    this[kState] = 'idle';
     this[kMaterialized] = null;
     this[kUpstream] = null;
     this[kNativeOnly] = false;
     this._closed = false;
     this._errored = false;
-
-    // Fix 10: Store cancel callback for later use
     this._cancel = cancel;
-
     this._storedError = undefined;
+    this._onPull = null;
 
     if (start) {
       const startResult = start.call(underlyingSource, controller);
-      if (startResult && typeof startResult.then === 'function') {
+      if (isThenable(startResult)) {
         startResult.then(
           () => {
             startCompleted = true;
@@ -478,7 +475,7 @@ export class FastReadableStream {
       signal,
     });
     // Mark as handled (spec: set [[PromiseIsHandled]] to true)
-    pipePromise.catch(() => {});
+    pipePromise.catch(noop);
 
     return readable;
   }
@@ -503,7 +500,7 @@ export class FastReadableStream {
       throw new TypeError(`Invalid mode: ${mode}`);
     }
 
-    // Fix 1: For native-only streams (byte, custom size), delegate reader too
+    // For native-only streams (byte, custom size), delegate reader too
     if (this[kNativeOnly]) {
       return materializeReadable(this).getReader();
     }
@@ -523,17 +520,10 @@ export class FastReadableStream {
     // For native-only streams, delegate
     if (this[kNativeOnly]) {
       const [b1, b2] = materializeReadable(this).tee();
-      const wrap = (native) => {
-        const fast = Object.create(FastReadableStream.prototype);
-        fast[kMaterialized] = native;
-        fast[kNodeReadable] = null;
-        fast[kLock] = null;
-        fast[kState] = 'idle';
-        fast[kNativeOnly] = true;
-        fast[kUpstream] = null;
-        return fast;
-      };
-      return [wrap(b1), wrap(b2)];
+      return [
+        _initNativeReadableShell(Object.create(FastReadableStream.prototype), b1),
+        _initNativeReadableShell(Object.create(FastReadableStream.prototype), b2),
+      ];
     }
 
     const reader = this.getReader();
@@ -662,12 +652,12 @@ export class FastReadableStream {
       return Promise.reject(e);
     }
     // Skip destroy if cancel handler signals not to (e.g., transform during flush)
-    if (cancelResult !== 'SKIP_DESTROY') {
+    if (cancelResult !== kSkipDestroy) {
       if (this[kNodeReadable] && !this[kNodeReadable].destroyed) {
         this[kNodeReadable].destroy(null);
       }
     }
-    const resolvedResult = cancelResult === 'SKIP_DESTROY' ? undefined : cancelResult;
+    const resolvedResult = cancelResult === kSkipDestroy ? undefined : cancelResult;
     return Promise.resolve(resolvedResult).then(() => undefined);
   }
 

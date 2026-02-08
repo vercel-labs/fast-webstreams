@@ -6,15 +6,13 @@
 
 import { Writable } from 'node:stream';
 import {
-  kNodeWritable, kNodeReadable, kState, kLock, kMaterialized, kNativeOnly, resolveHWM,
-  kWritableState, kStoredError,
+  kNodeWritable, kNodeReadable, kLock, kMaterialized, kNativeOnly,
+  kWritableState, kStoredError, isThenable, RESOLVED_UNDEFINED,
 } from './utils.js';
-import { FastWritableStreamDefaultController, kWrappedError, kControllerBrand } from './controller.js';
+import { FastWritableStreamDefaultController, kWrappedError, kControllerBrand, unwrapError, _errorReadableSide } from './controller.js';
 import { FastWritableStreamDefaultWriter } from './writer.js';
 import { materializeWritable } from './materialize.js';
 
-// Re-export shared symbols
-export { kWritableState, kStoredError };
 export const kPendingAbortRequest = Symbol('kPendingAbortRequest');
 export const kInFlightWriteRequest = Symbol('kInFlightWriteRequest');
 export const kInFlightCloseRequest = Symbol('kInFlightCloseRequest');
@@ -65,11 +63,7 @@ export class FastWritableStream {
     // If strategy has a custom size(), delegate to native
     if (typeof strategySize === 'function') {
       const native = new WritableStream(underlyingSink, strategy);
-      this[kNodeWritable] = null;
-      this[kMaterialized] = native;
-      this[kLock] = null;
-      this[kState] = 'idle';
-      this[kNativeOnly] = true;
+      _initNativeWritableShell(this, native);
       return;
     }
 
@@ -104,7 +98,7 @@ export class FastWritableStream {
         }
         try {
           const result = Reflect.apply(write, underlyingSink, [chunk, controller]);
-          if (result && typeof result.then === 'function') {
+          if (isThenable(result)) {
             result.then(() => callback(), (err) => {
               // Wrap falsy errors so Node treats rejection as error (not success)
               if (err == null || err === false || err === 0 || err === '') {
@@ -129,7 +123,7 @@ export class FastWritableStream {
         }
         try {
           const result = Reflect.apply(close, underlyingSink, []);
-          if (result && typeof result.then === 'function') {
+          if (isThenable(result)) {
             result.then(() => callback(), (err) => {
               if (err == null || err === false || err === 0 || err === '') {
                 const wrapped = new Error('close rejected');
@@ -158,7 +152,6 @@ export class FastWritableStream {
 
     this[kNodeWritable] = nodeWritable;
     this[kLock] = null;
-    this[kState] = 'idle';
     this[kMaterialized] = null;
     this[kNativeOnly] = false;
     this._controller = controller;
@@ -167,37 +160,37 @@ export class FastWritableStream {
     this._sinkWrite = write || null;
     this._sinkClose = close || null;
     this._hwm = hwm;
+    this._isTransformShell = false;
 
     // Start
     let startResult;
     if (start) {
-      try {
-        startResult = Reflect.apply(start, underlyingSink, [controller]);
-      } catch (e) {
-        throw e;
-      }
+      startResult = Reflect.apply(start, underlyingSink, [controller]);
     }
 
-    // Per spec: even for sync start, kStarted is set via a microtask
-    // (the resolved promise's .then handler). This ensures writes queued
-    // synchronously after construction don't dispatch until start "completes".
-    const startPromiseResolved = startResult && typeof startResult.then === 'function'
-      ? Promise.resolve(startResult)
-      : Promise.resolve(undefined);
-
-    this._startPromise = startPromiseResolved;
-    startPromiseResolved.then(
-      () => {
+    // Per spec: even for sync start, kStarted is set via a microtask.
+    if (isThenable(startResult)) {
+      this._startPromise = startResult;
+      startResult.then(
+        () => {
+          self[kStarted] = true;
+          self._startPromise = null;
+          _advanceQueueIfNeeded(self);
+        },
+        (err) => {
+          self[kStarted] = true;
+          self._startPromise = null;
+          _dealWithRejection(self, err);
+        }
+      );
+    } else {
+      // Sync start — use queueMicrotask instead of Promise.resolve().then()
+      this._startPromise = null;
+      queueMicrotask(() => {
         self[kStarted] = true;
-        self._startPromise = null;
         _advanceQueueIfNeeded(self);
-      },
-      (err) => {
-        self[kStarted] = true;
-        self._startPromise = null;
-        _dealWithRejection(self, err);
-      }
-    );
+      });
+    }
   }
 
   getWriter() {
@@ -266,7 +259,7 @@ export function _abortInternal(stream, reason) {
 
   // If already closed or errored, no-op
   if (state === 'closed' || state === 'errored') {
-    return Promise.resolve(undefined);
+    return RESOLVED_UNDEFINED;
   }
 
   // Abort the controller's signal synchronously (spec requirement)
@@ -375,7 +368,7 @@ function _finishErroring(stream) {
 
   try {
     const result = Reflect.apply(sinkAbort, stream._underlyingSink, [abortRequest.reason]);
-    if (result && typeof result.then === 'function') {
+    if (isThenable(result)) {
       result.then(
         () => {
           abortRequest.resolve();
@@ -458,7 +451,7 @@ function _processWrite(stream) {
   const ok = nodeWritable.write(chunk, (err) => {
     stream[kInFlightWriteRequest] = null;
     if (err) {
-      const unwrapped = _unwrapError(err);
+      const unwrapped = unwrapError(err);
       writeRequest.reject(unwrapped);
       _handleWriteError(stream, unwrapped);
     } else {
@@ -508,45 +501,28 @@ function _processWriteTransform(stream, writeRequest, nodeWritable, chunk) {
 }
 
 function _doTransformWrite(stream, writeRequest, nodeWritable, chunk) {
-  // For transforms, we hook into the Node internal callback mechanism.
-  // The transform's _transform function gets called synchronously by write(),
-  // and its callback signals completion. We'll intercept via a one-time wrapper.
-  const origTransform = nodeWritable._transform;
+  // Use callback slot pattern instead of swapping _transform on every write.
+  // This keeps the Node Transform's hidden class stable for V8 optimization.
+  stream._transformWriteCallback = (err, data, cb) => {
+    stream._transformWriteCallback = null;
 
-  nodeWritable._transform = function(c, enc, cb) {
-    // Restore original transform
-    nodeWritable._transform = origTransform;
-
-    // Track that we're inside a transform callback (for _errorTransformWritable)
     const ts = stream._transformStream;
     if (ts) ts._inTransformCallback = true;
 
-    // Call original, preserving the data argument (callback(null, data) === push + callback)
-    origTransform.call(this, c, enc, (err, data) => {
+    // Call original transform, preserving the data argument
+    stream._origTransform.call(nodeWritable, chunk, 'utf8', (transformErr, transformData) => {
       if (ts) ts._inTransformCallback = false;
-      // Pass through to Node's internal callback FIRST (so Node knows transform is done)
-      cb(err, data);
+      cb(transformErr, transformData);
 
-      // Then update our state machine (deferred to maintain desiredSize semantics)
-      // This must happen BEFORE flush runs, which Node defers to nextTick
-      Promise.resolve().then(() => {
+      // Deferred state machine update (must happen BEFORE flush, which Node defers to nextTick)
+      queueMicrotask(() => {
         stream[kInFlightWriteRequest] = null;
-        if (err) {
-          const unwrapped = _unwrapError(err);
+        if (transformErr) {
+          const unwrapped = unwrapError(transformErr);
           writeRequest.reject(unwrapped);
           _handleWriteError(stream, unwrapped);
-          // For transforms: also error the readable side (TransformStreamError)
           if (stream._transformReadable) {
-            const readable = stream._transformReadable();
-            if (readable && !readable._errored) {
-              readable._storedError = unwrapped;
-              readable._errored = true;
-              const readableReader = readable[kLock];
-              if (readableReader) {
-                if (readableReader._settleClosedFromError) readableReader._settleClosedFromError(unwrapped);
-                if (readableReader._errorReadRequests) readableReader._errorReadRequests(unwrapped);
-              }
-            }
+            _errorReadableSide(stream._transformReadable(), unwrapped);
           }
         } else {
           writeRequest.resolve(undefined);
@@ -572,16 +548,6 @@ function _handleWriteError(stream, error) {
   }
 }
 
-/**
- * Called when a write or close error needs to also reject the ready promise.
- */
-function _errorReadyForWriter(stream, error) {
-  const writer = stream[kLock];
-  if (writer) {
-    writer._rejectReady(error);
-  }
-}
-
 function _processClose(stream) {
   const closeRequest = stream[kCloseRequest];
   stream[kCloseRequest] = null;
@@ -602,24 +568,16 @@ function _processClose(stream) {
       }
       if (err) {
         stream[kInFlightCloseRequest] = null;
-        const unwrapped = _unwrapError(err);
+        const unwrapped = unwrapError(err);
         closeRequest.reject(unwrapped);
         _handleCloseError(stream, unwrapped);
         // For transforms: also error the readable side (TransformStreamError)
         if (stream._transformReadable) {
           const readable = stream._transformReadable();
-          if (readable && !readable._errored) {
-            readable._storedError = unwrapped;
-            readable._errored = true;
-            if (readable[kNodeReadable] && !readable[kNodeReadable].destroyed) {
-              readable[kNodeReadable].destroy(unwrapped);
-            }
-            const readableReader = readable[kLock];
-            if (readableReader) {
-              if (readableReader._settleClosedFromError) readableReader._settleClosedFromError(unwrapped);
-              if (readableReader._errorReadRequests) readableReader._errorReadRequests(unwrapped);
-            }
+          if (readable && !readable._errored && readable[kNodeReadable] && !readable[kNodeReadable].destroyed) {
+            readable[kNodeReadable].destroy(unwrapped);
           }
+          _errorReadableSide(readable, unwrapped);
         }
       } else {
         _handleCloseSuccess(stream, closeRequest);
@@ -640,7 +598,7 @@ function _processClose(stream) {
   nodeWritable.end((err) => {
     stream[kInFlightCloseRequest] = null;
     if (err) {
-      const unwrapped = _unwrapError(err);
+      const unwrapped = unwrapError(err);
       closeRequest.reject(unwrapped);
       _handleCloseError(stream, unwrapped);
     } else {
@@ -718,13 +676,6 @@ function _dealWithRejection(stream, error) {
   }
 }
 
-function _unwrapError(err) {
-  if (err && typeof err === 'object' && kWrappedError in err) {
-    return err[kWrappedError];
-  }
-  return err;
-}
-
 /**
  * Called by the controller when controller.error() is invoked.
  */
@@ -752,6 +703,49 @@ export function _writeInternal(stream, chunk) {
     return Promise.reject(new TypeError('Cannot write to a closing stream'));
   }
 
+  // FAST PATH: started, queue empty, no in-flight write, not transform shell.
+  // Dispatch directly to nodeWritable.write() — skips queue push/shift and
+  // _advanceQueueIfNeeded dispatch overhead.
+  if (stream[kStarted] && stream[kWriteRequests].length === 0 &&
+      !stream[kInFlightWriteRequest] && !stream._isTransformShell) {
+    return new Promise((resolve, reject) => {
+      const writeRequest = { resolve, reject, chunk };
+      stream[kInFlightWriteRequest] = writeRequest;
+
+      // Update backpressure (in-flight write counts toward desiredSize)
+      const writer = stream[kLock];
+      if (writer && stream[kWritableState] === 'writable') {
+        writer._updateReadyForBackpressure(stream);
+      }
+
+      // Dispatch write directly (identical to _processWrite callback logic)
+      const nodeWritable = stream[kNodeWritable];
+      const ok = nodeWritable.write(chunk, (err) => {
+        stream[kInFlightWriteRequest] = null;
+        if (err) {
+          const unwrapped = unwrapError(err);
+          writeRequest.reject(unwrapped);
+          _handleWriteError(stream, unwrapped);
+        } else {
+          writeRequest.resolve(undefined);
+          const w = stream[kLock];
+          if (w && stream[kWritableState] === 'writable') {
+            w._updateReadyForBackpressure(stream);
+          }
+          _advanceQueueIfNeeded(stream);
+        }
+      });
+
+      if (!ok) {
+        const w = stream[kLock];
+        if (w && stream[kWritableState] === 'writable') {
+          w._setReadyPending(stream);
+        }
+      }
+    });
+  }
+
+  // SLOW PATH: queue the write (multiple pending writes or not yet started)
   return new Promise((resolve, reject) => {
     stream[kWriteRequests].push({ resolve, reject, chunk });
     const writer = stream[kLock];
@@ -785,6 +779,17 @@ export function _closeFromWriter(stream) {
 /**
  * Get the desiredSize for the stream.
  */
+/**
+ * Initialize a native-only writable shell (delegates everything to native WritableStream).
+ */
+export function _initNativeWritableShell(target, nativeStream) {
+  target[kNodeWritable] = null;
+  target[kLock] = null;
+  target[kMaterialized] = nativeStream;
+  target[kNativeOnly] = true;
+  return target;
+}
+
 export function _getDesiredSize(stream) {
   const state = stream[kWritableState];
   if (state === 'errored' || state === 'erroring') return null;

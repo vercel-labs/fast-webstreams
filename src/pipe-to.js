@@ -9,9 +9,7 @@
  * https://streams.spec.whatwg.org/#readable-stream-pipe-to
  */
 
-import { kWritableState, kStoredError, kNodeReadable } from './utils.js';
-
-const noop = () => {};
+import { kWritableState, kNodeReadable, noop, RESOLVED_UNDEFINED } from './utils.js';
 
 /**
  * Wait for all promises in a set to settle, resolving to undefined (not an array).
@@ -36,7 +34,7 @@ export function specPipeTo(source, dest, options = {}) {
   const writer = dest.getWriter();
 
   let shuttingDown = false;
-  let currentWrite = Promise.resolve();
+  let currentWrite = RESOLVED_UNDEFINED;
   const pendingWrites = new Set();
 
   // Track dest state for WritableStreamDefaultWriterCloseWithErrorPropagation
@@ -145,35 +143,62 @@ export function specPipeTo(source, dest, options = {}) {
       }
     );
 
+    // Check if reader supports sync reads (FastReadableStreamDefaultReader)
+    const hasSyncRead = typeof reader._readSync === 'function';
+
     // --- Pump loop ---
     pipeLoop();
 
     function pipeLoop() {
       if (shuttingDown) return;
 
-      writer.ready.then(() => {
-        if (shuttingDown) return;
+      if (writer.desiredSize > 0) {
+        pumpRead();
+      } else {
+        writer.ready.then(() => {
+          if (!shuttingDown) pumpRead();
+        }, noop);
+      }
+    }
 
-        return reader.read().then(
-          ({ value, done }) => {
-            if (shuttingDown) return;
-            if (done) { sourceClosed = true; return; } // Source close handled by reader.closed
+    function pumpRead() {
+      if (shuttingDown) return;
 
-            currentWrite = writer.write(value);
-            currentWrite.catch(noop); // Error handled by writer.closed
-            pendingWrites.add(currentWrite);
-            const w = currentWrite;
-            currentWrite.then(
-              () => pendingWrites.delete(w),
-              () => pendingWrites.delete(w)
-            );
-            // Per spec: don't wait for write to complete. Continue pump loop
-            // immediately. Backpressure is handled by writer.ready.
-            pipeLoop();
-          },
-          noop // Error handled by reader.closed
-        );
-      }, noop); // Error handled by writer.closed
+      // Sync fast path: read directly from Node buffer via reader._readSync
+      // (saves 2 promises per chunk: the read result Promise + the .then Promise).
+      // Must yield to microtask queue after each read for close/error handler interleaving.
+      if (hasSyncRead) {
+        const syncResult = reader._readSync();
+        if (syncResult !== null) {
+          if (syncResult.done) { sourceClosed = true; return; }
+          currentWrite = writer.write(syncResult.value);
+          pendingWrites.add(currentWrite);
+          const w = currentWrite;
+          currentWrite.then(
+            () => pendingWrites.delete(w),
+            () => pendingWrites.delete(w)
+          );
+          queueMicrotask(pipeLoop);
+          return;
+        }
+      }
+
+      // Async fallback
+      reader.read().then(
+        ({ value, done }) => {
+          if (shuttingDown) return;
+          if (done) { sourceClosed = true; return; }
+          currentWrite = writer.write(value);
+          pendingWrites.add(currentWrite);
+          const w = currentWrite;
+          currentWrite.then(
+            () => pendingWrites.delete(w),
+            () => pendingWrites.delete(w)
+          );
+          pipeLoop();
+        },
+        noop
+      );
     }
 
     // --- Shutdown with action (spec: shutdownWithAction) ---

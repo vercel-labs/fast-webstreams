@@ -3,24 +3,16 @@
  * Bridges reader.read() to Node Readable consumption with sync fast path (Tier 1).
  */
 
-import { kNodeReadable, kState, kLock } from './utils.js';
-import { kWrappedError } from './controller.js';
+import { kNodeReadable, kLock, noop } from './utils.js';
+import { unwrapError } from './controller.js';
 
-function unwrapError(err) {
-  if (err && typeof err === 'object' && kWrappedError in err) {
-    return err[kWrappedError];
-  }
-  return err;
-}
+// Cached done result — avoids allocating { value: undefined, done: true } + Promise per stream end
+const DONE_RESULT = { value: undefined, done: true };
+const DONE_PROMISE = Promise.resolve(DONE_RESULT);
 
-/**
- * Create a resolved promise with a read result { value, done }.
- * Note: In pure JS, Promise.resolve() triggers the thenable check on the
- * result object. This means WPT then-interception tests cannot pass in
- * pure JS (native impls use internal FulfillPromise that bypasses this).
- */
 function _resolveReadResult(value, done) {
-  return Promise.resolve({ value, done });
+  if (done) return DONE_PROMISE;
+  return Promise.resolve({ value, done: false });
 }
 
 export class FastReadableStreamDefaultReader {
@@ -109,7 +101,7 @@ export class FastReadableStreamDefaultReader {
       this.#closedResolve(undefined);
     } else {
       this.#closedReject(err);
-      this.#closedPromise.catch(() => {});
+      this.#closedPromise.catch(noop);
     }
   }
 
@@ -169,7 +161,7 @@ export class FastReadableStreamDefaultReader {
           if (stream._onPull) stream._onPull();
           resolve({ value: data, done: false });
         } else if (nodeReadable.readableEnded || nodeReadable.destroyed) {
-          resolve({ value: undefined, done: true });
+          resolve(DONE_RESULT);
         } else {
           // No data yet, re-register
           this.#pendingReads.push(entry);
@@ -182,12 +174,11 @@ export class FastReadableStreamDefaultReader {
       const onEnd = () => {
         cleanup();
         removePending();
-        resolve({ value: undefined, done: true });
+        resolve(DONE_RESULT);
       };
       const onError = (err) => {
         cleanup();
         removePending();
-        // Use stream-level error if available
         if (stream._errored) {
           reject(stream._storedError);
         } else {
@@ -202,7 +193,7 @@ export class FastReadableStreamDefaultReader {
         } else if (nodeReadable.errored) {
           reject(unwrapError(nodeReadable.errored));
         } else {
-          resolve({ value: undefined, done: true });
+          resolve(DONE_RESULT);
         }
       };
       const cleanup = () => {
@@ -225,12 +216,31 @@ export class FastReadableStreamDefaultReader {
       nodeReadable.once('close', onClose);
 
       // Trigger _read() to request data (pull).
-      // Reset reading flag in case a previous pull didn't push data.
       if (nodeReadable._readableState.reading) {
         nodeReadable._readableState.reading = false;
       }
       nodeReadable.read(0);
     });
+  }
+
+  /**
+   * Internal sync read — returns { value, done } directly, or null if data isn't
+   * available (caller should fall back to async read()). Used by specPipeTo to
+   * avoid Promise allocation when data is buffered.
+   */
+  _readSync() {
+    if (this.#released) return null;
+    const stream = this.#stream;
+    if (stream._errored) return null; // Let async read() handle error rejection
+    const nodeReadable = this.#nodeReadable;
+    if (nodeReadable.errored || nodeReadable.destroyed) return null;
+    const chunk = nodeReadable.read();
+    if (chunk !== null) {
+      if (stream._onPull) stream._onPull();
+      return { value: chunk, done: false };
+    }
+    if (nodeReadable.readableEnded) return DONE_RESULT;
+    return null;
   }
 
   cancel(reason) {
@@ -249,7 +259,7 @@ export class FastReadableStreamDefaultReader {
     if (!this.#closedSettled && !this.#released) {
       this.#closedSettled = true;
       this.#closedReject(error);
-      this.#closedPromise.catch(() => {});
+      this.#closedPromise.catch(noop);
     }
   }
 
@@ -308,24 +318,24 @@ export class FastReadableStreamDefaultReader {
           this.#closedResolve(undefined);
           this.#closedSettled = true;
           this.#closedPromise = Promise.reject(releasedError);
-          this.#closedPromise.catch(() => {});
+          this.#closedPromise.catch(noop);
         } else if (stream._errored) {
           // Stream errored — reject with stored error, then replace
           this.#closedReject(stream._storedError);
-          this.#closedPromise.catch(() => {});
+          this.#closedPromise.catch(noop);
           this.#closedSettled = true;
           this.#closedPromise = Promise.reject(releasedError);
-          this.#closedPromise.catch(() => {});
+          this.#closedPromise.catch(noop);
         } else {
           // Stream still readable — reject existing promise, preserve identity
           this.#closedReject(releasedError);
-          this.#closedPromise.catch(() => {});
+          this.#closedPromise.catch(noop);
           this.#closedSettled = true;
         }
       } else {
         // Already settled — per spec: replace with new rejected promise
         this.#closedPromise = Promise.reject(releasedError);
-        this.#closedPromise.catch(() => {});
+        this.#closedPromise.catch(noop);
       }
 
       stream[kLock] = null;

@@ -34,12 +34,14 @@ const DEFAULTS = {
 // Scenarios with reduced totalBytes
 const REDUCED_TOTAL = {
   backpressure: 10 * 1024 * 1024, // 10MB for backpressure (slow by design)
+  compression: 10 * 1024 * 1024,  // 10MB for compression (CompressionStream is slow at small chunks)
 };
 
 // Smart filtering: skip combinations that don't make sense
 const CHUNK_FILTERS = {
   'chunk-accumulation': (chunkSize) => chunkSize <= 16384,   // Skip chunks > 16KB
   backpressure: (chunkSize) => chunkSize >= 1024,            // Skip chunks < 1KB
+  compression: (chunkSize) => chunkSize >= 1024,             // Skip chunks < 1KB (CompressionStream degrades non-linearly)
 };
 
 function parseArgs() {

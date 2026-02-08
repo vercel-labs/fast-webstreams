@@ -8,27 +8,19 @@
 import { Transform } from 'node:stream';
 import {
   kNodeReadable, kNodeWritable, kNodeTransform,
-  kState, kLock, kMaterialized, kUpstream, kNativeOnly, resolveHWM,
+  kLock, kMaterialized, kUpstream, kNativeOnly, kSkipDestroy, resolveHWM,
+  kWritableState, kStoredError, isThenable,
 } from './utils.js';
 import { FastTransformStreamDefaultController } from './controller.js';
-import { FastReadableStream } from './readable.js';
+import { FastReadableStream, _initNativeReadableShell } from './readable.js';
 import {
-  FastWritableStream,
-  kWritableState, kStoredError, kPendingAbortRequest,
+  FastWritableStream, _initNativeWritableShell,
+  kPendingAbortRequest,
   kInFlightWriteRequest, kInFlightCloseRequest,
   kWriteRequests, kCloseRequest, kStarted,
   _controllerError as _writableControllerError,
   _advanceQueueIfNeeded,
 } from './writable.js';
-import { kWrappedError } from './controller.js';
-
-function _unwrapError(err) {
-  if (err && typeof err === 'object' && kWrappedError in err) {
-    return err[kWrappedError];
-  }
-  return err;
-}
-
 /**
  * Error the transform's writable side via the proper state machine.
  * Uses _writableControllerError which transitions through erroring → errored,
@@ -90,20 +82,8 @@ export class FastTransformStream {
         (readableStrategy && typeof readableStrategy.size === 'function')) {
       const native = new TransformStream(transformer, writableStrategy, readableStrategy);
       this[kNodeTransform] = null;
-      this.#readable = Object.create(FastReadableStream.prototype);
-      this.#readable[kNodeReadable] = null;
-      this.#readable[kLock] = null;
-      this.#readable[kState] = 'idle';
-      this.#readable[kMaterialized] = native.readable;
-      this.#readable[kUpstream] = null;
-      this.#readable[kNativeOnly] = true;
-
-      this.#writable = Object.create(FastWritableStream.prototype);
-      this.#writable[kNodeWritable] = null;
-      this.#writable[kLock] = null;
-      this.#writable[kState] = 'idle';
-      this.#writable[kMaterialized] = native.writable;
-      this.#writable[kNativeOnly] = true;
+      this.#readable = _initNativeReadableShell(Object.create(FastReadableStream.prototype), native.readable);
+      this.#writable = _initNativeWritableShell(Object.create(FastWritableStream.prototype), native.writable);
       return;
     }
 
@@ -125,7 +105,7 @@ export class FastTransformStream {
           }
           try {
             const result = Reflect.apply(transform, transformer, [chunk, controller]);
-            if (result && typeof result.then === 'function') {
+            if (isThenable(result)) {
               result.then(() => callback(), callback);
             } else {
               callback();
@@ -154,7 +134,7 @@ export class FastTransformStream {
           }
           try {
             const result = Reflect.apply(flush, transformer, [controller]);
-            if (result && typeof result.then === 'function') {
+            if (isThenable(result)) {
               result.then(() => callback(), callback);
             } else {
               callback();
@@ -178,7 +158,7 @@ export class FastTransformStream {
           self._cancelCalled = true;
           try {
             const result = Reflect.apply(cancel, transformer, [err]);
-            if (result && typeof result.then === 'function') {
+            if (isThenable(result)) {
               result.then(() => callback(err), () => callback(err));
               return;
             }
@@ -228,7 +208,7 @@ export class FastTransformStream {
 
     if (start) {
       const startResult = Reflect.apply(start, transformer, [controller]);
-      if (startResult && typeof startResult.then === 'function') {
+      if (isThenable(startResult)) {
         startPromise = startResult;
         startResult.then(
           () => { queueMicrotask(onStartCompleted); },
@@ -258,12 +238,17 @@ export class FastTransformStream {
       const transformerObj = this._transformer;
 
       this.#readable = Object.create(FastReadableStream.prototype);
+      // Property order must match FastReadableStream constructor for monomorphic hidden class
       this.#readable[kNodeReadable] = transform;
       this.#readable[kLock] = null;
-      this.#readable[kState] = 'idle';
       this.#readable[kMaterialized] = null;
       this.#readable[kUpstream] = null;
       this.#readable[kNativeOnly] = false;
+      this.#readable._closed = false;
+      this.#readable._errored = false;
+      // _cancel and _storedError set below; _onPull set below
+      this.#readable._cancel = null; // replaced below
+      this.#readable._storedError = undefined;
 
       // Wire pull notification: clears transform backpressure when reader demands data
       const transformSelf = this;
@@ -283,7 +268,7 @@ export class FastTransformStream {
         // If flush is already in progress, skip cancel and don't error writable.
         // Return a special signal to _cancelInternal to NOT destroy the node stream.
         if (transformSelf._flushStarted) {
-          return 'SKIP_DESTROY';
+          return kSkipDestroy;
         }
 
         // Capture writable error state BEFORE cancel handler runs
@@ -322,7 +307,7 @@ export class FastTransformStream {
           _errorTransformWritable(transformSelf, reason);
         };
 
-        if (cancelResult && typeof cancelResult.then === 'function') {
+        if (isThenable(cancelResult)) {
           return cancelResult.then(checkWritableError, (e) => {
             _errorTransformWritable(transformSelf, e);
             throw e;
@@ -341,7 +326,6 @@ export class FastTransformStream {
       this.#writable = Object.create(FastWritableStream.prototype);
       this.#writable[kNodeWritable] = nodeTransform;
       this.#writable[kLock] = null;
-      this.#writable[kState] = 'idle';
       this.#writable[kMaterialized] = null;
       this.#writable[kNativeOnly] = false;
 
@@ -361,10 +345,19 @@ export class FastTransformStream {
       this.#writable._sinkClose = null;
       this.#writable._controller = null;
       this.#writable._isTransformShell = true;
+      // Store original _transform and install stable dispatch wrapper (avoids per-write monkey-patching)
+      this.#writable._origTransform = nodeTransform._transform;
+      this.#writable._transformWriteCallback = null;
+      const writableShell = this.#writable;
+      nodeTransform._transform = function(c, enc, cb) {
+        if (writableShell._transformWriteCallback) {
+          writableShell._transformWriteCallback(null, null, cb);
+        } else {
+          writableShell._origTransform.call(this, c, enc, cb);
+        }
+      };
       this.#writable._transformReadable = () => this.readable;
       this.#writable._transformStream = this;
-      // Per spec: TransformStream starts with backpressure=true
-      // Backpressure is cleared when the readable side has room (read request arrives)
       this.#writable._transformBackpressure = true;
       this.#writable._transformBackpressureResolve = null;
 

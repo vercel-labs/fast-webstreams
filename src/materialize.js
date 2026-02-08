@@ -9,7 +9,7 @@ import { kNodeReadable, kNodeWritable, kMaterialized } from './utils.js';
 export function materializeReadable(fastReadable) {
   if (fastReadable[kMaterialized]) return fastReadable[kMaterialized];
 
-  // Fix 1: kNodeReadable may be null for native-only streams (byte, custom size)
+  // kNodeReadable may be null for native-only streams (byte, custom size)
   const nodeReadable = fastReadable[kNodeReadable];
   if (!nodeReadable) {
     throw new Error('Cannot materialize: no Node readable (native-only stream should already have kMaterialized)');

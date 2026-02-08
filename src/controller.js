@@ -7,6 +7,29 @@ import { kLock } from './utils.js';
 // Sentinel for wrapping falsy error values that Node.js would lose
 const kWrappedError = Symbol('kWrappedError');
 
+// Shared unwrap helper — used by reader.js, writable.js
+export function unwrapError(err) {
+  if (err && typeof err === 'object' && kWrappedError in err) {
+    return err[kWrappedError];
+  }
+  return err;
+}
+
+/**
+ * Shared helper: error the readable side of a transform stream.
+ * Sets stored error, marks errored, settles reader's closed and pending reads.
+ */
+export function _errorReadableSide(readable, error) {
+  if (!readable || readable._errored) return;
+  readable._storedError = error;
+  readable._errored = true;
+  const reader = readable[kLock];
+  if (reader) {
+    if (reader._settleClosedFromError) reader._settleClosedFromError(error);
+    if (reader._errorReadRequests) reader._errorReadRequests(error);
+  }
+}
+
 // Brand token for internal-only construction
 const kControllerBrand = Symbol('kControllerBrand');
 
@@ -139,7 +162,22 @@ export class FastTransformStreamDefaultController {
     if (!writable || !writable._isTransformShell) return;
     const t = this.#nodeTransform;
     const desiredSize = t.readableHighWaterMark - t.readableLength;
-    const pendingReads = this.#transformStream.readable?.[kLock]?._pendingReadCount?.() || 0;
+
+    // Fast path: if desiredSize > 0, backpressure is definitely false
+    // (pending reads can only increase effective size). Skip optional chaining.
+    if (desiredSize > 0) {
+      if (writable._transformBackpressure) {
+        writable._transformBackpressure = false;
+        if (writable._transformBackpressureResolve) {
+          writable._transformBackpressureResolve();
+        }
+      }
+      return;
+    }
+
+    // Only compute pendingReads when desiredSize <= 0
+    const reader = this.#transformStream.readable?.[kLock];
+    const pendingReads = reader?._pendingReadCount?.() ?? 0;
     const effectiveDesiredSize = desiredSize + pendingReads;
     const backpressure = effectiveDesiredSize <= 0;
     if (writable._transformBackpressure !== backpressure) {
@@ -159,16 +197,7 @@ export class FastTransformStreamDefaultController {
     this.#errored = true;
     // Error the readable side directly (set stored error + reject reader)
     if (this.#transformStream) {
-      const readable = this.#transformStream.readable;
-      if (readable && !readable._errored) {
-        readable._storedError = e;
-        readable._errored = true;
-        const reader = readable[kLock];
-        if (reader) {
-          if (reader._settleClosedFromError) reader._settleClosedFromError(e);
-          if (reader._errorReadRequests) reader._errorReadRequests(e);
-        }
-      }
+      _errorReadableSide(this.#transformStream.readable, e);
     }
     if (!this.#nodeTransform.destroyed) {
       this.#nodeTransform.destroy(e);
@@ -204,13 +233,12 @@ export class FastTransformStreamDefaultController {
     const t = this.#nodeTransform;
     if (this.#terminated) return 0;
     const queueSize = t.readableLength;
-    // Account for pending reads that will consume chunks synchronously
-    // (per spec, enqueue with a pending read bypasses the queue).
-    const pendingReads = this.#transformStream
-      ? (this.#transformStream.readable?.[kLock]?._pendingReadCount?.() || 0)
-      : 0;
-    const effectiveQueueSize = Math.max(0, queueSize - pendingReads);
-    return t.readableHighWaterMark - effectiveQueueSize;
+    // Fast path: empty queue means effectiveQueueSize = 0 (max(0, 0-N) = 0)
+    if (queueSize === 0) return t.readableHighWaterMark;
+    // Only compute pendingReads when queue has items
+    const reader = this.#transformStream?.readable?.[kLock];
+    const pendingReads = reader?._pendingReadCount?.() ?? 0;
+    return t.readableHighWaterMark - Math.max(0, queueSize - pendingReads);
   }
 }
 
@@ -231,7 +259,7 @@ export class FastWritableStreamDefaultController {
     this.#nodeWritable = nodeWritable;
     this.#stream = stream;
     this.#controllerErrorFn = controllerErrorFn;
-    this.#abortController = new AbortController();
+    this.#abortController = null; // Lazy — most streams are never aborted
   }
 
   error(e) {
@@ -241,12 +269,14 @@ export class FastWritableStreamDefaultController {
   }
 
   _abortSignal(reason) {
+    if (!this.#abortController) this.#abortController = new AbortController();
     if (!this.#abortController.signal.aborted) {
       this.#abortController.abort(reason);
     }
   }
 
   get signal() {
+    if (!this.#abortController) this.#abortController = new AbortController();
     return this.#abortController.signal;
   }
 }
