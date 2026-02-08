@@ -12,21 +12,10 @@
 import { kNodeReadable, kWritableState, noop, RESOLVED_UNDEFINED } from './utils.js';
 
 /**
- * Wait for all promises in a set to settle, resolving to undefined (not an array).
- * Unlike Promise.all(), this avoids creating an intermediate array result that would
- * trigger observable thenable resolution on Object.prototype.then monkey-patching.
+ * Wait for a write promise to settle, resolving to undefined regardless of outcome.
  */
-function _waitForAll(promiseSet) {
-  let p = RESOLVED_UNDEFINED;
-  for (const w of promiseSet) {
-    p = p
-      .then(
-        () => w,
-        () => w,
-      )
-      .then(noop, noop);
-  }
-  return p;
+function _waitForWrite(writePromise) {
+  return writePromise.then(noop, noop);
 }
 
 export function specPipeTo(source, dest, options = {}) {
@@ -40,7 +29,6 @@ export function specPipeTo(source, dest, options = {}) {
 
   let shuttingDown = false;
   let currentWrite = RESOLVED_UNDEFINED;
-  const pendingWrites = new Set();
 
   // Track dest state for WritableStreamDefaultWriterCloseWithErrorPropagation
   let destClosed = false;
@@ -162,76 +150,66 @@ export function specPipeTo(source, dest, options = {}) {
       }
     }
 
+    // Close-shutdown helper (called when pump reads done)
+    function pumpClose() {
+      sourceClosed = true;
+      if (shuttingDown) return;
+      if (!preventClose) {
+        shutdownWithAction(() => {
+          if (destErrored) return Promise.reject(destStoredError);
+          if (destClosed) return RESOLVED_UNDEFINED;
+          return writer.close().catch((e) => {
+            if (e instanceof TypeError) return;
+            throw e;
+          });
+        });
+      } else {
+        shutdown();
+      }
+    }
+
     function pumpRead() {
       if (shuttingDown) return;
 
-      // Sync fast path: read directly from Node buffer via reader._readSync
-      // (saves 2 promises per chunk: the read result Promise + the .then Promise).
-      // Must yield to microtask queue after each read for close/error handler interleaving.
+      // Sync fast path: batch-read directly from Node buffer via reader._readSync.
+      // Drains all available buffered chunks in one go before yielding to the
+      // microtask queue, amortizing the yield cost across multiple chunks.
       if (hasSyncRead) {
-        const syncResult = reader._readSync();
-        if (syncResult !== null) {
+        let didSync = false;
+        let syncResult = reader._readSync();
+        while (syncResult !== null) {
           if (syncResult.done) {
-            sourceClosed = true;
-            // Pump is responsible for triggering close-shutdown (not reader.closed)
-            // to ensure all buffered data is drained before closing.
-            if (!shuttingDown) {
-              if (!preventClose) {
-                shutdownWithAction(() => {
-                  if (destErrored) return Promise.reject(destStoredError);
-                  if (destClosed) return RESOLVED_UNDEFINED;
-                  return writer.close().catch((e) => {
-                    if (e instanceof TypeError) return;
-                    throw e;
-                  });
-                });
-              } else {
-                shutdown();
-              }
-            }
+            pumpClose();
             return;
           }
+          didSync = true;
           currentWrite = writer.write(syncResult.value);
-          pendingWrites.add(currentWrite);
-          const w = currentWrite;
-          currentWrite.then(
-            () => pendingWrites.delete(w),
-            () => pendingWrites.delete(w),
-          );
+          if (shuttingDown) return;
+          // Check backpressure before reading more
+          if (writer.desiredSize <= 0) {
+            queueMicrotask(pipeLoop);
+            return;
+          }
+          syncResult = reader._readSync();
+        }
+        // _readSync returned null — no more buffered data.
+        if (didSync) {
+          // We processed at least one chunk. Yield to allow events to fire,
+          // then re-enter pipeLoop which will try sync again or fall to async.
           queueMicrotask(pipeLoop);
           return;
         }
+        // No sync data available at all — fall through to async read below.
       }
 
-      // Async fallback
+      // Async fallback: wait for data via 'readable' event
       reader.read().then(({ value, done }) => {
         if (shuttingDown) return;
         if (done) {
-          sourceClosed = true;
-          // Pump is responsible for triggering close-shutdown (not reader.closed)
-          if (!shuttingDown) {
-            if (!preventClose) {
-              shutdownWithAction(() => {
-                if (destErrored) return Promise.reject(destStoredError);
-                if (destClosed) return RESOLVED_UNDEFINED;
-                return writer.close().catch((e) => {
-                  if (e instanceof TypeError) return;
-                  throw e;
-                });
-              });
-            } else {
-              shutdown();
-            }
-          }
+          pumpClose();
           return;
         }
         currentWrite = writer.write(value);
-        pendingWrites.add(currentWrite);
-        const w = currentWrite;
-        currentWrite.then(
-          () => pendingWrites.delete(w),
-          () => pendingWrites.delete(w),
-        );
         pipeLoop();
       }, noop);
     }
@@ -255,17 +233,15 @@ export function specPipeTo(source, dest, options = {}) {
         );
       };
 
-      // Wait for all in-flight writes to complete before running action
-      const allWrites = pendingWrites.size > 0 ? _waitForAll(pendingWrites) : currentWrite;
-      allWrites.then(doAction, doAction);
+      // Wait for the last in-flight write to settle before running action
+      _waitForWrite(currentWrite).then(doAction, doAction);
     }
 
     // --- Shutdown without action ---
     function shutdown(isError = false, error) {
       if (shuttingDown) return;
       shuttingDown = true;
-      const allWrites = pendingWrites.size > 0 ? _waitForAll(pendingWrites) : currentWrite;
-      allWrites.then(
+      _waitForWrite(currentWrite).then(
         () => finalize(isError, error),
         () => finalize(isError, error),
       );
