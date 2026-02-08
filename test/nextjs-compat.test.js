@@ -165,7 +165,7 @@ describe('Next.js compat: pipeThrough chain + pipeTo with signal', () => {
 describe('Next.js compat: HTTP response streaming', () => {
   afterEach(() => unpatchGlobalWebStreams());
 
-  it('streams payload to HTTP response via pipeThrough + pipeTo', async () => {
+  it('streams payload to HTTP response via pipeThrough + pipeTo', async (t) => {
     patchGlobalWebStreams();
 
     const server = http.createServer(async (req, res) => {
@@ -193,7 +193,15 @@ describe('Next.js compat: HTTP response streaming', () => {
       }
     });
 
-    await new Promise((resolve) => server.listen(0, resolve));
+    try {
+      await new Promise((resolve, reject) => {
+        server.on('error', reject);
+        server.listen(0, resolve);
+      });
+    } catch (e) {
+      if (e.code === 'EPERM' || e.code === 'EACCES') { t.skip('cannot listen (sandboxed)'); return; }
+      throw e;
+    }
     const port = server.address().port;
 
     try {
