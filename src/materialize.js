@@ -4,7 +4,7 @@
  */
 
 import { Readable, Writable } from 'node:stream';
-import { kNodeReadable, kNodeWritable, kMaterialized } from './utils.js';
+import { kMaterialized, kNodeReadable, kNodeWritable } from './utils.js';
 
 export function materializeReadable(fastReadable) {
   if (fastReadable[kMaterialized]) return fastReadable[kMaterialized];

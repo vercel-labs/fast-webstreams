@@ -3,8 +3,8 @@
  * Bridges reader.read() to Node Readable consumption with sync fast path (Tier 1).
  */
 
-import { kNodeReadable, kLock, noop } from './utils.js';
 import { unwrapError } from './controller.js';
+import { kLock, kNodeReadable, noop } from './utils.js';
 
 // Cached done result — avoids allocating { value: undefined, done: true } + Promise per stream end
 const DONE_RESULT = { value: undefined, done: true };
@@ -345,5 +345,4 @@ export class FastReadableStreamDefaultReader {
   get closed() {
     return this.#closedPromise;
   }
-
 }

@@ -9,7 +9,7 @@
  * https://streams.spec.whatwg.org/#readable-stream-pipe-to
  */
 
-import { kWritableState, kNodeReadable, noop, RESOLVED_UNDEFINED } from './utils.js';
+import { kNodeReadable, kWritableState, noop, RESOLVED_UNDEFINED } from './utils.js';
 
 /**
  * Wait for all promises in a set to settle, resolving to undefined (not an array).
@@ -17,9 +17,14 @@ import { kWritableState, kNodeReadable, noop, RESOLVED_UNDEFINED } from './utils
  * trigger observable thenable resolution on Object.prototype.then monkey-patching.
  */
 function _waitForAll(promiseSet) {
-  let p = Promise.resolve();
+  let p = RESOLVED_UNDEFINED;
   for (const w of promiseSet) {
-    p = p.then(() => w, () => w).then(noop, noop);
+    p = p
+      .then(
+        () => w,
+        () => w,
+      )
+      .then(noop, noop);
   }
   return p;
 }
@@ -50,23 +55,21 @@ export function specPipeTo(source, dest, options = {}) {
       abortAlgorithm = () => {
         const error = signal.reason;
         const actions = [];
-        if (!preventAbort) actions.push(() => {
-          // Abort on already-errored writable resolves (spec: no-op)
-          const state = dest[kWritableState];
-          if (state === 'closed' || state === 'errored') return Promise.resolve();
-          return writer.abort(error);
-        });
-        if (!preventCancel) actions.push(() => {
-          // Cancel on already-errored/closed readable resolves to avoid
-          // the automatic rejection overriding the abort signal error.
-          if (source._errored || source._closed) return Promise.resolve();
-          return reader.cancel(error);
-        });
-        shutdownWithAction(
-          () => Promise.all(actions.map(a => a())),
-          true,
-          error
-        );
+        if (!preventAbort)
+          actions.push(() => {
+            // Abort on already-errored writable resolves (spec: no-op)
+            const state = dest[kWritableState];
+            if (state === 'closed' || state === 'errored') return RESOLVED_UNDEFINED;
+            return writer.abort(error);
+          });
+        if (!preventCancel)
+          actions.push(() => {
+            // Cancel on already-errored/closed readable resolves to avoid
+            // the automatic rejection overriding the abort signal error.
+            if (source._errored || source._closed) return RESOLVED_UNDEFINED;
+            return reader.cancel(error);
+          });
+        shutdownWithAction(() => Promise.all(actions.map((a) => a())), true, error);
       };
 
       if (signal.aborted) {
@@ -78,8 +81,13 @@ export function specPipeTo(source, dest, options = {}) {
 
     // --- Track dest state ---
     writer.closed.then(
-      () => { destClosed = true; },
-      (err) => { destErrored = true; destStoredError = err; }
+      () => {
+        destClosed = true;
+      },
+      (err) => {
+        destErrored = true;
+        destStoredError = err;
+      },
     );
 
     // --- Source close/error handler ---
@@ -92,7 +100,7 @@ export function specPipeTo(source, dest, options = {}) {
           shutdownWithAction(() => {
             // WritableStreamDefaultWriterCloseWithErrorPropagation
             if (destErrored) return Promise.reject(destStoredError);
-            if (destClosed) return Promise.resolve();
+            if (destClosed) return RESOLVED_UNDEFINED;
             // writer.close() may reject if already closed; treat as success
             return writer.close().catch((e) => {
               if (e instanceof TypeError) return; // Already closed/closing
@@ -111,7 +119,7 @@ export function specPipeTo(source, dest, options = {}) {
         } else {
           shutdown(true, storedError);
         }
-      }
+      },
     );
 
     // --- Dest close/error handler ---
@@ -120,7 +128,7 @@ export function specPipeTo(source, dest, options = {}) {
         // Dest closed unexpectedly (if we didn't close it, shuttingDown would be false)
         if (shuttingDown) return;
         const destClosedError = new TypeError(
-          'the destination writable stream closed before all data could be piped to it'
+          'the destination writable stream closed before all data could be piped to it',
         );
         if (!preventCancel) {
           shutdownWithAction(() => reader.cancel(destClosedError), true, destClosedError);
@@ -133,14 +141,16 @@ export function specPipeTo(source, dest, options = {}) {
         if (shuttingDown) return;
         // Per spec: don't cancel source if it's already closed/closing
         const nodeReadable = source[kNodeReadable];
-        const srcAlreadyClosed = sourceClosed || source._closed ||
+        const srcAlreadyClosed =
+          sourceClosed ||
+          source._closed ||
           (nodeReadable && (nodeReadable.readableEnded || nodeReadable._readableState?.ended));
         if (!preventCancel && !srcAlreadyClosed) {
           shutdownWithAction(() => reader.cancel(storedError), true, storedError);
         } else {
           shutdown(true, storedError);
         }
-      }
+      },
     );
 
     // Check if reader supports sync reads (FastReadableStreamDefaultReader)
@@ -170,13 +180,16 @@ export function specPipeTo(source, dest, options = {}) {
       if (hasSyncRead) {
         const syncResult = reader._readSync();
         if (syncResult !== null) {
-          if (syncResult.done) { sourceClosed = true; return; }
+          if (syncResult.done) {
+            sourceClosed = true;
+            return;
+          }
           currentWrite = writer.write(syncResult.value);
           pendingWrites.add(currentWrite);
           const w = currentWrite;
           currentWrite.then(
             () => pendingWrites.delete(w),
-            () => pendingWrites.delete(w)
+            () => pendingWrites.delete(w),
           );
           queueMicrotask(pipeLoop);
           return;
@@ -184,21 +197,21 @@ export function specPipeTo(source, dest, options = {}) {
       }
 
       // Async fallback
-      reader.read().then(
-        ({ value, done }) => {
-          if (shuttingDown) return;
-          if (done) { sourceClosed = true; return; }
-          currentWrite = writer.write(value);
-          pendingWrites.add(currentWrite);
-          const w = currentWrite;
-          currentWrite.then(
-            () => pendingWrites.delete(w),
-            () => pendingWrites.delete(w)
-          );
-          pipeLoop();
-        },
-        noop
-      );
+      reader.read().then(({ value, done }) => {
+        if (shuttingDown) return;
+        if (done) {
+          sourceClosed = true;
+          return;
+        }
+        currentWrite = writer.write(value);
+        pendingWrites.add(currentWrite);
+        const w = currentWrite;
+        currentWrite.then(
+          () => pendingWrites.delete(w),
+          () => pendingWrites.delete(w),
+        );
+        pipeLoop();
+      }, noop);
     }
 
     // --- Shutdown with action (spec: shutdownWithAction) ---
@@ -216,7 +229,7 @@ export function specPipeTo(source, dest, options = {}) {
         }
         Promise.resolve(p).then(
           () => finalize(isError, originalError),
-          (newError) => finalize(true, newError)
+          (newError) => finalize(true, newError),
         );
       };
 
@@ -232,7 +245,7 @@ export function specPipeTo(source, dest, options = {}) {
       const allWrites = pendingWrites.size > 0 ? _waitForAll(pendingWrites) : currentWrite;
       allWrites.then(
         () => finalize(isError, error),
-        () => finalize(isError, error)
+        () => finalize(isError, error),
       );
     }
 

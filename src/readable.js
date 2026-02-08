@@ -6,17 +6,28 @@
  * Tier 2: tee(), native interop → Readable.toWeb() delegation
  */
 
-import { Readable, pipeline } from 'node:stream';
-import {
-  kNodeReadable, kNodeWritable, kLock, kMaterialized, kUpstream,
-  isFastReadable, isFastWritable, isFastTransform, kNativeOnly,
-  kWritableState, kSkipDestroy, isThenable, noop,
-} from './utils.js';
+import { pipeline, Readable } from 'node:stream';
+import { FastReadableStreamBYOBReader } from './byob-reader.js';
 import { FastReadableStreamDefaultController } from './controller.js';
-import { FastReadableStreamDefaultReader } from './reader.js';
 import { materializeReadable, materializeWritable } from './materialize.js';
 import { specPipeTo } from './pipe-to.js';
-import { FastReadableStreamBYOBReader } from './byob-reader.js';
+import { FastReadableStreamDefaultReader } from './reader.js';
+import {
+  isFastReadable,
+  isFastTransform,
+  isFastWritable,
+  isThenable,
+  kLock,
+  kMaterialized,
+  kNativeOnly,
+  kNodeReadable,
+  kNodeWritable,
+  kSkipDestroy,
+  kUpstream,
+  kWritableState,
+  noop,
+  RESOLVED_UNDEFINED,
+} from './utils.js';
 
 // ReadableStreamAsyncIteratorPrototype — shared by all async iterators
 // Per spec: extends AsyncIteratorPrototype, has next() and return() methods on the prototype
@@ -28,17 +39,13 @@ const kIterOngoing = Symbol('kIterOngoing');
 let _readableStreamAsyncIteratorPrototype = null;
 function _getAsyncIteratorPrototype() {
   if (!_readableStreamAsyncIteratorPrototype) {
-    const asyncIterProto = Object.getPrototypeOf(Object.getPrototypeOf(
-      (async function* () {}).prototype
-    ));
+    const asyncIterProto = Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}.prototype));
     _readableStreamAsyncIteratorPrototype = Object.create(asyncIterProto);
 
     // Helper: chain operation behind ongoing promise
     function chainOperation(iter, op) {
       const ongoing = iter[kIterOngoing];
-      iter[kIterOngoing] = ongoing
-        ? ongoing.then(op, op)
-        : op();
+      iter[kIterOngoing] = ongoing ? ongoing.then(op, op) : op();
       return iter[kIterOngoing];
     }
 
@@ -62,7 +69,7 @@ function _getAsyncIteratorPrototype() {
     }
 
     // return needs length = 1, so we use an explicit parameter
-    const returnFn = async function(value) {
+    const returnFn = async function (value) {
       return chainOperation(this, async () => {
         if (!this[kIterDone]) {
           this[kIterDone] = true;
@@ -80,10 +87,16 @@ function _getAsyncIteratorPrototype() {
     Object.defineProperty(returnFn, 'name', { value: 'return' });
 
     Object.defineProperty(_readableStreamAsyncIteratorPrototype, 'next', {
-      value: next, writable: true, configurable: true, enumerable: true,
+      value: next,
+      writable: true,
+      configurable: true,
+      enumerable: true,
     });
     Object.defineProperty(_readableStreamAsyncIteratorPrototype, 'return', {
-      value: returnFn, writable: true, configurable: true, enumerable: true,
+      value: returnFn,
+      writable: true,
+      configurable: true,
+      enumerable: true,
     });
   }
   return _readableStreamAsyncIteratorPrototype;
@@ -176,7 +189,10 @@ export class FastReadableStream {
     // Per WebIDL: undefined → empty dictionary; null and non-objects → TypeError
     if (underlyingSource === undefined) {
       underlyingSource = {};
-    } else if (underlyingSource === null || (typeof underlyingSource !== 'object' && typeof underlyingSource !== 'function')) {
+    } else if (
+      underlyingSource === null ||
+      (typeof underlyingSource !== 'object' && typeof underlyingSource !== 'function')
+    ) {
       throw new TypeError('underlyingSource must be an object');
     }
 
@@ -226,11 +242,14 @@ export class FastReadableStream {
     }
 
     // Validate and resolve strategy highWaterMark
-    const hwm = strategyHWM !== undefined ? (() => {
-      const h = Number(strategyHWM);
-      if (Number.isNaN(h) || h < 0) throw new RangeError('Invalid highWaterMark');
-      return h;
-    })() : 1;
+    const hwm =
+      strategyHWM !== undefined
+        ? (() => {
+            const h = Number(strategyHWM);
+            if (Number.isNaN(h) || h < 0) throw new RangeError('Invalid highWaterMark');
+            return h;
+          })()
+        : 1;
 
     let controller;
     let pullCallback = null;
@@ -238,7 +257,7 @@ export class FastReadableStream {
 
     const nodeReadable = new Readable({
       objectMode: true,
-      highWaterMark: hwm === Infinity ? 0x7FFFFFFF : hwm,
+      highWaterMark: hwm === Infinity ? 0x7fffffff : hwm,
       read() {
         // Per spec: pull must not be called until start completes
         if (!startCompleted) {
@@ -263,7 +282,7 @@ export class FastReadableStream {
                 (err) => {
                   pullCallback = null;
                   if (!nodeReadable.destroyed) controller.error(err);
-                }
+                },
               );
             }
             // For sync pull: don't touch reading flag.
@@ -276,7 +295,7 @@ export class FastReadableStream {
     });
 
     // Prevent unhandled 'error' events from crashing
-    nodeReadable.on('error', () => {});
+    nodeReadable.on('error', noop);
 
     controller = new FastReadableStreamDefaultController(nodeReadable, hwm);
     controller._stream = this;
@@ -302,7 +321,9 @@ export class FastReadableStream {
               nodeReadable.read(0);
             }
           },
-          (err) => { controller.error(err); }
+          (err) => {
+            controller.error(err);
+          },
         );
       } else {
         // Sync start — per spec, start "completes" via microtask
@@ -344,7 +365,10 @@ export class FastReadableStream {
       }
 
       // Access option getters in spec order (alphabetical per Web IDL)
-      let preventAbort = false, preventCancel = false, preventClose = false, signal;
+      let preventAbort = false,
+        preventCancel = false,
+        preventClose = false,
+        signal;
       if (options !== undefined && options !== null) {
         if (typeof options !== 'object' && typeof options !== 'function') {
           throw new TypeError('options must be an object');
@@ -382,8 +406,13 @@ export class FastReadableStream {
       // Tier 1: pipeThrough chain with upstream links → pipeline()
       // Only when kUpstream is set (from pipeThrough Tier 1 linking).
       const isDefaultOpts = !preventAbort && !preventCancel && !preventClose && !signal;
-      if (isDefaultOpts && this[kUpstream] && isFastWritable(destination) &&
-          !destination[kNativeOnly] && destination[kNodeWritable]) {
+      if (
+        isDefaultOpts &&
+        this[kUpstream] &&
+        isFastWritable(destination) &&
+        !destination[kNativeOnly] &&
+        destination[kNodeWritable]
+      ) {
         return fastPipelineTo(this, destination);
       }
 
@@ -403,8 +432,11 @@ export class FastReadableStream {
    *   Tier 2: Mixed/options → specPipeTo (full WHATWG compliance)
    */
   pipeThrough(transform, options) {
-    if (transform === null || transform === undefined ||
-        (typeof transform !== 'object' && typeof transform !== 'function')) {
+    if (
+      transform === null ||
+      transform === undefined ||
+      (typeof transform !== 'object' && typeof transform !== 'function')
+    ) {
       throw new TypeError('transform must be an object');
     }
 
@@ -428,9 +460,11 @@ export class FastReadableStream {
     }
 
     // Eagerly access option getters per Web IDL (alphabetical order)
-    let preventAbort = false, preventCancel = false, preventClose = false, signal;
-    if (options !== undefined && options !== null &&
-        (typeof options === 'object' || typeof options === 'function')) {
+    let preventAbort = false,
+      preventCancel = false,
+      preventClose = false,
+      signal;
+    if (options !== undefined && options !== null && (typeof options === 'object' || typeof options === 'function')) {
       preventAbort = !!options.preventAbort;
       preventCancel = !!options.preventCancel;
       preventClose = !!options.preventClose;
@@ -454,7 +488,7 @@ export class FastReadableStream {
       const nativeRd = isFastReadable(readable) ? materializeReadable(readable) : readable;
       nativeSrc.pipeThrough(
         { writable: nativeDst, readable: nativeRd },
-        { preventAbort, preventCancel, preventClose, signal }
+        { preventAbort, preventCancel, preventClose, signal },
       );
       // Return the original readable (Fast shell or native) — the pipe is running
       return readable;
@@ -532,7 +566,9 @@ export class FastReadableStream {
     let reason1, reason2;
     let branch1Controller, branch2Controller;
     let cancelResolve;
-    const cancelPromise = new Promise(resolve => { cancelResolve = resolve; });
+    const cancelPromise = new Promise((resolve) => {
+      cancelResolve = resolve;
+    });
 
     function cancel1Algorithm(reason) {
       canceled1 = true;
@@ -556,42 +592,72 @@ export class FastReadableStream {
       return cancelPromise;
     }
 
-    const branch1 = new FastReadableStream({
-      start(c) { branch1Controller = c; },
-      pull() { return readLoop(); },
-      cancel(reason) { return cancel1Algorithm(reason); },
-    }, { highWaterMark: 0 });
+    const branch1 = new FastReadableStream(
+      {
+        start(c) {
+          branch1Controller = c;
+        },
+        pull() {
+          return readLoop();
+        },
+        cancel(reason) {
+          return cancel1Algorithm(reason);
+        },
+      },
+      { highWaterMark: 0 },
+    );
 
-    const branch2 = new FastReadableStream({
-      start(c) { branch2Controller = c; },
-      pull() { return readLoop(); },
-      cancel(reason) { return cancel2Algorithm(reason); },
-    }, { highWaterMark: 0 });
+    const branch2 = new FastReadableStream(
+      {
+        start(c) {
+          branch2Controller = c;
+        },
+        pull() {
+          return readLoop();
+        },
+        cancel(reason) {
+          return cancel2Algorithm(reason);
+        },
+      },
+      { highWaterMark: 0 },
+    );
 
     let reading = false;
     function readLoop() {
-      if (reading) return Promise.resolve();
+      if (reading) return RESOLVED_UNDEFINED;
       reading = true;
       return reader.read().then(
         ({ value, done }) => {
           reading = false;
           if (done) {
-            try { if (!canceled1 && branch1Controller) branch1Controller.close(); } catch {}
-            try { if (!canceled2 && branch2Controller) branch2Controller.close(); } catch {}
+            try {
+              if (!canceled1 && branch1Controller) branch1Controller.close();
+            } catch {}
+            try {
+              if (!canceled2 && branch2Controller) branch2Controller.close();
+            } catch {}
             // Resolve any pending cancel promise (source is done)
             cancelResolve(undefined);
             return;
           }
-          try { if (!canceled1 && branch1Controller) branch1Controller.enqueue(value); } catch {}
-          try { if (!canceled2 && branch2Controller) branch2Controller.enqueue(value); } catch {}
+          try {
+            if (!canceled1 && branch1Controller) branch1Controller.enqueue(value);
+          } catch {}
+          try {
+            if (!canceled2 && branch2Controller) branch2Controller.enqueue(value);
+          } catch {}
         },
         (r) => {
           reading = false;
-          try { if (!canceled1 && branch1Controller) branch1Controller.error(r); } catch {}
-          try { if (!canceled2 && branch2Controller) branch2Controller.error(r); } catch {}
+          try {
+            if (!canceled1 && branch1Controller) branch1Controller.error(r);
+          } catch {}
+          try {
+            if (!canceled2 && branch2Controller) branch2Controller.error(r);
+          } catch {}
           // Resolve any pending cancel promise (source errored)
           cancelResolve(undefined);
-        }
+        },
       );
     }
 
@@ -599,16 +665,24 @@ export class FastReadableStream {
     reader.closed.then(
       () => {
         // Source closed — close both branches
-        try { if (!canceled1 && branch1Controller) branch1Controller.close(); } catch {}
-        try { if (!canceled2 && branch2Controller) branch2Controller.close(); } catch {}
+        try {
+          if (!canceled1 && branch1Controller) branch1Controller.close();
+        } catch {}
+        try {
+          if (!canceled2 && branch2Controller) branch2Controller.close();
+        } catch {}
         cancelResolve(undefined);
       },
       (r) => {
         // Source errored — error both branches
-        try { if (!canceled1 && branch1Controller) branch1Controller.error(r); } catch {}
-        try { if (!canceled2 && branch2Controller) branch2Controller.error(r); } catch {}
+        try {
+          if (!canceled1 && branch1Controller) branch1Controller.error(r);
+        } catch {}
+        try {
+          if (!canceled2 && branch2Controller) branch2Controller.error(r);
+        } catch {}
         cancelResolve(undefined);
-      }
+      },
     );
 
     return [branch1, branch2];
@@ -693,5 +767,4 @@ export class FastReadableStream {
   [Symbol.asyncIterator](options) {
     return this.values(options);
   }
-
 }

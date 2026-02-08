@@ -6,21 +6,36 @@
  */
 
 import { Transform } from 'node:stream';
-import {
-  kNodeReadable, kNodeWritable, kNodeTransform,
-  kLock, kMaterialized, kUpstream, kNativeOnly, kSkipDestroy, resolveHWM,
-  kWritableState, kStoredError, isThenable,
-} from './utils.js';
 import { FastTransformStreamDefaultController } from './controller.js';
-import { FastReadableStream, _initNativeReadableShell } from './readable.js';
+import { _initNativeReadableShell, FastReadableStream } from './readable.js';
 import {
-  FastWritableStream, _initNativeWritableShell,
-  kPendingAbortRequest,
-  kInFlightWriteRequest, kInFlightCloseRequest,
-  kWriteRequests, kCloseRequest, kStarted,
-  _controllerError as _writableControllerError,
+  isThenable,
+  kLock,
+  kMaterialized,
+  kNativeOnly,
+  kNodeReadable,
+  kNodeTransform,
+  kNodeWritable,
+  kSkipDestroy,
+  kStoredError,
+  kUpstream,
+  kWritableState,
+  noop,
+  resolveHWM,
+} from './utils.js';
+import {
   _advanceQueueIfNeeded,
+  _initNativeWritableShell,
+  _controllerError as _writableControllerError,
+  FastWritableStream,
+  kCloseRequest,
+  kInFlightCloseRequest,
+  kInFlightWriteRequest,
+  kPendingAbortRequest,
+  kStarted,
+  kWriteRequests,
 } from './writable.js';
+
 /**
  * Error the transform's writable side via the proper state machine.
  * Uses _writableControllerError which transitions through erroring → errored,
@@ -34,8 +49,7 @@ function _errorTransformWritable(transformSelf, reason) {
   // Must clear BEFORE _controllerError so _finishErroring can run.
   // But DON'T clear if we're inside an active transform callback —
   // the callback will fire and should handle the write rejection.
-  if (writable._isTransformShell && writable[kInFlightWriteRequest] &&
-      !transformSelf._inTransformCallback) {
+  if (writable._isTransformShell && writable[kInFlightWriteRequest] && !transformSelf._inTransformCallback) {
     const req = writable[kInFlightWriteRequest];
     writable[kInFlightWriteRequest] = null;
     req.reject(reason);
@@ -78,8 +92,10 @@ export class FastTransformStream {
     }
 
     // If either strategy has a custom size(), delegate to native
-    if ((writableStrategy && typeof writableStrategy.size === 'function') ||
-        (readableStrategy && typeof readableStrategy.size === 'function')) {
+    if (
+      (writableStrategy && typeof writableStrategy.size === 'function') ||
+      (readableStrategy && typeof readableStrategy.size === 'function')
+    ) {
       const native = new TransformStream(transformer, writableStrategy, readableStrategy);
       this[kNodeTransform] = null;
       this.#readable = _initNativeReadableShell(Object.create(FastReadableStream.prototype), native.readable);
@@ -95,8 +111,8 @@ export class FastTransformStream {
 
     const nodeTransform = new Transform({
       objectMode: true,
-      readableHighWaterMark: readableHWM === Infinity ? 0x7FFFFFFF : readableHWM,
-      writableHighWaterMark: writableHWM === Infinity ? 0x7FFFFFFF : writableHWM,
+      readableHighWaterMark: readableHWM === Infinity ? 0x7fffffff : readableHWM,
+      writableHighWaterMark: writableHWM === Infinity ? 0x7fffffff : writableHWM,
       transform(chunk, encoding, callback) {
         const doTransform = () => {
           if (!transform) {
@@ -159,7 +175,10 @@ export class FastTransformStream {
           try {
             const result = Reflect.apply(cancel, transformer, [err]);
             if (isThenable(result)) {
-              result.then(() => callback(err), () => callback(err));
+              result.then(
+                () => callback(err),
+                () => callback(err),
+              );
               return;
             }
           } catch {
@@ -171,7 +190,7 @@ export class FastTransformStream {
     });
 
     // Prevent unhandled 'error' events from crashing
-    nodeTransform.on('error', () => {});
+    nodeTransform.on('error', noop);
 
     controller = new FastTransformStreamDefaultController(nodeTransform);
     controller._setTransformStream(this);
@@ -211,16 +230,20 @@ export class FastTransformStream {
       if (isThenable(startResult)) {
         startPromise = startResult;
         startResult.then(
-          () => { queueMicrotask(onStartCompleted); },
+          () => {
+            queueMicrotask(onStartCompleted);
+          },
           (err) => {
             const e = err || new Error('start() failed');
             // Error both sides per spec
             if (self._controller) {
-              try { self._controller.error(e); } catch {}
+              try {
+                self._controller.error(e);
+              } catch {}
             }
             if (!nodeTransform.destroyed) nodeTransform.destroy(e);
             queueMicrotask(onStartCompleted);
-          }
+          },
         );
       } else {
         // Sync start — defer completion via microtask (per spec)
@@ -298,9 +321,11 @@ export class FastTransformStream {
         const checkWritableError = () => {
           const writable = transformSelf.writable;
           const writableState = writable[kWritableState];
-          if (cancelCausedError &&
-              (writableState === 'errored' || writableState === 'erroring') &&
-              writable[kStoredError] !== undefined) {
+          if (
+            cancelCausedError &&
+            (writableState === 'errored' || writableState === 'erroring') &&
+            writable[kStoredError] !== undefined
+          ) {
             throw writable[kStoredError];
           }
           // Error writable with cancel reason if not already errored
@@ -349,7 +374,7 @@ export class FastTransformStream {
       this.#writable._origTransform = nodeTransform._transform;
       this.#writable._transformWriteCallback = null;
       const writableShell = this.#writable;
-      nodeTransform._transform = function(c, enc, cb) {
+      nodeTransform._transform = function (c, enc, cb) {
         if (writableShell._transformWriteCallback) {
           writableShell._transformWriteCallback(null, null, cb);
         } else {
@@ -376,14 +401,20 @@ export class FastTransformStream {
             // Normal path: error readable with abort reason
             if (readable && readable._errored !== true) {
               const ctrl = transformSelf._controller;
-              if (ctrl) try { ctrl.error(reason); } catch {}
+              if (ctrl)
+                try {
+                  ctrl.error(reason);
+                } catch {}
             }
             return result;
           } catch (e) {
             // Cancel threw: error readable with THROWN error
             if (readable && readable._errored !== true) {
               const ctrl = transformSelf._controller;
-              if (ctrl) try { ctrl.error(e); } catch {}
+              if (ctrl)
+                try {
+                  ctrl.error(e);
+                } catch {}
             }
             throw e; // Propagate to abort rejection
           }

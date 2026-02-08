@@ -12,10 +12,18 @@
     "bench:passthrough": "node --expose-gc bench/run.js --scenario=passthrough",
     "test": "node test/run-wpt.js --mode=native",
     "test:wpt": "node test/run-wpt.js --mode=native",
-    "test:wpt:fast": "node test/run-wpt.js --mode=fast"
+    "test:wpt:fast": "node test/run-wpt.js --mode=fast",
+    "knip": "knip",
+    "lint": "biome check src/",
+    "lint:fix": "biome check --fix src/",
+    "format": "biome format --write src/"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "packageManager": "pnpm@10.28.1"
+  "packageManager": "pnpm@10.28.1",
+  "dependencies": {
+    "biome": "^0.3.3",
+    "knip": "^5.83.1"
+  }
 }

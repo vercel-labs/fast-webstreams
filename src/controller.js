@@ -247,7 +247,6 @@ export class FastTransformStreamDefaultController {
  * Receives a controllerError callback at construction to avoid circular imports.
  */
 export class FastWritableStreamDefaultController {
-  #nodeWritable;
   #abortController;
   #controllerErrorFn;
   #stream;
@@ -256,7 +255,6 @@ export class FastWritableStreamDefaultController {
     if (brand !== kControllerBrand) {
       throw new TypeError('Illegal constructor');
     }
-    this.#nodeWritable = nodeWritable;
     this.#stream = stream;
     this.#controllerErrorFn = controllerErrorFn;
     this.#abortController = null; // Lazy — most streams are never aborted

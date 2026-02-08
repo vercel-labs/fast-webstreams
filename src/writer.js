@@ -3,16 +3,19 @@
  * Bridges writer.write() to the writable state machine.
  */
 
-import { kNodeWritable, kLock, isFastWritable, kWritableState, kStoredError, noop, RESOLVED_UNDEFINED } from './utils.js';
 import {
-  kPendingAbortRequest,
-  kInFlightWriteRequest, kWriteRequests, kCloseRequest, kInFlightCloseRequest,
-  _abortInternal, _writeInternal, _closeFromWriter, _getDesiredSize,
-} from './writable.js';
+  isFastWritable,
+  kLock,
+  kNodeWritable,
+  kStoredError,
+  kWritableState,
+  noop,
+  RESOLVED_UNDEFINED,
+} from './utils.js';
+import { _abortInternal, _closeFromWriter, _getDesiredSize, _writeInternal } from './writable.js';
 
 export class FastWritableStreamDefaultWriter {
   #stream;
-  #nodeWritable;
   #closedPromise;
   #closedResolve;
   #closedReject;
@@ -32,7 +35,6 @@ export class FastWritableStreamDefaultWriter {
       throw new TypeError('WritableStream is already locked');
     }
     this.#stream = stream;
-    this.#nodeWritable = stream[kNodeWritable];
     stream[kLock] = this;
 
     // Set up closed promise

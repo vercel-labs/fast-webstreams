@@ -6,12 +6,26 @@
 
 import { Writable } from 'node:stream';
 import {
-  kNodeWritable, kNodeReadable, kLock, kMaterialized, kNativeOnly,
-  kWritableState, kStoredError, isThenable, RESOLVED_UNDEFINED,
-} from './utils.js';
-import { FastWritableStreamDefaultController, kWrappedError, kControllerBrand, unwrapError, _errorReadableSide } from './controller.js';
-import { FastWritableStreamDefaultWriter } from './writer.js';
+  _errorReadableSide,
+  FastWritableStreamDefaultController,
+  kControllerBrand,
+  kWrappedError,
+  unwrapError,
+} from './controller.js';
 import { materializeWritable } from './materialize.js';
+import {
+  isThenable,
+  kLock,
+  kMaterialized,
+  kNativeOnly,
+  kNodeReadable,
+  kNodeWritable,
+  kStoredError,
+  kWritableState,
+  noop,
+  RESOLVED_UNDEFINED,
+} from './utils.js';
+import { FastWritableStreamDefaultWriter } from './writer.js';
 
 export const kPendingAbortRequest = Symbol('kPendingAbortRequest');
 export const kInFlightWriteRequest = Symbol('kInFlightWriteRequest');
@@ -90,7 +104,7 @@ export class FastWritableStream {
 
     const nodeWritable = new Writable({
       objectMode: true,
-      highWaterMark: hwm === Infinity ? 0x7FFFFFFF : hwm,
+      highWaterMark: hwm === Infinity ? 0x7fffffff : hwm,
       write(chunk, encoding, callback) {
         if (!write) {
           callback();
@@ -99,16 +113,19 @@ export class FastWritableStream {
         try {
           const result = Reflect.apply(write, underlyingSink, [chunk, controller]);
           if (isThenable(result)) {
-            result.then(() => callback(), (err) => {
-              // Wrap falsy errors so Node treats rejection as error (not success)
-              if (err == null || err === false || err === 0 || err === '') {
-                const wrapped = new Error('write rejected');
-                wrapped[kWrappedError] = err;
-                callback(wrapped);
-              } else {
-                callback(err);
-              }
-            });
+            result.then(
+              () => callback(),
+              (err) => {
+                // Wrap falsy errors so Node treats rejection as error (not success)
+                if (err == null || err === false || err === 0 || err === '') {
+                  const wrapped = new Error('write rejected');
+                  wrapped[kWrappedError] = err;
+                  callback(wrapped);
+                } else {
+                  callback(err);
+                }
+              },
+            );
           } else {
             callback();
           }
@@ -124,15 +141,18 @@ export class FastWritableStream {
         try {
           const result = Reflect.apply(close, underlyingSink, []);
           if (isThenable(result)) {
-            result.then(() => callback(), (err) => {
-              if (err == null || err === false || err === 0 || err === '') {
-                const wrapped = new Error('close rejected');
-                wrapped[kWrappedError] = err;
-                callback(wrapped);
-              } else {
-                callback(err);
-              }
-            });
+            result.then(
+              () => callback(),
+              (err) => {
+                if (err == null || err === false || err === 0 || err === '') {
+                  const wrapped = new Error('close rejected');
+                  wrapped[kWrappedError] = err;
+                  callback(wrapped);
+                } else {
+                  callback(err);
+                }
+              },
+            );
           } else {
             callback();
           }
@@ -146,7 +166,7 @@ export class FastWritableStream {
     });
 
     // Prevent unhandled 'error' events from crashing
-    nodeWritable.on('error', () => {});
+    nodeWritable.on('error', noop);
 
     controller = new FastWritableStreamDefaultController(nodeWritable, self, _controllerError, kControllerBrand);
 
@@ -181,7 +201,7 @@ export class FastWritableStream {
           self[kStarted] = true;
           self._startPromise = null;
           _dealWithRejection(self, err);
-        }
+        },
       );
     } else {
       // Sync start — use queueMicrotask instead of Promise.resolve().then()
@@ -332,8 +352,13 @@ function _finishErroring(stream) {
 
   // For transform shells, destroy the node stream to propagate error to readable side
   if (stream._isTransformShell && stream[kNodeWritable] && !stream[kNodeWritable].destroyed) {
-    stream[kNodeWritable].destroy(storedError instanceof Error ? storedError :
-      (storedError != null ? Object.assign(new Error('abort'), { [kWrappedError]: storedError }) : new Error('aborted')));
+    stream[kNodeWritable].destroy(
+      storedError instanceof Error
+        ? storedError
+        : storedError != null
+          ? Object.assign(new Error('abort'), { [kWrappedError]: storedError })
+          : new Error('aborted'),
+    );
   }
 
   // Reject all queued writes
@@ -377,7 +402,7 @@ function _finishErroring(stream) {
         (e) => {
           abortRequest.reject(e);
           _rejectCloseAndClosedPromiseIfNeeded(stream, storedError);
-        }
+        },
       );
     } else {
       abortRequest.resolve();
@@ -624,7 +649,9 @@ function _handleCloseSuccess(stream, closeRequest) {
   if (stream._isTransformShell && stream[kNodeWritable]) {
     const nodeTransform = stream[kNodeWritable];
     if (!nodeTransform.readableEnded) {
-      try { nodeTransform.push(null); } catch {}
+      try {
+        nodeTransform.push(null);
+      } catch {}
       if (nodeTransform.readableLength === 0) {
         nodeTransform.resume();
       }
@@ -706,8 +733,12 @@ export function _writeInternal(stream, chunk) {
   // FAST PATH: started, queue empty, no in-flight write, not transform shell.
   // Dispatch directly to nodeWritable.write() — skips queue push/shift and
   // _advanceQueueIfNeeded dispatch overhead.
-  if (stream[kStarted] && stream[kWriteRequests].length === 0 &&
-      !stream[kInFlightWriteRequest] && !stream._isTransformShell) {
+  if (
+    stream[kStarted] &&
+    stream[kWriteRequests].length === 0 &&
+    !stream[kInFlightWriteRequest] &&
+    !stream._isTransformShell
+  ) {
     return new Promise((resolve, reject) => {
       const writeRequest = { resolve, reject, chunk };
       stream[kInFlightWriteRequest] = writeRequest;
