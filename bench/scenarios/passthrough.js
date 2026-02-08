@@ -88,6 +88,29 @@ function createWebWritable(highWaterMark) {
   return writable;
 }
 
+/**
+ * Create a Fast ReadableStream with CountQueuingStrategy.
+ */
+function createFastReadable(chunk, totalBytes, highWaterMark, chunkSize) {
+  const countHWM = Math.max(1, Math.ceil(highWaterMark / chunkSize));
+  let remaining = totalBytes;
+  return new FastReadableStream(
+    {
+      pull(controller) {
+        if (remaining <= 0) {
+          controller.close();
+          return;
+        }
+        const size = Math.min(chunk.length, remaining);
+        const buf = size === chunk.length ? chunk : chunk.subarray(0, size);
+        remaining -= size;
+        controller.enqueue(buf);
+      },
+    },
+    { highWaterMark: countHWM }
+  );
+}
+
 export default {
   name: 'passthrough',
   description: 'Pure overhead: no transformation, measures streaming infrastructure cost',
@@ -236,6 +259,140 @@ export default {
         );
 
         await readable.pipeThrough(transform).pipeTo(writable);
+
+        return { bytesProcessed: bytesWritten };
+      },
+    },
+    {
+      name: 'node-read-loop',
+      fn: async ({ chunkSize, totalBytes }) => {
+        const chunk = makeChunk(chunkSize);
+        const readable = createNodeReadable(chunk, totalBytes);
+        let bytesRead = 0;
+
+        await new Promise((resolve, reject) => {
+          readable.on('data', (c) => {
+            bytesRead += c.length;
+          });
+          readable.on('end', resolve);
+          readable.on('error', reject);
+        });
+
+        return { bytesProcessed: bytesRead };
+      },
+    },
+    {
+      name: 'node-write-loop',
+      fn: async ({ chunkSize, totalBytes }) => {
+        const chunk = makeChunk(chunkSize);
+        const writable = createNodeWritable();
+        let remaining = totalBytes;
+        let bytesWritten = 0;
+
+        await new Promise((resolve, reject) => {
+          writable.on('error', reject);
+          function write() {
+            let ok = true;
+            while (remaining > 0 && ok) {
+              const size = Math.min(chunk.length, remaining);
+              const buf = size === chunk.length ? chunk : chunk.subarray(0, size);
+              remaining -= size;
+              bytesWritten += size;
+              if (remaining <= 0) {
+                writable.end(buf, resolve);
+              } else {
+                ok = writable.write(buf);
+              }
+            }
+            if (remaining > 0) {
+              writable.once('drain', write);
+            }
+          }
+          write();
+        });
+
+        return { bytesProcessed: bytesWritten };
+      },
+    },
+    {
+      name: 'web-read-loop',
+      fn: async ({ chunkSize, totalBytes, highWaterMark }) => {
+        const chunk = makeChunk(chunkSize);
+        const readable = createWebReadable(chunk, totalBytes, highWaterMark);
+        const reader = readable.getReader();
+        let bytesRead = 0;
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          bytesRead += value.length;
+        }
+
+        return { bytesProcessed: bytesRead };
+      },
+    },
+    {
+      name: 'fast-read-loop',
+      fn: async ({ chunkSize, totalBytes, highWaterMark }) => {
+        const chunk = makeChunk(chunkSize);
+        const readable = createFastReadable(chunk, totalBytes, highWaterMark, chunkSize);
+        const reader = readable.getReader();
+        let bytesRead = 0;
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          bytesRead += value.length;
+        }
+
+        return { bytesProcessed: bytesRead };
+      },
+    },
+    {
+      name: 'web-write-loop',
+      fn: async ({ chunkSize, totalBytes, highWaterMark }) => {
+        const chunk = makeChunk(chunkSize);
+        let bytesWritten = 0;
+        const writable = createWebWritable(highWaterMark);
+        const writer = writable.getWriter();
+        let remaining = totalBytes;
+
+        while (remaining > 0) {
+          const size = Math.min(chunk.length, remaining);
+          const buf = size === chunk.length ? chunk : chunk.subarray(0, size);
+          remaining -= size;
+          await writer.write(buf);
+          bytesWritten += size;
+        }
+        await writer.close();
+
+        return { bytesProcessed: bytesWritten };
+      },
+    },
+    {
+      name: 'fast-write-loop',
+      fn: async ({ chunkSize, totalBytes, highWaterMark }) => {
+        const chunk = makeChunk(chunkSize);
+        const countHWM = Math.max(1, Math.ceil(highWaterMark / chunkSize));
+        let bytesWritten = 0;
+        const writable = new FastWritableStream(
+          {
+            write(c) {
+              bytesWritten += c.length;
+            },
+          },
+          { highWaterMark: countHWM }
+        );
+        const writer = writable.getWriter();
+        let remaining = totalBytes;
+
+        while (remaining > 0) {
+          const size = Math.min(chunk.length, remaining);
+          const buf = size === chunk.length ? chunk : chunk.subarray(0, size);
+          remaining -= size;
+          await writer.write(buf);
+        }
+        await writer.close();
 
         return { bytesProcessed: bytesWritten };
       },

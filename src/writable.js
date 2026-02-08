@@ -181,6 +181,14 @@ export class FastWritableStream {
     this._sinkClose = close || null;
     this._hwm = hwm;
     this._isTransformShell = false;
+    // Pre-declare transform-shell properties so normal + transform paths share
+    // the same property set, reducing V8 polymorphism in hot functions.
+    this._origTransform = null;
+    this._transformWriteCallback = null;
+    this._transformReadable = null;
+    this._transformStream = null;
+    this._transformBackpressure = false;
+    this._transformBackpressureResolve = null;
 
     // Start
     let startResult;
@@ -731,25 +739,81 @@ export function _writeInternal(stream, chunk) {
   }
 
   // FAST PATH: started, queue empty, no in-flight write, not transform shell.
-  // Dispatch directly to nodeWritable.write() — skips queue push/shift and
-  // _advanceQueueIfNeeded dispatch overhead.
+  // Bypasses Node Writable entirely for direct sink calls — eliminates the
+  // process.nextTick() deferral that Node imposes on write callbacks.
   if (
     stream[kStarted] &&
     stream[kWriteRequests].length === 0 &&
     !stream[kInFlightWriteRequest] &&
     !stream._isTransformShell
   ) {
+    const sinkWrite = stream._sinkWrite;
+
+    // DIRECT SINK PATH: call user's write() directly, no Node Writable
+    if (sinkWrite) {
+      return new Promise((resolve, reject) => {
+        const writeRequest = { resolve, reject, chunk };
+        stream[kInFlightWriteRequest] = writeRequest;
+
+        // Update backpressure (in-flight write counts toward desiredSize)
+        const writer = stream[kLock];
+        if (writer && stream[kWritableState] === 'writable') {
+          writer._updateReadyForBackpressure(stream);
+        }
+
+        try {
+          const result = Reflect.apply(sinkWrite, stream._underlyingSink, [chunk, stream._controller]);
+          if (isThenable(result)) {
+            result.then(
+              () => {
+                stream[kInFlightWriteRequest] = null;
+                writeRequest.resolve(undefined);
+                const w = stream[kLock];
+                if (w && stream[kWritableState] === 'writable') {
+                  w._updateReadyForBackpressure(stream);
+                }
+                _advanceQueueIfNeeded(stream);
+              },
+              (err) => {
+                stream[kInFlightWriteRequest] = null;
+                writeRequest.reject(err);
+                _handleWriteError(stream, err);
+              },
+            );
+          } else {
+            // Sync write — defer completion by one microtask (not nextTick).
+            // This matches WHATWG spec's promise-based write completion timing
+            // while being much faster than Node's nextTick deferral.
+            // The write already succeeded (sink returned normally), so we always
+            // resolve — even if abort races in before the microtask fires.
+            queueMicrotask(() => {
+              stream[kInFlightWriteRequest] = null;
+              writeRequest.resolve(undefined);
+              const w = stream[kLock];
+              if (w && stream[kWritableState] === 'writable') {
+                w._updateReadyForBackpressure(stream);
+              }
+              _advanceQueueIfNeeded(stream);
+            });
+          }
+        } catch (err) {
+          stream[kInFlightWriteRequest] = null;
+          writeRequest.reject(err);
+          _handleWriteError(stream, err);
+        }
+      });
+    }
+
+    // No sink write (default no-op sink) — go through Node Writable
     return new Promise((resolve, reject) => {
       const writeRequest = { resolve, reject, chunk };
       stream[kInFlightWriteRequest] = writeRequest;
 
-      // Update backpressure (in-flight write counts toward desiredSize)
       const writer = stream[kLock];
       if (writer && stream[kWritableState] === 'writable') {
         writer._updateReadyForBackpressure(stream);
       }
 
-      // Dispatch write directly (identical to _processWrite callback logic)
       const nodeWritable = stream[kNodeWritable];
       const ok = nodeWritable.write(chunk, (err) => {
         stream[kInFlightWriteRequest] = null;
