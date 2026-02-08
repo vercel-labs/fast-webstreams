@@ -4,10 +4,11 @@
  */
 
 import { materializeReadable } from './materialize.js';
+import { NativeReadableStream } from './natives.js';
 import { isFastReadable } from './utils.js';
 
 // Get the native BYOB reader constructor
-const NativeBYOBReader = new ReadableStream({ type: 'bytes' }).getReader({ mode: 'byob' }).constructor;
+const NativeBYOBReader = new NativeReadableStream({ type: 'bytes' }).getReader({ mode: 'byob' }).constructor;
 
 /**
  * BYOB reader that accepts both native ReadableStream and FastReadableStream.

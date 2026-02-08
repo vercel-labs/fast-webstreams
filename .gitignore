@@ -1,3 +1,4 @@
 node_modules/
 bench/results/*.json
 bench/results/*.md
+todo/

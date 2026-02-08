@@ -13,6 +13,7 @@ import {
   unwrapError,
 } from './controller.js';
 import { materializeWritable } from './materialize.js';
+import { NativeWritableStream } from './natives.js';
 import {
   isThenable,
   kLock,
@@ -76,7 +77,7 @@ export class FastWritableStream {
 
     // If strategy has a custom size(), delegate to native
     if (typeof strategySize === 'function') {
-      const native = new WritableStream(underlyingSink, strategy);
+      const native = new NativeWritableStream(underlyingSink, strategy);
       _initNativeWritableShell(this, native);
       return;
     }

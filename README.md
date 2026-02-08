@@ -1,4 +1,4 @@
-# fast-webstreams
+# experimental-fast-webstreams
 
 WHATWG WebStreams API (`ReadableStream`, `WritableStream`, `TransformStream`) backed by Node.js native streams for dramatically better performance.
 
@@ -24,15 +24,41 @@ When your transform does real work (CPU, I/O), the streaming overhead becomes ne
 
 ## Installation
 
+```bash
+npm install experimental-fast-webstreams
+```
+
 ```js
 import {
   FastReadableStream,
   FastWritableStream,
   FastTransformStream,
-} from 'fast-webstreams';
+} from 'experimental-fast-webstreams';
 ```
 
 These are drop-in replacements for the global `ReadableStream`, `WritableStream`, and `TransformStream`.
+
+### Global Patch
+
+To replace the built-in stream constructors globally:
+
+```js
+import { patchGlobalWebStreams, unpatchGlobalWebStreams } from 'experimental-fast-webstreams/patch';
+
+patchGlobalWebStreams();
+// globalThis.ReadableStream is now FastReadableStream
+// globalThis.WritableStream is now FastWritableStream
+// globalThis.TransformStream is now FastTransformStream
+
+unpatchGlobalWebStreams();
+// restores the original native constructors
+```
+
+Native constructor references are captured at import time, so internal code and `unpatch()` always work correctly.
+
+### TypeScript
+
+Type declarations are included. The exports re-export the standard WHATWG stream types, so existing TypeScript code works without changes.
 
 ## Quick Example
 
@@ -41,7 +67,7 @@ import {
   FastReadableStream,
   FastWritableStream,
   FastTransformStream,
-} from 'fast-webstreams';
+} from 'experimental-fast-webstreams';
 
 const readable = new FastReadableStream({
   start(controller) {
@@ -131,7 +157,7 @@ These patterns use the fast internal implementation (Node.js `Readable`, `Writab
 **1. Pull-based ReadableStream with reader.read() loop (Tier 1 -- sync fast path)**
 
 ```js
-import { FastReadableStream } from 'fast-webstreams';
+import { FastReadableStream } from 'experimental-fast-webstreams';
 
 const stream = new FastReadableStream({
   start(controller) {
@@ -158,7 +184,7 @@ import {
   FastReadableStream,
   FastWritableStream,
   FastTransformStream,
-} from 'fast-webstreams';
+} from 'experimental-fast-webstreams';
 
 const source = new FastReadableStream({
   pull(controller) {
@@ -186,7 +212,7 @@ When all streams in a `pipeThrough` / `pipeTo` chain are Fast streams with defau
 **3. WritableStream with simple write sink (Tier 1 -- direct dispatch)**
 
 ```js
-import { FastWritableStream } from 'fast-webstreams';
+import { FastWritableStream } from 'experimental-fast-webstreams';
 
 const writable = new FastWritableStream({
   write(chunk) {
@@ -209,7 +235,7 @@ These patterns fall back to native WebStreams. They are fully WHATWG-compliant b
 **1. ReadableStream with custom size() in QueuingStrategy**
 
 ```js
-import { FastReadableStream } from 'fast-webstreams';
+import { FastReadableStream } from 'experimental-fast-webstreams';
 
 // Custom size() function triggers delegation to native ReadableStream
 const stream = new FastReadableStream(
@@ -232,7 +258,7 @@ Any strategy with a `size()` function causes the constructor to create a native 
 **2. TransformStream with custom readableStrategy.size**
 
 ```js
-import { FastTransformStream } from 'fast-webstreams';
+import { FastTransformStream } from 'experimental-fast-webstreams';
 
 // Custom size on either strategy triggers delegation to native TransformStream
 const transform = new FastTransformStream(
@@ -256,7 +282,7 @@ If either `writableStrategy` or `readableStrategy` has a `size()` function, the 
 **3. tee() on any stream**
 
 ```js
-import { FastReadableStream } from 'fast-webstreams';
+import { FastReadableStream } from 'experimental-fast-webstreams';
 
 const stream = new FastReadableStream({
   start(controller) {
@@ -273,7 +299,7 @@ const [branch1, branch2] = stream.tee(); // <-- compat mode (pure JS tee)
 **4. Byte streams (type: 'bytes')**
 
 ```js
-import { FastReadableStream } from 'fast-webstreams';
+import { FastReadableStream } from 'experimental-fast-webstreams';
 
 // Byte stream type delegates entirely to native ReadableStream
 const stream = new FastReadableStream({
@@ -291,7 +317,7 @@ Byte streams (`type: 'bytes'`) require BYOB reader support and typed array view 
 If you want to check programmatically whether a stream took the fast path or was delegated to native:
 
 ```js
-import { FastReadableStream } from 'fast-webstreams';
+import { FastReadableStream } from 'experimental-fast-webstreams';
 
 const stream = new FastReadableStream(source, strategy);
 
@@ -338,15 +364,14 @@ The `specPipeTo` implementation follows the WHATWG `ReadableStreamPipeTo` algori
 | Implementation | Pass Rate | Tests |
 |---|---|---|
 | Native (Node.js) | 98.2% | 1096/1116 |
-| fast-webstreams | 97.6% | 1089/1116 |
+| fast-webstreams | 97.7% | 1090/1116 |
 
-The 27 remaining failures (9 fast-only) are in edge cases:
+The 26 remaining failures (8 fast-only) are in edge cases:
 
 - **2 tests**: `then`-interception -- `Promise.resolve(obj)` always triggers a thenable check on `obj`, which is unfixable in pure JavaScript.
 - **3 tests**: Cancel timing -- microtask ordering differences between the spec's pure-Promise model and Node.js event-driven completion.
 - **2 tests**: Piping timing -- subtle microtask ordering in error propagation paths.
-- **1 test**: `tee()` edge case.
-- **1 test**: Flow control timing.
+- **1 test**: `tee()` error identity -- non-Error objects lose identity through Node.js `destroy()`.
 
 ### Running WPT Tests
 
@@ -433,12 +458,18 @@ src/
   controller.js       WHATWG controller adapters (Readable, Writable, Transform)
   pipe-to.js          Spec-compliant pipeTo implementation
   materialize.js      Tier 2: Readable.toWeb() / Writable.toWeb() delegation
+  natives.js          Captured native constructors (pre-polyfill)
+  patch.js            Global patch/unpatch
   utils.js            Symbols, type checks, shared constants
+
+types/
+  index.d.ts          TypeScript declarations
 
 test/
   run-wpt.js          WPT test runner (subprocess-based, concurrency=4)
   run-wpt-file.js     Single-file WPT runner
   wpt-harness.js      testharness.js polyfill for VM context
+  patch.test.js       Patch/unpatch tests
 
 bench/
   run.js              Benchmark entry point

@@ -118,7 +118,13 @@ export class FastReadableStreamDefaultController {
     if (this.#originalHWM === Infinity) {
       return Infinity;
     }
-    return this.#originalHWM - r.readableLength;
+    // Account for pending reads: in WHATWG spec, pending reads consume enqueued
+    // chunks directly (no queuing). Our Node readable buffers chunks first,
+    // so subtract pending reads from queue length for accurate desiredSize.
+    const queueSize = r.readableLength;
+    const reader = this._stream?.[kLock];
+    const pendingReads = reader?._pendingReadCount?.() ?? 0;
+    return this.#originalHWM - Math.max(0, queueSize - pendingReads);
   }
 }
 

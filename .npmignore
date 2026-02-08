@@ -1,0 +1,11 @@
+bench/
+test/
+vendor/
+todo/
+project.md
+.claude/
+.gitignore
+biome.json
+biome.jsonc
+knip.json
+knip.jsonc

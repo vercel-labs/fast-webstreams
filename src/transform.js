@@ -7,6 +7,7 @@
 
 import { Transform } from 'node:stream';
 import { FastTransformStreamDefaultController } from './controller.js';
+import { NativeTransformStream } from './natives.js';
 import { _initNativeReadableShell, FastReadableStream } from './readable.js';
 import {
   isThenable,
@@ -96,7 +97,7 @@ export class FastTransformStream {
       (writableStrategy && typeof writableStrategy.size === 'function') ||
       (readableStrategy && typeof readableStrategy.size === 'function')
     ) {
-      const native = new TransformStream(transformer, writableStrategy, readableStrategy);
+      const native = new NativeTransformStream(transformer, writableStrategy, readableStrategy);
       this[kNodeTransform] = null;
       this.#readable = _initNativeReadableShell(Object.create(FastReadableStream.prototype), native.readable);
       this.#writable = _initNativeWritableShell(Object.create(FastWritableStream.prototype), native.writable);

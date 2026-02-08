@@ -10,6 +10,7 @@ import { pipeline, Readable } from 'node:stream';
 import { FastReadableStreamBYOBReader } from './byob-reader.js';
 import { FastReadableStreamDefaultController } from './controller.js';
 import { materializeReadable, materializeWritable } from './materialize.js';
+import { NativeReadableStream, NativeWritableStream } from './natives.js';
 import { specPipeTo } from './pipe-to.js';
 import { FastReadableStreamDefaultReader } from './reader.js';
 import {
@@ -106,13 +107,13 @@ function _getAsyncIteratorPrototype() {
 function _isReadableStream(obj) {
   if (obj == null) return false;
   if (typeof obj !== 'object' && typeof obj !== 'function') return false;
-  return isFastReadable(obj) || obj instanceof ReadableStream;
+  return isFastReadable(obj) || obj instanceof NativeReadableStream;
 }
 
 function _isWritableStream(obj) {
   if (obj == null) return false;
   if (typeof obj !== 'object' && typeof obj !== 'function') return false;
-  return isFastWritable(obj) || obj instanceof WritableStream;
+  return isFastWritable(obj) || obj instanceof NativeWritableStream;
 }
 
 /**
@@ -181,7 +182,7 @@ export class FastReadableStream {
    * Wraps result in a FastReadableStream shell so .constructor checks pass
    */
   static from(asyncIterable) {
-    const native = ReadableStream.from(asyncIterable);
+    const native = NativeReadableStream.from(asyncIterable);
     return _initNativeReadableShell(Object.create(FastReadableStream.prototype), native);
   }
 
@@ -217,7 +218,7 @@ export class FastReadableStream {
 
     // Validate type
     if (type === 'bytes') {
-      _initNativeReadableShell(this, new ReadableStream(underlyingSource, strategy));
+      _initNativeReadableShell(this, new NativeReadableStream(underlyingSource, strategy));
       return;
     }
     if (type !== undefined) {
@@ -237,7 +238,7 @@ export class FastReadableStream {
 
     // If strategy has a custom size(), delegate to native
     if (typeof strategySize === 'function') {
-      _initNativeReadableShell(this, new ReadableStream(underlyingSource, strategy));
+      _initNativeReadableShell(this, new NativeReadableStream(underlyingSource, strategy));
       return;
     }
 
