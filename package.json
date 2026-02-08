@@ -1,15 +1,16 @@
 {
   "name": "experimental-fast-webstreams",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "type": "module",
   "description": "Exploring faster WebStreams for Node.js",
   "types": "./types/index.d.ts",
   "exports": {
     ".": {
       "types": "./types/index.d.ts",
+      "edge-light": "./src/edge.js",
+      "workerd": "./src/edge.js",
       "default": "./src/index.js"
-    },
-    "./patch": "./src/patch.js"
+    }
   },
   "scripts": {
     "bench": "node --expose-gc bench/run.js",
