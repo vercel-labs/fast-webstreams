@@ -145,18 +145,19 @@ function fastPipelineTo(source, dest) {
   const chain = collectPipelineChain(source, dest);
   return new Promise((resolve, reject) => {
     pipeline(...chain, (err) => {
-      // Sync closed state after pipeline completes
       if (!err) {
         source._closed = true;
         if (kWritableState in dest) {
           dest[kWritableState] = 'closed';
         }
+        resolve(undefined);
+      } else {
+        reject(err);
       }
-      if (err) reject(err);
-      else resolve(undefined);
     });
   });
 }
+
 
 /**
  * Initialize a native-only readable shell (delegates everything to native ReadableStream).
@@ -404,8 +405,8 @@ export class FastReadableStream {
         return Promise.reject(new TypeError('WritableStream is locked'));
       }
 
-      // Tier 1: pipeThrough chain with upstream links → pipeline()
-      // Only when kUpstream is set (from pipeThrough Tier 1 linking).
+      // Tier 0: pipeThrough chain with upstream links → Node.js pipeline()
+      // Full pipeline only when ALL options are default + all-Fast chain.
       const isDefaultOpts = !preventAbort && !preventCancel && !preventClose && !signal;
       if (
         isDefaultOpts &&
@@ -417,7 +418,24 @@ export class FastReadableStream {
         return fastPipelineTo(this, destination);
       }
 
-      // Tier 2: Spec-compliant
+      // Tier 0.5: upstream chain exists but can't use full pipeline.
+      // Start specPipeTo for each upstream hop retroactively.
+      if (this[kUpstream]) {
+        const hops = [];
+        let current = this;
+        while (current[kUpstream]) {
+          hops.push({ source: current[kUpstream], writable: current._upstreamWritable });
+          current = current[kUpstream];
+        }
+        // Start each hop (they are independent: source→t1.writable, t1.readable→t2.writable, ...)
+        for (const hop of hops) {
+          if (hop.source && hop.writable) {
+            specPipeTo(hop.source, hop.writable, {}).catch(noop);
+          }
+        }
+      }
+
+      // Tier 2: Spec-compliant (handles the last hop: this → destination)
       return specPipeTo(this, destination, { preventAbort, preventCancel, preventClose, signal });
     } catch (e) {
       return Promise.reject(e);
@@ -492,6 +510,17 @@ export class FastReadableStream {
         { preventAbort, preventCancel, preventClose, signal },
       );
       // Return the original readable (Fast shell or native) — the pipe is running
+      return readable;
+    }
+
+    // Tier 1: FastTransform, default options → upstream linking (deferred pipe)
+    // Just sets kUpstream. pipeTo resolves the chain:
+    //   - Default opts + Fast dest → fastPipelineTo (Tier 0, zero promises)
+    //   - Otherwise → retroactive specPipeTo for each hop
+    const isDefaultOpts = !preventAbort && !preventCancel && !preventClose && !signal;
+    if (isDefaultOpts && isFastTransform(transform)) {
+      readable[kUpstream] = this;
+      readable._upstreamWritable = writable; // for retroactive specPipeTo
       return readable;
     }
 
