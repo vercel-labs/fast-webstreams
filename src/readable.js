@@ -495,13 +495,6 @@ export class FastReadableStream {
       return readable;
     }
 
-    // Tier 1: FastTransform, default options → upstream linking (deferred pipe)
-    const isDefaultOpts = !preventAbort && !preventCancel && !preventClose && !signal;
-    if (isDefaultOpts && isFastTransform(transform)) {
-      readable[kUpstream] = this;
-      return readable;
-    }
-
     // Tier 2: Spec-compliant — use internal pipeTo (not this.pipeTo) per spec
     const pipePromise = specPipeTo(this, writable, {
       preventAbort,

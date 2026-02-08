@@ -7,7 +7,7 @@ settings:
 importers:
 
   .:
-    dependencies:
+    devDependencies:
       biome:
         specifier: ^0.3.3
         version: 0.3.3
