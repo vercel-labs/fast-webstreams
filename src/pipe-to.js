@@ -91,28 +91,19 @@ export function specPipeTo(source, dest, options = {}) {
     );
 
     // --- Source close/error handler ---
+    // NOTE: Don't trigger shutdown on source close here. The reader.closed
+    // promise can resolve (via Node.js 'end'/'close' events) before the pump
+    // has drained all buffered data from the underlying Node.js readable.
+    // Instead, just set the flag and kick the pump. The pump will read done
+    // and trigger shutdown after draining all buffered chunks.
     reader.closed.then(
       () => {
-        // Source closed
+        // Source closed — let the pump drain remaining data and handle shutdown
         sourceClosed = true;
-        if (shuttingDown) return;
-        if (!preventClose) {
-          shutdownWithAction(() => {
-            // WritableStreamDefaultWriterCloseWithErrorPropagation
-            if (destErrored) return Promise.reject(destStoredError);
-            if (destClosed) return RESOLVED_UNDEFINED;
-            // writer.close() may reject if already closed; treat as success
-            return writer.close().catch((e) => {
-              if (e instanceof TypeError) return; // Already closed/closing
-              throw e;
-            });
-          });
-        } else {
-          shutdown();
-        }
+        if (!shuttingDown) pipeLoop();
       },
       (storedError) => {
-        // Source errored
+        // Source errored — immediate shutdown is correct (no data to drain)
         if (shuttingDown) return;
         if (!preventAbort) {
           shutdownWithAction(() => writer.abort(storedError), true, storedError);
@@ -182,6 +173,22 @@ export function specPipeTo(source, dest, options = {}) {
         if (syncResult !== null) {
           if (syncResult.done) {
             sourceClosed = true;
+            // Pump is responsible for triggering close-shutdown (not reader.closed)
+            // to ensure all buffered data is drained before closing.
+            if (!shuttingDown) {
+              if (!preventClose) {
+                shutdownWithAction(() => {
+                  if (destErrored) return Promise.reject(destStoredError);
+                  if (destClosed) return RESOLVED_UNDEFINED;
+                  return writer.close().catch((e) => {
+                    if (e instanceof TypeError) return;
+                    throw e;
+                  });
+                });
+              } else {
+                shutdown();
+              }
+            }
             return;
           }
           currentWrite = writer.write(syncResult.value);
@@ -201,6 +208,21 @@ export function specPipeTo(source, dest, options = {}) {
         if (shuttingDown) return;
         if (done) {
           sourceClosed = true;
+          // Pump is responsible for triggering close-shutdown (not reader.closed)
+          if (!shuttingDown) {
+            if (!preventClose) {
+              shutdownWithAction(() => {
+                if (destErrored) return Promise.reject(destStoredError);
+                if (destClosed) return RESOLVED_UNDEFINED;
+                return writer.close().catch((e) => {
+                  if (e instanceof TypeError) return;
+                  throw e;
+                });
+              });
+            } else {
+              shutdown();
+            }
+          }
           return;
         }
         currentWrite = writer.write(value);
