@@ -471,16 +471,60 @@ function _processWrite(stream) {
   const writeRequest = stream[kWriteRequests].shift();
   stream[kInFlightWriteRequest] = writeRequest;
 
-  const nodeWritable = stream[kNodeWritable];
   const chunk = writeRequest.chunk;
 
   // For transform shells, the write callback from Node may not fire reliably
   // due to readable-side backpressure. Use a different approach.
   if (stream._isTransformShell) {
+    const nodeWritable = stream[kNodeWritable];
     _processWriteTransform(stream, writeRequest, nodeWritable, chunk);
     return;
   }
 
+  // Direct sink path: bypass Node Writable for queued writes too
+  const sinkWrite = stream._sinkWrite;
+  if (sinkWrite) {
+    try {
+      const result = Reflect.apply(sinkWrite, stream._underlyingSink, [chunk, stream._controller]);
+      if (isThenable(result)) {
+        result.then(
+          () => {
+            stream[kInFlightWriteRequest] = null;
+            writeRequest.resolve(undefined);
+            const writer = stream[kLock];
+            if (writer && stream[kWritableState] === 'writable') {
+              writer._updateReadyForBackpressure(stream);
+            }
+            _advanceQueueIfNeeded(stream);
+          },
+          (err) => {
+            stream[kInFlightWriteRequest] = null;
+            writeRequest.reject(err);
+            _handleWriteError(stream, err);
+          },
+        );
+      } else {
+        // Sync sink — resolve via microtask (matches fast path timing)
+        queueMicrotask(() => {
+          stream[kInFlightWriteRequest] = null;
+          writeRequest.resolve(undefined);
+          const writer = stream[kLock];
+          if (writer && stream[kWritableState] === 'writable') {
+            writer._updateReadyForBackpressure(stream);
+          }
+          _advanceQueueIfNeeded(stream);
+        });
+      }
+    } catch (err) {
+      stream[kInFlightWriteRequest] = null;
+      writeRequest.reject(err);
+      _handleWriteError(stream, err);
+    }
+    return;
+  }
+
+  // No sink write (default no-op) — go through Node Writable
+  const nodeWritable = stream[kNodeWritable];
   const ok = nodeWritable.write(chunk, (err) => {
     stream[kInFlightWriteRequest] = null;
     if (err) {
@@ -781,11 +825,9 @@ export function _writeInternal(stream, chunk) {
               },
             );
           } else {
-            // Sync write — defer completion by one microtask (not nextTick).
-            // This matches WHATWG spec's promise-based write completion timing
-            // while being much faster than Node's nextTick deferral.
-            // The write already succeeded (sink returned normally), so we always
-            // resolve — even if abort races in before the microtask fires.
+            // Sync write — defer by one microtask (not nextTick).
+            // Must keep kInFlightWriteRequest set so concurrent fire-and-forget
+            // writes queue properly (abort can reject them).
             queueMicrotask(() => {
               stream[kInFlightWriteRequest] = null;
               writeRequest.resolve(undefined);
