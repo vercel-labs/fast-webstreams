@@ -177,6 +177,28 @@ export function _initNativeReadableShell(target, nativeStream) {
   return target;
 }
 
+/**
+ * Bridge a kNativeOnly readable into a proper FastReadableStream.
+ * Reads from the native reader and enqueues into a Fast controller.
+ * Cost: 1 Promise per chunk (native reader.read()), but enables
+ * downstream Fast transforms to use Node.js pipeline (zero promises per chunk).
+ */
+function _bridgeNativeToFast(nativeOnlyStream) {
+  const nativeStream = materializeReadable(nativeOnlyStream);
+  const nativeReader = nativeStream.getReader();
+  return new FastReadableStream({
+    pull(controller) {
+      return nativeReader.read().then(({ value, done }) => {
+        if (done) controller.close();
+        else controller.enqueue(value);
+      });
+    },
+    cancel(reason) {
+      return nativeReader.cancel(reason);
+    },
+  });
+}
+
 export class FastReadableStream {
   /**
    * Static from() — delegates to native ReadableStream.from()
@@ -442,7 +464,9 @@ export class FastReadableStream {
         let current = this;
         while (current[kUpstream]) {
           hops.push({ source: current[kUpstream], writable: current._upstreamWritable });
-          current = current[kUpstream];
+          const next = current[kUpstream];
+          current[kUpstream] = null;
+          current = next;
         }
         // Start each hop (they are independent: source→t1.writable, t1.readable→t2.writable, ...)
         for (const hop of hops) {
@@ -517,8 +541,22 @@ export class FastReadableStream {
       }
     }
 
-    // Tier 0: kNativeOnly source → delegate to native pipeThrough
+    // Tier 0: kNativeOnly source → bridge to Fast when transform is fully Fast
     if (this[kNativeOnly]) {
+      // Bridge: convert native source to Fast, then use upstream linking.
+      // The bridge's node readable becomes the pipeline source (fed by native reader).
+      // This breaks the native cascade so downstream transforms use Node.js pipeline.
+      // The deferred pipe is resolved by pipeTo (fastPipelineTo/Tier 0.5) or getReader.
+      if (
+        isFastWritable(writable) && !writable[kNativeOnly] &&
+        isFastReadable(readable) && !readable[kNativeOnly]
+      ) {
+        const bridged = _bridgeNativeToFast(this);
+        readable[kUpstream] = bridged;
+        readable._upstreamWritable = writable;
+        return readable;
+      }
+      // Fallback: cascade to native (transform is not fully Fast)
       const nativeSrc = materializeReadable(this);
       const nativeDst = isFastWritable(writable) ? materializeWritable(writable) : writable;
       const nativeRd = isFastReadable(readable) ? materializeReadable(readable) : readable;
@@ -577,6 +615,24 @@ export class FastReadableStream {
     // For native-only streams (byte, custom size), delegate reader too
     if (this[kNativeOnly]) {
       return materializeReadable(this).getReader();
+    }
+
+    // Resolve upstream chain: start specPipeTo for each deferred hop
+    // (same logic as pipeTo Tier 0.5, needed when getReader() is called
+    // on the result of pipeThrough instead of pipeTo)
+    if (this[kUpstream]) {
+      const hops = [];
+      let current = this;
+      while (current[kUpstream]) {
+        hops.push({ source: current[kUpstream], writable: current._upstreamWritable });
+        current = current[kUpstream];
+      }
+      for (const hop of hops) {
+        if (hop.source && hop.writable) {
+          specPipeTo(hop.source, hop.writable, {}).catch(noop);
+        }
+      }
+      this[kUpstream] = null;
     }
 
     return new FastReadableStreamDefaultReader(this);

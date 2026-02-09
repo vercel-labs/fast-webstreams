@@ -31,6 +31,13 @@ before(async () => {
         res.write('x'.repeat(1000));
       }
       res.end();
+    } else if (req.url === '/echo' && req.method === 'POST') {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end(Buffer.concat(chunks).toString());
+      });
     } else {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       res.end('Hello from server');
@@ -186,5 +193,72 @@ describe('fetch integration', () => {
       chunks.push(Buffer.from(value).toString());
     }
     assert.strictEqual(chunks.join(''), 'reader test');
+  });
+
+  it('new Request(url, { body: FastReadableStream }) materializes body', async () => {
+    patchGlobalWebStreams();
+    const rs = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('request body'));
+        c.close();
+      },
+    });
+    const req = new Request(`${baseURL}/echo`, {
+      method: 'POST',
+      body: rs,
+      duplex: 'half',
+    });
+    assert.ok(req.body, 'Request should have a body');
+    const text = await req.text();
+    assert.strictEqual(text, 'request body');
+  });
+
+  it('fetch with FastReadableStream POST body', async () => {
+    patchGlobalWebStreams();
+    const rs = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('streamed post'));
+        c.close();
+      },
+    });
+    const resp = await fetch(`${baseURL}/echo`, {
+      method: 'POST',
+      body: rs,
+      duplex: 'half',
+    });
+    const text = await resp.text();
+    assert.strictEqual(text, 'streamed post');
+  });
+
+  it('fetch body → pipeThrough chain bridges to Fast (large data)', async () => {
+    patchGlobalWebStreams();
+    const resp = await fetch(`${baseURL}/large`);
+    // Pipe through 3 Fast transforms — bridge should prevent native cascade
+    let stream = resp.body;
+    for (let i = 0; i < 3; i++) {
+      stream = stream.pipeThrough(new TransformStream({
+        transform(chunk, ctrl) { ctrl.enqueue(chunk); },
+      }));
+    }
+    let totalBytes = 0;
+    const dest = new WritableStream({
+      write(chunk) { totalBytes += chunk.byteLength; },
+    });
+    await stream.pipeTo(dest);
+    assert.strictEqual(totalBytes, 100 * 1000);
+  });
+
+  it('fetch body → pipeThrough bridge preserves cancel', async () => {
+    patchGlobalWebStreams();
+    const resp = await fetch(`${baseURL}/large`);
+    const piped = resp.body.pipeThrough(new TransformStream({
+      transform(chunk, ctrl) { ctrl.enqueue(chunk); },
+    }));
+    const reader = piped.getReader();
+    // Read one chunk then cancel
+    const { done } = await reader.read();
+    assert.strictEqual(done, false);
+    await reader.cancel('test cancel');
+    // Should not throw — cancel propagates through bridge to native
   });
 });
