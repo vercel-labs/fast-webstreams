@@ -658,7 +658,22 @@ function _processClose(stream) {
           _errorReadableSide(readable, unwrapped);
         }
       } else {
-        _handleCloseSuccess(stream, closeRequest);
+        // If a cancel is in-flight (readable.cancel() running async), wait for it
+        // before resolving close — cancel rejection should take precedence.
+        const ts = stream._transformStream;
+        if (ts && ts._cancelPromise) {
+          ts._cancelPromise.then(
+            () => _handleCloseSuccess(stream, closeRequest),
+            (cancelErr) => {
+              stream[kInFlightCloseRequest] = null;
+              const unwrapped = unwrapError(cancelErr);
+              closeRequest.reject(unwrapped);
+              _handleCloseError(stream, unwrapped);
+            },
+          );
+        } else {
+          _handleCloseSuccess(stream, closeRequest);
+        }
       }
     };
     if (flush) {

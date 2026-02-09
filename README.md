@@ -364,14 +364,11 @@ The `specPipeTo` implementation follows the WHATWG `ReadableStreamPipeTo` algori
 | Implementation | Pass Rate | Tests |
 |---|---|---|
 | Native (Node.js) | 98.2% | 1096/1116 |
-| fast-webstreams | 97.7% | 1090/1116 |
+| fast-webstreams | 98.0% | 1094/1116 |
 
-The 26 remaining failures (8 fast-only) are in edge cases:
+The 22 remaining failures (2 fast-only) are in edge cases:
 
 - **2 tests**: `then`-interception -- `Promise.resolve(obj)` always triggers a thenable check on `obj`, which is unfixable in pure JavaScript.
-- **3 tests**: Cancel timing -- microtask ordering differences between the spec's pure-Promise model and Node.js event-driven completion.
-- **2 tests**: Piping timing -- subtle microtask ordering in error propagation paths.
-- **1 test**: `tee()` error identity -- non-Error objects lose identity through Node.js `destroy()`.
 
 ### Running WPT Tests
 

@@ -201,6 +201,7 @@ export class FastTransformStream {
     this._transformerCancel = cancel || null;
     this._transformer = transformer;
     this._cancelCalled = false;
+    this._cancelPromise = null;
     this._flushStarted = false;
     this._inTransformCallback = false;
     this._controller = controller;
@@ -333,14 +334,18 @@ export class FastTransformStream {
           _errorTransformWritable(transformSelf, reason);
         };
 
+        let cancelPromise;
         if (isThenable(cancelResult)) {
-          return cancelResult.then(checkWritableError, (e) => {
+          cancelPromise = cancelResult.then(checkWritableError, (e) => {
             _errorTransformWritable(transformSelf, e);
             throw e;
           });
+        } else {
+          // Sync cancel: defer writable error check to next microtask
+          cancelPromise = Promise.resolve().then(checkWritableError);
         }
-        // Sync cancel: defer writable error check to next microtask
-        return Promise.resolve().then(checkWritableError);
+        transformSelf._cancelPromise = cancelPromise;
+        return cancelPromise;
       };
     }
     return this.#readable;
@@ -393,10 +398,16 @@ export class FastTransformStream {
         const cancelFn = this._transformerCancel;
         const transformerObj = this._transformer;
         this.#writable._sinkAbort = (reason) => {
-          if (transformSelf._cancelCalled) return undefined;
+          if (transformSelf._cancelCalled) {
+            // Cancel already running from readable.cancel() — throw stored error so abort rejects
+            const storedError = transformSelf.writable[kStoredError];
+            if (storedError !== undefined) throw storedError;
+            return undefined;
+          }
           transformSelf._cancelCalled = true;
           // Per spec: also error the readable side
           const readable = transformSelf.readable;
+          const readableErrorBefore = readable._storedError;
           try {
             const result = Reflect.apply(cancelFn, transformerObj, [reason]);
             // Normal path: error readable with abort reason
@@ -406,6 +417,14 @@ export class FastTransformStream {
                 try {
                   ctrl.error(reason);
                 } catch {}
+            }
+            // For async cancel: after it resolves, check if cancel called controller.error()
+            if (isThenable(result)) {
+              return result.then(() => {
+                if (readable._errored && readable._storedError !== readableErrorBefore) {
+                  throw readable._storedError;
+                }
+              });
             }
             return result;
           } catch (e) {

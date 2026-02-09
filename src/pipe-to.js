@@ -9,7 +9,7 @@
  * https://streams.spec.whatwg.org/#readable-stream-pipe-to
  */
 
-import { kNodeReadable, kWritableState, noop, RESOLVED_UNDEFINED } from './utils.js';
+import { kNodeReadable, kStoredError, kWritableState, noop, RESOLVED_UNDEFINED } from './utils.js';
 
 /**
  * Wait for a write promise to settle, resolving to undefined regardless of outcome.
@@ -35,6 +35,7 @@ export function specPipeTo(source, dest, options = {}) {
   let destErrored = false;
   let destStoredError;
   let sourceClosed = false;
+  const destWasErroredAtStart = dest[kWritableState] === 'errored';
 
   return new Promise((resolve, reject) => {
     // --- Abort signal handling ---
@@ -113,6 +114,12 @@ export function specPipeTo(source, dest, options = {}) {
         // Source errored — immediate shutdown is correct (no data to drain)
         if (shuttingDown) return;
         if (!preventAbort) {
+          // Check if dest errored during setup — dest error takes precedence
+          const destNowErrored = dest[kWritableState] === 'errored';
+          if (!destWasErroredAtStart && destNowErrored) {
+            shutdown(true, dest[kStoredError]);
+            return;
+          }
           shutdownWithAction(() => writer.abort(storedError), true, storedError);
         } else {
           shutdown(true, storedError);
