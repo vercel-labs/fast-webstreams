@@ -7,6 +7,7 @@ import transformCpu from './transform-cpu.js';
 import compression from './compression.js';
 import chunkAccumulation from './chunk-accumulation.js';
 import backpressure from './backpressure.js';
+import fetchBridge from './fetch-bridge.js';
 
 const scenarios = [
   passthrough,
@@ -14,6 +15,7 @@ const scenarios = [
   compression,
   chunkAccumulation,
   backpressure,
+  fetchBridge,
 ];
 
 export const scenarioMap = new Map(scenarios.map((s) => [s.name, s]));
