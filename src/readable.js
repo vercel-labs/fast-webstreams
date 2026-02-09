@@ -219,8 +219,25 @@ export class FastReadableStream {
 
     // Validate type
     if (type === 'bytes') {
-      _initNativeReadableShell(this, new NativeReadableStream(underlyingSource, strategy));
-      return;
+      // Node.js/undici stores ReadableStream state as symbol properties (kState, kType).
+      // Object.create(native) lets the shell access these via the prototype chain.
+      // We also copy our Fast methods as own properties so pipeTo/pipeThrough/tee
+      // route through our logic (which handles FastWritableStream destinations etc.).
+      const native = new NativeReadableStream(underlyingSource, strategy);
+      const shell = Object.create(native);
+      _initNativeReadableShell(shell, native);
+      // Shadow native methods with our routing methods
+      shell.getReader = FastReadableStream.prototype.getReader;
+      shell.pipeTo = FastReadableStream.prototype.pipeTo;
+      shell.pipeThrough = FastReadableStream.prototype.pipeThrough;
+      shell.tee = FastReadableStream.prototype.tee;
+      shell.cancel = FastReadableStream.prototype.cancel;
+      shell._cancelInternal = FastReadableStream.prototype._cancelInternal;
+      shell.values = FastReadableStream.prototype.values;
+      shell[Symbol.asyncIterator] = FastReadableStream.prototype[Symbol.asyncIterator];
+      const lockedDesc = Object.getOwnPropertyDescriptor(FastReadableStream.prototype, 'locked');
+      if (lockedDesc) Object.defineProperty(shell, 'locked', lockedDesc);
+      return shell;
     }
     if (type !== undefined) {
       throw new TypeError(`Invalid type: ${type}`);
