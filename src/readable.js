@@ -7,6 +7,7 @@
  */
 
 import { pipeline, Readable } from 'node:stream';
+import { pipeline as pipelineWithSignal } from 'node:stream/promises';
 import { FastReadableStreamBYOBReader } from './byob-reader.js';
 import { FastReadableStreamDefaultController } from './controller.js';
 import { materializeReadable, materializeWritable } from './materialize.js';
@@ -141,15 +142,21 @@ function collectPipelineChain(readable, destination) {
  * Tier 0 fast path: pipe Fast→Fast via Node.js pipeline().
  * Walks upstream links and builds a single pipeline() call.
  */
-function fastPipelineTo(source, dest) {
+function fastPipelineTo(source, dest, signal) {
   const chain = collectPipelineChain(source, dest);
+  const onDone = () => {
+    source._closed = true;
+    if (kWritableState in dest) {
+      dest[kWritableState] = 'closed';
+    }
+  };
+  if (signal) {
+    return pipelineWithSignal(...chain, { signal }).then(onDone);
+  }
   return new Promise((resolve, reject) => {
     pipeline(...chain, (err) => {
       if (!err) {
-        source._closed = true;
-        if (kWritableState in dest) {
-          dest[kWritableState] = 'closed';
-        }
+        onDone();
         resolve(undefined);
       } else {
         reject(err);
@@ -445,16 +452,17 @@ export class FastReadableStream {
       }
 
       // Tier 0: pipeThrough chain with upstream links → Node.js pipeline()
-      // Full pipeline only when ALL options are default + all-Fast chain.
-      const isDefaultOpts = !preventAbort && !preventCancel && !preventClose && !signal;
+      // Supports default options OR signal-only (pipeline supports AbortSignal).
+      // preventAbort/preventCancel/preventClose require spec-compliant handling.
+      const isPipelineCompatible = !preventAbort && !preventCancel && !preventClose;
       if (
-        isDefaultOpts &&
+        isPipelineCompatible &&
         this[kUpstream] &&
         isFastWritable(destination) &&
         !destination[kNativeOnly] &&
         destination[kNodeWritable]
       ) {
-        return fastPipelineTo(this, destination);
+        return fastPipelineTo(this, destination, signal);
       }
 
       // Tier 0.5: upstream chain exists but can't use full pipeline.
