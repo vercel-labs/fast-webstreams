@@ -79,16 +79,35 @@ export function specPipeTo(source, dest, options = {}) {
     );
 
     // --- Source close/error handler ---
-    // NOTE: Don't trigger shutdown on source close here. The reader.closed
-    // promise can resolve (via Node.js 'end'/'close' events) before the pump
-    // has drained all buffered data from the underlying Node.js readable.
-    // Instead, just set the flag and kick the pump. The pump will read done
-    // and trigger shutdown after draining all buffered chunks.
+    // NOTE: reader.closed can resolve (via Node.js 'end'/'close' events)
+    // before the pump loop has drained all buffered data from the Node.js
+    // readable (e.g., TransformStream flush() chunks). Check readableLength
+    // to decide: if data remains, kick the pump to drain it first; if not,
+    // shutdown immediately (preserves microtask ordering for abort signal
+    // tests and avoids deadlock when dest has HWM=0).
     reader.closed.then(
       () => {
-        // Source closed — let the pump drain remaining data and handle shutdown
         sourceClosed = true;
-        if (!shuttingDown) pipeLoop();
+        if (shuttingDown) return;
+        // Check if there's buffered data that the pump needs to drain first
+        const nodeReadable = source[kNodeReadable];
+        if (nodeReadable && nodeReadable.readableLength > 0) {
+          pipeLoop();
+          return;
+        }
+        // No buffered data — shutdown immediately
+        if (!preventClose) {
+          shutdownWithAction(() => {
+            if (destErrored) return Promise.reject(destStoredError);
+            if (destClosed) return RESOLVED_UNDEFINED;
+            return writer.close().catch((e) => {
+              if (e instanceof TypeError) return;
+              throw e;
+            });
+          });
+        } else {
+          shutdown();
+        }
       },
       (storedError) => {
         // Source errored — immediate shutdown is correct (no data to drain)
