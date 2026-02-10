@@ -358,13 +358,18 @@ When both source and destination are Fast streams, `specPipeTo` uses a **write b
 | Native (Node.js v22) | 98.5% | 1099/1116 |
 | fast-webstreams | 98.6% | 1100/1116 |
 
-The 16 remaining failures break down as follows:
+`fast-webstreams` passes 1 more test than native Node.js. Native has its own unique failures: a recursive abort assertion crash (`ERR_INTERNAL_ASSERTION`) and a synchronous write algorithm violation.
 
+The 16 remaining fast-webstreams failures break down as follows:
+
+**Shared with native (8 tests):**
+- **5 tests**: `owning` type -- Node.js does not implement the `type: 'owning'` spec extension
+- **1 test**: async iterator prototype -- cross-realm `===` identity mismatch between host and VM context `AsyncIteratorPrototype`
+- **1 test**: BYOB templated -- WPT template expects `{value: undefined}` after cancel, but BYOB spec returns `{value: Uint8Array(0)}`
+- **1 test**: byte stream bad-buffers timeout -- test infrastructure limitation with `async_test` + `pull` callbacks
+
+**Fast-only (8 tests):**
 - **8 tests**: `tee()` -- 1 error identity mismatch (non-Error objects through Node.js `destroy()`), 7 tests that monkey-patch the global `ReadableStream` constructor and expect `tee()` to use it (architectural mismatch -- our tee creates branches directly)
-- **5 tests**: `owning` type -- Node.js does not implement the `type: 'owning'` spec extension (native also fails all 5)
-- **1 test**: async iterator prototype -- cross-realm `===` identity mismatch between host and VM context `AsyncIteratorPrototype` (native also fails)
-- **1 test**: BYOB templated -- WPT template expects `{value: undefined}` after cancel, but BYOB spec returns `{value: Uint8Array(0)}` (native also fails)
-- **1 test**: byte stream bad-buffers timeout -- test infrastructure limitation with `async_test` + `pull` callbacks (native also times out on 16/24 tests in same file)
 
 ### Running WPT Tests
 
