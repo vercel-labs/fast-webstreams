@@ -32,8 +32,11 @@ describe('patch: global replacement', () => {
 
   it('replaces globalThis.ReadableStream with FastReadableStream', () => {
     patchGlobalWebStreams();
-    assert.strictEqual(globalThis.ReadableStream, FastReadableStream);
+    // Patched RS may be a wrapper around FastReadableStream for byte+pull streams
     assert.notStrictEqual(globalThis.ReadableStream, OriginalReadableStream);
+    // New instances should produce FastReadableStream-compatible objects
+    const s = new globalThis.ReadableStream();
+    assert.ok(s instanceof FastReadableStream);
   });
 
   it('replaces globalThis.WritableStream with FastWritableStream', () => {
@@ -251,6 +254,8 @@ describe('unpatch: restores native constructors', () => {
     patchGlobalWebStreams();
     unpatchGlobalWebStreams();
     patchGlobalWebStreams();
-    assert.strictEqual(globalThis.ReadableStream, FastReadableStream);
+    assert.notStrictEqual(globalThis.ReadableStream, OriginalReadableStream);
+    const s = new globalThis.ReadableStream();
+    assert.ok(s instanceof FastReadableStream);
   });
 });
