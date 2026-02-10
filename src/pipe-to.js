@@ -9,7 +9,8 @@
  * https://streams.spec.whatwg.org/#readable-stream-pipe-to
  */
 
-import { kNodeReadable, kStoredError, kWritableState, noop, RESOLVED_UNDEFINED, _stats } from './utils.js';
+import { isThenable, kLock, kNodeReadable, kStoredError, kWritableState, noop, RESOLVED_UNDEFINED, _stats } from './utils.js';
+import { kInFlightWriteRequest, kWriteRequests, kStarted, kCloseRequest, kInFlightCloseRequest, _advanceQueueIfNeeded } from './writable.js';
 
 /**
  * Wait for a write promise to settle, resolving to undefined regardless of outcome.
@@ -162,6 +163,14 @@ export function specPipeTo(source, dest, options = {}) {
     // Check if reader supports sync reads (FastReadableStreamDefaultReader)
     const hasSyncRead = typeof reader._readSync === 'function';
 
+    // Check if dest supports direct sink writes (Fast writable, not transform shell)
+    const hasBatchWrite = !!(dest._sinkWrite && !dest._isTransformShell);
+
+    // Cache sink references for batch path
+    const sinkWrite = hasBatchWrite ? dest._sinkWrite : null;
+    const sink = hasBatchWrite ? dest._underlyingSink : null;
+    const ctrl = hasBatchWrite ? dest._controller : null;
+
     // --- Pump loop ---
     pipeLoop();
 
@@ -202,8 +211,103 @@ export function specPipeTo(source, dest, options = {}) {
       // Drains all available buffered chunks in one go before yielding to the
       // microtask queue, amortizing the yield cost across multiple chunks.
       if (hasSyncRead) {
-        let didSync = false;
         let syncResult = reader._readSync();
+
+        // Batch write path: when both reader and writer are Fast, bypass writer.write()
+        // and call the sink directly. Reduces N promises to 1 per batch.
+        if (syncResult !== null && hasBatchWrite &&
+            dest[kStarted] &&
+            dest[kWritableState] === 'writable' &&
+            !dest[kInFlightWriteRequest] &&
+            dest[kWriteRequests].length === 0 &&
+            !dest[kCloseRequest]) {
+          // Set sentinel to block concurrent writes from _advanceQueueIfNeeded
+          dest[kInFlightWriteRequest] = true;
+
+          let batchCount = 0;
+          const hwm = dest._hwm;
+
+          batch_loop:
+          while (syncResult !== null) {
+            if (syncResult.done) {
+              // Clear sentinel before shutdown
+              dest[kInFlightWriteRequest] = null;
+              pumpClose();
+              return;
+            }
+
+            try {
+              const result = Reflect.apply(sinkWrite, sink, [syncResult.value, ctrl]);
+              if (isThenable(result)) {
+                // Async write — wait for it, then re-enter pipeLoop
+                batchCount++;
+                currentWrite = result.then(
+                  () => {
+                    dest[kInFlightWriteRequest] = null;
+                    const w = dest[kWritableState];
+                    if (w === 'erroring' || w === 'errored') return;
+                    const writer_ = dest[kLock];
+                    if (writer_ && w === 'writable') {
+                      writer_._updateReadyForBackpressure(dest);
+                    }
+                    _advanceQueueIfNeeded(dest);
+                    pipeLoop();
+                  },
+                  (err) => {
+                    dest[kInFlightWriteRequest] = null;
+                    // Error identity preserved — controller.error uses original error
+                    ctrl.error(err);
+                  },
+                );
+                return;
+              }
+            } catch (err) {
+              dest[kInFlightWriteRequest] = null;
+              ctrl.error(err);
+              return;
+            }
+
+            batchCount++;
+            if (shuttingDown) {
+              dest[kInFlightWriteRequest] = null;
+              return;
+            }
+
+            // Check writable state (may have changed via abort signal, etc.)
+            if (dest[kWritableState] !== 'writable') {
+              dest[kInFlightWriteRequest] = null;
+              return;
+            }
+
+            // Backpressure: stop batch after hwm chunks
+            if (batchCount >= hwm) {
+              break batch_loop;
+            }
+
+            syncResult = reader._readSync();
+          }
+
+          // End of batch (all sync). Clear sentinel and re-enter pipeLoop via microtask.
+          // The microtask deferral allows events (abort signal, errors) to fire between batches.
+          currentWrite = new Promise((resolve) => {
+            queueMicrotask(() => {
+              dest[kInFlightWriteRequest] = null;
+              if (dest[kWritableState] === 'writable') {
+                const writer_ = dest[kLock];
+                if (writer_) {
+                  writer_._updateReadyForBackpressure(dest);
+                }
+                _advanceQueueIfNeeded(dest);
+              }
+              resolve();
+              pipeLoop();
+            });
+          });
+          return;
+        }
+
+        // Non-batch sync path: use writer.write() per chunk (transform shells, etc.)
+        let didSync = false;
         while (syncResult !== null) {
           if (syncResult.done) {
             pumpClose();
