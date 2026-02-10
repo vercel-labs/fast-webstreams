@@ -13,6 +13,7 @@
  */
 
 import { FastReadableStream, FastTransformStream, FastWritableStream } from './index.js';
+import { _initNativeReadableShell } from './readable.js';
 import {
   NativeByteLengthQueuingStrategy,
   NativeCountQueuingStrategy,
@@ -37,8 +38,46 @@ const _origHasInstanceTS = Object.getOwnPropertyDescriptor(NativeTransformStream
  * streaming) hold references to the original native constructors and use
  * instanceof checks.
  */
+// Wrapper constructor for globalThis.ReadableStream.
+// Byte streams with pull (e.g. undici/fetch) depend on C++ internal slots of
+// ReadableByteStreamController. We create a native stream wrapped as a
+// kNativeOnly Fast shell so downstream consumers get the fast path.
+function _PatchedReadableStream(underlyingSource, strategy) {
+  if (
+    underlyingSource != null &&
+    (typeof underlyingSource === 'object' || typeof underlyingSource === 'function') &&
+    underlyingSource.type === 'bytes' &&
+    typeof underlyingSource.pull === 'function'
+  ) {
+    // Must return genuine native stream — undici uses C++ internal slots for body I/O.
+    // Object.create(native) gives us native internal slots + Fast prototype methods.
+    const native = new NativeReadableStream(underlyingSource, strategy);
+    const shell = Object.create(native);
+    _initNativeReadableShell(shell, native);
+    shell.getReader = function(opts) { return FastReadableStream.prototype.getReader.call(this, opts); };
+    shell.pipeTo = function(dest, opts) { return FastReadableStream.prototype.pipeTo.call(this, dest, opts); };
+    shell.pipeThrough = function(t, opts) { return FastReadableStream.prototype.pipeThrough.call(this, t, opts); };
+    shell.tee = function() { return FastReadableStream.prototype.tee.call(this); };
+    shell.cancel = function(r) { return FastReadableStream.prototype.cancel.call(this, r); };
+    shell._cancelInternal = FastReadableStream.prototype._cancelInternal;
+    shell.values = function(opts) { return FastReadableStream.prototype.values.call(this, opts); };
+    shell[Symbol.asyncIterator] = FastReadableStream.prototype[Symbol.asyncIterator];
+    const lockedDesc = Object.getOwnPropertyDescriptor(FastReadableStream.prototype, 'locked');
+    if (lockedDesc) {
+      Object.defineProperty(shell, 'locked', {
+        get() { return lockedDesc.get.call(this); },
+        configurable: true,
+      });
+    }
+    return shell;
+  }
+  return new FastReadableStream(underlyingSource, strategy);
+}
+_PatchedReadableStream.prototype = FastReadableStream.prototype;
+_PatchedReadableStream.from = FastReadableStream.from;
+
 export function patchGlobalWebStreams() {
-  globalThis.ReadableStream = FastReadableStream;
+  globalThis.ReadableStream = _PatchedReadableStream;
   globalThis.WritableStream = FastWritableStream;
   globalThis.TransformStream = FastTransformStream;
   globalThis.ByteLengthQueuingStrategy = NativeByteLengthQueuingStrategy;
@@ -47,18 +86,27 @@ export function patchGlobalWebStreams() {
   // Make Fast instances pass instanceof checks against the captured native constructors.
   Object.defineProperty(NativeReadableStream, Symbol.hasInstance, {
     value(instance) {
+      if (_origHasInstanceRS) {
+        try { if (_origHasInstanceRS.value.call(NativeReadableStream, instance)) return true; } catch {}
+      }
       return instance instanceof FastReadableStream || isFastReadable(instance);
     },
     configurable: true,
   });
   Object.defineProperty(NativeWritableStream, Symbol.hasInstance, {
     value(instance) {
+      if (_origHasInstanceWS) {
+        try { if (_origHasInstanceWS.value.call(NativeWritableStream, instance)) return true; } catch {}
+      }
       return instance instanceof FastWritableStream || isFastWritable(instance);
     },
     configurable: true,
   });
   Object.defineProperty(NativeTransformStream, Symbol.hasInstance, {
     value(instance) {
+      if (_origHasInstanceTS) {
+        try { if (_origHasInstanceTS.value.call(NativeTransformStream, instance)) return true; } catch {}
+      }
       return instance instanceof FastTransformStream || isFastTransform(instance);
     },
     configurable: true,

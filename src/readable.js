@@ -339,9 +339,12 @@ export class FastReadableStream {
         return;
       }
       if (stream._pullLock) {
-        // Auto-pull (from LiteReadable microtask) respects the lock only when
-        // there's no HWM headroom. When desiredSize > 0, auto-pull should
-        // proceed to keep the buffer filled (e.g., HWM=256 read loop).
+        // Async pull in progress (Promise): always wait for it to complete.
+        // Per spec, pull must not be called again until its promise fulfills.
+        // The .then() handler will trigger read(0) when the pull resolves.
+        if (stream._pullLock !== true) return;
+        // Sync pull lock (true): only block auto-pulls with no HWM headroom.
+        // Demand-driven reader.read() bypasses sync lock (pull already completed).
         if (useLite && nodeReadable._isAutoPull && controller.desiredSize !== null && controller.desiredSize <= 0) return;
         if (!useLite) return;
       }
@@ -349,7 +352,8 @@ export class FastReadableStream {
       if (useLite && controller.desiredSize !== null && controller.desiredSize <= 0) {
         const reader = stream[kLock];
         const hasPendingReads = reader && reader._pendingReadCount && reader._pendingReadCount() > 0;
-        if (!hasPendingReads) {
+        const hasPendingPullIntos = controller[kHasPendingPullInto] && controller[kHasPendingPullInto]();
+        if (!hasPendingReads && !hasPendingPullIntos) {
           nodeReadable._readableState.reading = false;
           return;
         }
