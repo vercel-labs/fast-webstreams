@@ -3,7 +3,7 @@
  * Bridges reader.read() to Node Readable consumption with sync fast path (Tier 1).
  */
 
-import { unwrapError } from './controller.js';
+import { unwrapError, kDequeueBytes } from './controller.js';
 import { kLock, kNodeReadable, noop } from './utils.js';
 
 // Cached done result — avoids allocating { value: undefined, done: true } + Promise per stream end
@@ -131,8 +131,12 @@ export class FastReadableStreamDefaultReader {
     // Tier 1: sync fast path — data already in buffer
     const chunk = nodeReadable.read();
     if (chunk !== null) {
+      // Track byte dequeue for byte stream desiredSize
+      if (stream._controller && stream._controller[kDequeueBytes]) stream._controller[kDequeueBytes](chunk);
       // Notify transform controller that data was consumed (may clear backpressure)
       if (stream._onPull) stream._onPull();
+      // Byte stream pull-after-read: LiteReadable auto-pull microtask handles demand.
+      // Don't sync-trigger here — it causes infinite loops with HWM>0 streams.
       return _resolveReadResult(chunk, false);
     }
 
@@ -141,7 +145,7 @@ export class FastReadableStreamDefaultReader {
       return _resolveReadResult(undefined, true);
     }
 
-    // Data not available yet — wait for 'readable', 'end', or 'close'
+    // Data not available yet — wait for data
     return new Promise((resolve, reject) => {
       // Track this pending read for releaseLock
       const entry = { reject: null, cleanup: null };
@@ -151,13 +155,55 @@ export class FastReadableStreamDefaultReader {
       // Must be called AFTER pushing to pendingReads so _pendingReadCount() is accurate
       if (stream._onPull) stream._onPull();
 
+      const removePending = () => {
+        const idx = this.#pendingReads.indexOf(entry);
+        if (idx !== -1) this.#pendingReads.splice(idx, 1);
+      };
+
+      // LiteReadable fast path: single _dataCallback instead of 4 listener registrations
+      if (nodeReadable._dataCallback !== undefined) {
+        const onData = (event, arg) => {
+          removePending();
+          if (event === 'data') {
+            const data = nodeReadable.read();
+            if (data !== null) {
+              if (stream._controller && stream._controller[kDequeueBytes]) stream._controller[kDequeueBytes](data);
+              if (stream._onPull) stream._onPull();
+              resolve({ value: data, done: false });
+            } else if (nodeReadable.readableEnded || nodeReadable.destroyed) {
+              resolve(DONE_RESULT);
+            } else {
+              // No data yet, re-register
+              this.#pendingReads.push(entry);
+              nodeReadable._dataCallback = onData;
+              return;
+            }
+          } else if (event === 'end') {
+            resolve(DONE_RESULT);
+          } else if (event === 'error') {
+            if (stream._errored) reject(stream._storedError);
+            else reject(unwrapError(arg));
+          } else if (event === 'close') {
+            if (stream._errored) reject(stream._storedError);
+            else if (nodeReadable.errored) reject(unwrapError(nodeReadable.errored));
+            else resolve(DONE_RESULT);
+          }
+        };
+        entry.reject = reject;
+        entry.cleanup = () => { if (nodeReadable._dataCallback === onData) nodeReadable._dataCallback = null; };
+        nodeReadable._dataCallback = onData;
+        if (nodeReadable._readableState.reading) nodeReadable._readableState.reading = false;
+        nodeReadable.read(0);
+        return;
+      }
+
+      // Node.js Readable path: use event listeners
       const onReadable = () => {
         cleanup();
-        // Detach from pendingReads BEFORE read() to prevent _errorReadRequests
-        // from rejecting this entry if read() triggers a pull that errors.
         removePending();
         const data = nodeReadable.read();
         if (data !== null) {
+          if (stream._controller && stream._controller[kDequeueBytes]) stream._controller[kDequeueBytes](data);
           if (stream._onPull) stream._onPull();
           resolve({ value: data, done: false });
         } else if (nodeReadable.readableEnded || nodeReadable.destroyed) {
@@ -171,40 +217,23 @@ export class FastReadableStreamDefaultReader {
           nodeReadable.once('close', onClose);
         }
       };
-      const onEnd = () => {
-        cleanup();
-        removePending();
-        resolve(DONE_RESULT);
-      };
+      const onEnd = () => { cleanup(); removePending(); resolve(DONE_RESULT); };
       const onError = (err) => {
-        cleanup();
-        removePending();
-        if (stream._errored) {
-          reject(stream._storedError);
-        } else {
-          reject(unwrapError(err));
-        }
+        cleanup(); removePending();
+        if (stream._errored) reject(stream._storedError);
+        else reject(unwrapError(err));
       };
       const onClose = () => {
-        cleanup();
-        removePending();
-        if (stream._errored) {
-          reject(stream._storedError);
-        } else if (nodeReadable.errored) {
-          reject(unwrapError(nodeReadable.errored));
-        } else {
-          resolve(DONE_RESULT);
-        }
+        cleanup(); removePending();
+        if (stream._errored) reject(stream._storedError);
+        else if (nodeReadable.errored) reject(unwrapError(nodeReadable.errored));
+        else resolve(DONE_RESULT);
       };
       const cleanup = () => {
         nodeReadable.removeListener('readable', onReadable);
         nodeReadable.removeListener('end', onEnd);
         nodeReadable.removeListener('error', onError);
         nodeReadable.removeListener('close', onClose);
-      };
-      const removePending = () => {
-        const idx = this.#pendingReads.indexOf(entry);
-        if (idx !== -1) this.#pendingReads.splice(idx, 1);
       };
 
       entry.reject = reject;
@@ -236,6 +265,7 @@ export class FastReadableStreamDefaultReader {
     if (nodeReadable.errored || nodeReadable.destroyed) return null;
     const chunk = nodeReadable.read();
     if (chunk !== null) {
+      if (stream._controller && stream._controller[kDequeueBytes]) stream._controller[kDequeueBytes](chunk);
       if (stream._onPull) stream._onPull();
       return { value: chunk, done: false };
     }

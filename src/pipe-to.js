@@ -9,7 +9,7 @@
  * https://streams.spec.whatwg.org/#readable-stream-pipe-to
  */
 
-import { kNodeReadable, kStoredError, kWritableState, noop, RESOLVED_UNDEFINED } from './utils.js';
+import { kNodeReadable, kStoredError, kWritableState, noop, RESOLVED_UNDEFINED, _stats } from './utils.js';
 
 /**
  * Wait for a write promise to settle, resolving to undefined regardless of outcome.
@@ -19,6 +19,7 @@ function _waitForWrite(writePromise) {
 }
 
 export function specPipeTo(source, dest, options = {}) {
+  _stats.tier2_specPipeTo++;
   // Options are pre-evaluated by caller (pipeTo/pipeThrough) in spec order
   const preventClose = !!options.preventClose;
   const preventAbort = !!options.preventAbort;

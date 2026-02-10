@@ -10,7 +10,7 @@ import { pipeline, Readable } from 'node:stream';
 import { pipeline as pipelineWithSignal } from 'node:stream/promises';
 import { FastReadableStreamBYOBReader } from './byob-reader.js';
 import { FastReadableStreamDefaultController } from './controller.js';
-import { materializeReadable, materializeWritable } from './materialize.js';
+import { materializeReadable, materializeReadableAsBytes, materializeWritable } from './materialize.js';
 import { NativeReadableStream, NativeWritableStream } from './natives.js';
 import { specPipeTo } from './pipe-to.js';
 import { FastReadableStreamDefaultReader } from './reader.js';
@@ -27,8 +27,10 @@ import {
   kSkipDestroy,
   kUpstream,
   kWritableState,
+  LiteReadable,
   noop,
   RESOLVED_UNDEFINED,
+  _stats,
 } from './utils.js';
 
 // ReadableStreamAsyncIteratorPrototype — shared by all async iterators
@@ -143,6 +145,7 @@ function collectPipelineChain(readable, destination) {
  * Walks upstream links and builds a single pipeline() call.
  */
 function fastPipelineTo(source, dest, signal) {
+  _stats.tier0_pipeline++;
   const chain = collectPipelineChain(source, dest);
   const onDone = () => {
     source._closed = true;
@@ -170,6 +173,7 @@ function fastPipelineTo(source, dest, signal) {
  * Initialize a native-only readable shell (delegates everything to native ReadableStream).
  */
 export function _initNativeReadableShell(target, nativeStream) {
+  _stats.nativeOnlyReadable++;
   // Property order must match FastReadableStream constructor for monomorphic hidden class
   target[kNodeReadable] = null;
   target[kLock] = null;
@@ -181,6 +185,11 @@ export function _initNativeReadableShell(target, nativeStream) {
   target._cancel = null;
   target._storedError = undefined;
   target._onPull = null;
+  target._isByteStream = false;
+  target._controller = null;
+  target._byteSource = null;
+  target._pullLock = null;
+  target._pullFn = null;
   return target;
 }
 
@@ -191,6 +200,7 @@ export function _initNativeReadableShell(target, nativeStream) {
  * downstream Fast transforms to use Node.js pipeline (zero promises per chunk).
  */
 function _bridgeNativeToFast(nativeOnlyStream) {
+  _stats.bridge++;
   const nativeStream = materializeReadable(nativeOnlyStream);
   const nativeReader = nativeStream.getReader();
   return new FastReadableStream({
@@ -248,27 +258,37 @@ export class FastReadableStream {
 
     // Validate type
     if (type === 'bytes') {
-      // Node.js/undici stores ReadableStream state as symbol properties (kState, kType).
-      // Object.create(native) lets the shell access these via the prototype chain.
-      // We also copy our Fast methods as own properties so pipeTo/pipeThrough/tee
-      // route through our logic (which handles FastWritableStream destinations etc.).
-      const native = new NativeReadableStream(underlyingSource, strategy);
-      const shell = Object.create(native);
-      _initNativeReadableShell(shell, native);
-      // Shadow native methods with our routing methods
-      shell.getReader = FastReadableStream.prototype.getReader;
-      shell.pipeTo = FastReadableStream.prototype.pipeTo;
-      shell.pipeThrough = FastReadableStream.prototype.pipeThrough;
-      shell.tee = FastReadableStream.prototype.tee;
-      shell.cancel = FastReadableStream.prototype.cancel;
-      shell._cancelInternal = FastReadableStream.prototype._cancelInternal;
-      shell.values = FastReadableStream.prototype.values;
-      shell[Symbol.asyncIterator] = FastReadableStream.prototype[Symbol.asyncIterator];
-      const lockedDesc = Object.getOwnPropertyDescriptor(FastReadableStream.prototype, 'locked');
-      if (lockedDesc) Object.defineProperty(shell, 'locked', lockedDesc);
-      return shell;
+      // Delegate to native only when the pull callback needs a real
+      // ReadableByteStreamController (byobRequest/respond/respondWithNewView),
+      // or when autoAllocateChunkSize or custom size() is used.
+      // Byte streams with start/cancel only use enqueue/close/error on the
+      // controller, which our FastReadableStreamDefaultController supports.
+      // BYOB/tee fallback uses dual-write materialization (see materialize.js).
+      if (typeof strategySize === 'function' || underlyingSource.autoAllocateChunkSize !== undefined) {
+        const native = new NativeReadableStream(underlyingSource, strategy);
+        const shell = Object.create(native);
+        _initNativeReadableShell(shell, native);
+        shell.getReader = function(opts) { return FastReadableStream.prototype.getReader.call(this, opts); };
+        shell.pipeTo = function(dest, opts) { return FastReadableStream.prototype.pipeTo.call(this, dest, opts); };
+        shell.pipeThrough = function(t, opts) { return FastReadableStream.prototype.pipeThrough.call(this, t, opts); };
+        shell.tee = function() { return FastReadableStream.prototype.tee.call(this); };
+        shell.cancel = function(r) { return FastReadableStream.prototype.cancel.call(this, r); };
+        shell._cancelInternal = FastReadableStream.prototype._cancelInternal;
+        shell.values = function(opts) { return FastReadableStream.prototype.values.call(this, opts); };
+        shell[Symbol.asyncIterator] = FastReadableStream.prototype[Symbol.asyncIterator];
+        const lockedDesc = Object.getOwnPropertyDescriptor(FastReadableStream.prototype, 'locked');
+        if (lockedDesc) {
+          Object.defineProperty(shell, 'locked', {
+            get() { return lockedDesc.get.call(this); },
+            configurable: true,
+          });
+        }
+        return shell;
+      }
+      // Otherwise: use fast Node.js path, mark as byte-capable
+      // Fall through to normal constructor below
     }
-    if (type !== undefined) {
+    if (type !== undefined && type !== 'bytes') {
       throw new TypeError(`Invalid type: ${type}`);
     }
 
@@ -290,6 +310,8 @@ export class FastReadableStream {
     }
 
     // Validate and resolve strategy highWaterMark
+    // Byte streams default to 0 per spec (unlike default-type which defaults to 1)
+    const defaultHWM = type === 'bytes' ? 0 : 1;
     const hwm =
       strategyHWM !== undefined
         ? (() => {
@@ -297,56 +319,84 @@ export class FastReadableStream {
             if (Number.isNaN(h) || h < 0) throw new RangeError('Invalid highWaterMark');
             return h;
           })()
-        : 1;
+        : defaultHWM;
 
     let controller;
-    let pullCallback = null;
     let startCompleted = false;
 
-    const nodeReadable = new Readable({
-      objectMode: true,
-      highWaterMark: hwm === Infinity ? 0x7fffffff : hwm,
-      read() {
-        // Per spec: pull must not be called until start completes
-        if (!startCompleted) {
-          // Reset Node's internal reading flag so read(0) works later
+    // Byte streams use LiteReadable (lightweight array buffer, ~5µs faster construction).
+    // Default-type streams use Node.js Readable (needed for pipeline/pipe compatibility).
+    const useLite = type === 'bytes';
+
+    // _pullLock is shared between Node _read and native byte stream pull
+    // (from materializeReadableAsBytes). Prevents double-calling user's pull.
+    // Exposed on the stream so materializeReadableAsBytes can coordinate.
+    const stream = this;
+
+    const pullFn = pull ? () => {
+      if (!startCompleted) {
+        nodeReadable._readableState.reading = false;
+        return;
+      }
+      if (stream._pullLock) return;
+      // Byte streams: only pull when there's demand (desiredSize > 0 or pending reads)
+      if (useLite && controller.desiredSize !== null && controller.desiredSize <= 0) {
+        const reader = stream[kLock];
+        const hasPendingReads = reader && reader._pendingReadCount && reader._pendingReadCount() > 0;
+        if (!hasPendingReads) {
           nodeReadable._readableState.reading = false;
           return;
         }
-        if (pull) {
-          if (pullCallback) return;
-
-          try {
-            const result = pull.call(underlyingSource, controller);
-            if (isThenable(result)) {
-              pullCallback = result;
-              result.then(
-                () => {
-                  pullCallback = null;
-                  // Reset reading flag so read(0) re-triggers _read()
-                  nodeReadable._readableState.reading = false;
-                  if (!nodeReadable.destroyed) nodeReadable.read(0);
-                },
-                (err) => {
-                  pullCallback = null;
-                  if (!nodeReadable.destroyed) controller.error(err);
-                },
-              );
-            }
-            // For sync pull: don't touch reading flag.
-            // Node's internal maybeReadMore handles re-triggering after push.
-          } catch (e) {
-            if (!nodeReadable.destroyed) controller.error(e);
-          }
+      }
+      try {
+        const result = pull.call(underlyingSource, controller);
+        if (isThenable(result)) {
+          stream._pullLock = result;
+          result.then(
+            () => {
+              stream._pullLock = null;
+              nodeReadable._readableState.reading = false;
+              if (!nodeReadable.destroyed) nodeReadable.read(0);
+            },
+            (err) => {
+              stream._pullLock = null;
+              if (!nodeReadable.destroyed) controller.error(err);
+            },
+          );
         }
-      },
-    });
+        // Note: no sync pull lock — LiteReadable's _autoPullPending guard
+        // prevents infinite auto-pull loops.
+      } catch (e) {
+        if (!nodeReadable.destroyed) controller.error(e);
+      }
+    } : null;
 
-    // Prevent unhandled 'error' events from crashing
-    nodeReadable.on('error', noop);
+    const nodeReadable = useLite
+      ? new LiteReadable(hwm === Infinity ? 0x7fffffff : hwm)
+      : new Readable({
+          objectMode: true,
+          highWaterMark: hwm === Infinity ? 0x7fffffff : hwm,
+          read() { if (pullFn) pullFn(); },
+        });
+
+    if (useLite) {
+      if (pullFn) nodeReadable._onRead = pullFn;
+    } else {
+      nodeReadable.on('error', noop);
+    }
 
     controller = new FastReadableStreamDefaultController(nodeReadable, hwm);
     controller._stream = this;
+    // Byte streams: add byobRequest as own property (not on prototype — that's
+    // ReadableStreamDefaultController which doesn't have byobRequest per spec).
+    // Returns null until materializeReadableAsBytes overrides it with a proxy.
+    if (type === 'bytes') {
+      Object.defineProperty(controller, 'byobRequest', {
+        get() { return null; },
+        configurable: true,
+      });
+    }
+    this._controller = controller;
 
     this[kNodeReadable] = nodeReadable;
     this[kLock] = null;
@@ -358,6 +408,15 @@ export class FastReadableStream {
     this._cancel = cancel;
     this._storedError = undefined;
     this._onPull = null;
+    this._isByteStream = type === 'bytes';
+    this._byteSource = type === 'bytes' ? underlyingSource : null;
+    this._pullLock = null;
+    this._pullFn = pullFn;
+    _stats.readableCreated++;
+
+    // For byte streams (hwm=0), pull is demand-driven — triggered by pending reads,
+    // not by HWM headroom. Always try read(0) so pull fires if a read is waiting.
+    const shouldAutoPull = hwm > 0 || type === 'bytes';
 
     if (start) {
       const startResult = start.call(underlyingSource, controller);
@@ -365,7 +424,7 @@ export class FastReadableStream {
         startResult.then(
           () => {
             startCompleted = true;
-            if (pull && !nodeReadable.destroyed && hwm > 0) {
+            if (pull && !nodeReadable.destroyed && shouldAutoPull) {
               nodeReadable.read(0);
             }
           },
@@ -377,7 +436,7 @@ export class FastReadableStream {
         // Sync start — per spec, start "completes" via microtask
         queueMicrotask(() => {
           startCompleted = true;
-          if (pull && !nodeReadable.destroyed && hwm > 0) {
+          if (pull && !nodeReadable.destroyed && shouldAutoPull) {
             nodeReadable.read(0);
           }
         });
@@ -386,7 +445,7 @@ export class FastReadableStream {
       // No start — per spec, start completes via resolved promise's .then()
       queueMicrotask(() => {
         startCompleted = true;
-        if (pull && !nodeReadable.destroyed && hwm > 0) {
+        if (pull && !nodeReadable.destroyed && shouldAutoPull) {
           nodeReadable.read(0);
         }
       });
@@ -454,6 +513,8 @@ export class FastReadableStream {
       // Tier 0: pipeThrough chain with upstream links → Node.js pipeline()
       // Supports default options OR signal-only (pipeline supports AbortSignal).
       // preventAbort/preventCancel/preventClose require spec-compliant handling.
+      // Byte streams using LiteReadable can't use pipeline (LiteReadable lacks
+      // full Node.js Readable API — no pipe(), no flowing mode, no 'data' event).
       const isPipelineCompatible = !preventAbort && !preventCancel && !preventClose;
       if (
         isPipelineCompatible &&
@@ -462,7 +523,16 @@ export class FastReadableStream {
         !destination[kNativeOnly] &&
         destination[kNodeWritable]
       ) {
-        return fastPipelineTo(this, destination, signal);
+        // Check that no upstream source uses LiteReadable (byte stream fast path)
+        let hasByteSource = false;
+        let cur = this;
+        while (cur) {
+          if (cur._isByteStream) { hasByteSource = true; break; }
+          cur = cur[kUpstream];
+        }
+        if (!hasByteSource) {
+          return fastPipelineTo(this, destination, signal);
+        }
       }
 
       // Tier 0.5: upstream chain exists but can't use full pipeline.
@@ -612,9 +682,38 @@ export class FastReadableStream {
     }
     const mode = options ? (options.mode === undefined ? undefined : String(options.mode)) : undefined;
     if (mode === 'byob') {
+      if (this._isByteStream && !this[kNativeOnly]) {
+        // Fast byte stream: check lock before creating BYOB reader
+        if (this[kLock]) {
+          throw new TypeError('ReadableStream is locked');
+        }
+      }
       // Tier 2: BYOB requires native byte stream support
-      // Use FastReadableStreamBYOBReader so constructor checks work with FastReadableStream
-      return new FastReadableStreamBYOBReader(this);
+      const byobReader = new FastReadableStreamBYOBReader(this);
+      if (this._isByteStream && !this[kNativeOnly]) {
+        // Track lock on the fast stream so .locked returns true
+        const fastStream = this;
+        const origReleaseLock = byobReader.releaseLock.bind(byobReader);
+        fastStream[kLock] = byobReader;
+        byobReader.releaseLock = function() {
+          fastStream[kLock] = null;
+          // Re-enable Node readable's pull (disabled during materialization)
+          if (fastStream._pullFn) {
+            const nr = fastStream[kNodeReadable];
+            if (nr && nr._onRead !== undefined) {
+              nr._onRead = fastStream._pullFn; // LiteReadable
+            } else if (nr && nr._read) {
+              nr._read = fastStream._pullFn; // Node Readable
+            }
+            // Kickstart demand — next getReader().read() will trigger pull
+            if (nr && !nr.destroyed) {
+              nr._readableState.reading = false;
+            }
+          }
+          origReleaseLock();
+        };
+      }
+      return byobReader;
     }
     if (mode !== undefined) {
       throw new TypeError(`Invalid mode: ${mode}`);
@@ -629,20 +728,23 @@ export class FastReadableStream {
     // (same logic as pipeTo Tier 0.5, needed when getReader() is called
     // on the result of pipeThrough instead of pipeTo)
     if (this[kUpstream]) {
+      _stats.tier05_upstream++;
       const hops = [];
       let current = this;
       while (current[kUpstream]) {
         hops.push({ source: current[kUpstream], writable: current._upstreamWritable });
-        current = current[kUpstream];
+        const next = current[kUpstream];
+        current[kUpstream] = null; // Clear ALL upstream links to prevent double-locking
+        current = next;
       }
       for (const hop of hops) {
         if (hop.source && hop.writable) {
           specPipeTo(hop.source, hop.writable, {}).catch(noop);
         }
       }
-      this[kUpstream] = null;
     }
 
+    _stats.tier1_getReader++;
     return new FastReadableStreamDefaultReader(this);
   }
 
@@ -655,9 +757,13 @@ export class FastReadableStream {
       throw new TypeError('ReadableStream is locked');
     }
 
-    // For native-only streams, delegate
-    if (this[kNativeOnly]) {
-      const [b1, b2] = materializeReadable(this).tee();
+    // For native-only or byte streams, delegate to native tee
+    // (byte streams need native tee to produce byte-type branches)
+    if (this[kNativeOnly] || this._isByteStream) {
+      const nativeStream = this[kNativeOnly]
+        ? materializeReadable(this)
+        : materializeReadableAsBytes(this);
+      const [b1, b2] = nativeStream.tee();
       return [
         _initNativeReadableShell(Object.create(FastReadableStream.prototype), b1),
         _initNativeReadableShell(Object.create(FastReadableStream.prototype), b2),

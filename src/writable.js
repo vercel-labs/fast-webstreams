@@ -25,6 +25,7 @@ import {
   kWritableState,
   noop,
   RESOLVED_UNDEFINED,
+  _stats,
 } from './utils.js';
 import { FastWritableStreamDefaultWriter } from './writer.js';
 
@@ -91,6 +92,7 @@ export class FastWritableStream {
     }
 
     // --- State machine ---
+    _stats.writableCreated++;
     this[kWritableState] = 'writable';
     this[kStoredError] = undefined;
     this[kPendingAbortRequest] = null;
@@ -936,6 +938,7 @@ export function _closeFromWriter(stream) {
  * Initialize a native-only writable shell (delegates everything to native WritableStream).
  */
 export function _initNativeWritableShell(target, nativeStream) {
+  _stats.nativeOnlyWritable++;
   target[kNodeWritable] = null;
   target[kLock] = null;
   target[kMaterialized] = nativeStream;

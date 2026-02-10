@@ -16,6 +16,8 @@
     "bench": "node --expose-gc bench/run.js",
     "bench:quick": "node --expose-gc bench/run.js --iterations=3 --warmup=1",
     "bench:passthrough": "node --expose-gc bench/run.js --scenario=passthrough",
+    "bench:next": "npm run --prefix vendor/cf-vs-vercel-bench/next-bench/vercel-edition bench",
+    "bench:next:quick": "npm run --prefix vendor/cf-vs-vercel-bench/next-bench/vercel-edition bench:quick",
     "test": "node --test test/*.test.js && node test/run-wpt.js --mode=fast",
     "test:unit": "node --test test/*.test.js",
     "test:wpt": "node test/run-wpt.js --mode=fast",

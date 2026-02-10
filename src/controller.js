@@ -7,6 +7,9 @@ import { kLock } from './utils.js';
 // Sentinel for wrapping falsy error values that Node.js would lose
 const kWrappedError = Symbol('kWrappedError');
 
+// Symbol for byte queue dequeue method (avoids polluting getOwnPropertyNames)
+export const kDequeueBytes = Symbol('kDequeueBytes');
+
 // Shared unwrap helper — used by reader.js, writable.js
 export function unwrapError(err) {
   if (err && typeof err === 'object' && kWrappedError in err) {
@@ -41,6 +44,7 @@ export class FastReadableStreamDefaultController {
   #closed = false;
   #errored = false;
   #originalHWM;
+  #byteQueueSize = 0;
   _stream = null; // Set by the stream constructor
 
   constructor(nodeReadable, originalHWM) {
@@ -55,7 +59,43 @@ export class FastReadableStreamDefaultController {
     if (this.#closed || (this._stream && this._stream._closed)) {
       throw new TypeError('Cannot enqueue to a closed stream');
     }
+    // Byte streams: validate and convert per spec
+    if (this._stream && this._stream._isByteStream) {
+      if (ArrayBuffer.isView(chunk)) {
+        // Check for detached buffer
+        if (chunk.buffer.detached) {
+          throw new TypeError('Cannot enqueue a chunk with a detached buffer');
+        }
+        // Check for zero-length chunk
+        if (chunk.byteLength === 0) {
+          throw new TypeError('Cannot enqueue a zero-length chunk');
+        }
+        if (!(chunk instanceof Uint8Array)) {
+          chunk = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+        }
+      } else if (chunk instanceof ArrayBuffer) {
+        if (chunk.detached) {
+          throw new TypeError('Cannot enqueue a chunk with a detached buffer');
+        }
+        if (chunk.byteLength === 0) {
+          throw new TypeError('Cannot enqueue a zero-length chunk');
+        }
+      }
+    }
+    // Track byte queue size for byte stream desiredSize
+    if (this._stream && this._stream._isByteStream && chunk != null) {
+      this.#byteQueueSize += chunk.byteLength || 0;
+    }
     this.#nodeReadable.push(chunk);
+  }
+
+  // Called by reader when consuming a chunk (decrements byte queue tracking)
+  // Keyed by Symbol to avoid appearing in getOwnPropertyNames (WPT checks prototype shape)
+  [kDequeueBytes](chunk) {
+    if (chunk != null) {
+      this.#byteQueueSize -= chunk.byteLength || 0;
+      if (this.#byteQueueSize < 0) this.#byteQueueSize = 0;
+    }
   }
 
   close() {
@@ -117,6 +157,10 @@ export class FastReadableStreamDefaultController {
     const r = this.#nodeReadable;
     if (this.#originalHWM === Infinity) {
       return Infinity;
+    }
+    // Byte streams: use byte queue size instead of item count
+    if (this._stream && this._stream._isByteStream) {
+      return this.#originalHWM - this.#byteQueueSize;
     }
     // Account for pending reads: in WHATWG spec, pending reads consume enqueued
     // chunks directly (no queuing). Our Node readable buffers chunks first,

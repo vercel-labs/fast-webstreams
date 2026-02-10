@@ -23,6 +23,7 @@ import {
   kWritableState,
   noop,
   resolveHWM,
+  _stats,
 } from './utils.js';
 import {
   _advanceQueueIfNeeded,
@@ -97,6 +98,7 @@ export class FastTransformStream {
       (writableStrategy && typeof writableStrategy.size === 'function') ||
       (readableStrategy && typeof readableStrategy.size === 'function')
     ) {
+      _stats.nativeOnlyTransform++;
       const native = new NativeTransformStream(transformer, writableStrategy, readableStrategy);
       this[kNodeTransform] = null;
       this.#readable = _initNativeReadableShell(Object.create(FastReadableStream.prototype), native.readable);
@@ -196,6 +198,7 @@ export class FastTransformStream {
     controller = new FastTransformStreamDefaultController(nodeTransform);
     controller._setTransformStream(this);
 
+    _stats.transformCreated++;
     this[kNodeTransform] = nodeTransform;
 
     this._transformerCancel = cancel || null;
