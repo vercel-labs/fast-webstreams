@@ -66,6 +66,10 @@ export class FastReadableStreamDefaultController {
         if (chunk.buffer.detached) {
           throw new TypeError('Cannot enqueue a chunk with a detached buffer');
         }
+        // Check for SharedArrayBuffer (non-transferable)
+        if (chunk.buffer instanceof SharedArrayBuffer) {
+          throw new TypeError('Cannot enqueue a chunk backed by a SharedArrayBuffer');
+        }
         // Check for zero-length chunk
         if (chunk.byteLength === 0) {
           throw new TypeError('Cannot enqueue a zero-length chunk');

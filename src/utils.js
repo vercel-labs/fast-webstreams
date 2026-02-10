@@ -54,7 +54,9 @@ export class LiteReadable {
     this._readableState = { reading: false, ended: false };
     this._onRead = null; // _read callback (pull)
     this._autoPullPending = false;
+    this._isAutoPull = false;
     this._dataCallback = null; // Direct callback for reader fast path (bypasses listeners)
+    this._readQueue = null; // FIFO queue for multiple concurrent reads
   }
 
   get readableHighWaterMark() { return this._hwm; }
@@ -110,7 +112,9 @@ export class LiteReadable {
           this._autoPullPending = false;
           if (!this._destroyed && !this._readableState.reading && this._onRead &&
               this._buffer.length === 0) {
+            this._isAutoPull = true;
             this.read(0);
+            this._isAutoPull = false;
           }
         });
       }

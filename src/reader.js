@@ -15,6 +15,64 @@ function _resolveReadResult(value, done) {
   return Promise.resolve({ value, done: false });
 }
 
+/**
+ * Create a shared LiteReadable dispatcher for FIFO read queue.
+ * Dispatches push events to the oldest waiting read in the queue.
+ */
+function _createLiteDispatcher(nodeReadable) {
+  const dispatch = (event, arg) => {
+    const queue = nodeReadable._readQueue;
+    if (!queue || queue.length === 0) return;
+
+    if (event === 'data') {
+      // Dispatch to oldest waiting read (FIFO)
+      const entry = queue[0];
+      const data = nodeReadable.read();
+      if (data !== null) {
+        queue.shift();
+        entry.removePending();
+        const stream = entry.stream;
+        if (stream._controller && stream._controller[kDequeueBytes]) stream._controller[kDequeueBytes](data);
+        if (stream._onPull) stream._onPull();
+        entry.resolve({ value: data, done: false });
+        // If more data available and more reads waiting, dispatch again
+        if (queue.length > 0 && nodeReadable.readableLength > 0) {
+          dispatch('data');
+        } else if (queue.length > 0) {
+          // Re-register for next push
+          nodeReadable._dataCallback = dispatch;
+        }
+      } else if (nodeReadable.readableEnded || nodeReadable.destroyed) {
+        queue.shift();
+        entry.removePending();
+        entry.resolve(DONE_RESULT);
+      } else {
+        // No data yet — re-register for next push
+        nodeReadable._dataCallback = dispatch;
+      }
+    } else {
+      // end/error/close — dispatch to ALL waiting reads
+      const entries = queue.splice(0);
+      for (const entry of entries) {
+        entry.removePending();
+        if (event === 'end') {
+          entry.resolve(DONE_RESULT);
+        } else if (event === 'error') {
+          const stream = entry.stream;
+          if (stream._errored) entry.reject(stream._storedError);
+          else entry.reject(unwrapError(arg));
+        } else if (event === 'close') {
+          const stream = entry.stream;
+          if (stream._errored) entry.reject(stream._storedError);
+          else if (nodeReadable.errored) entry.reject(unwrapError(nodeReadable.errored));
+          else entry.resolve(DONE_RESULT);
+        }
+      }
+    }
+  };
+  return dispatch;
+}
+
 export class FastReadableStreamDefaultReader {
   #stream;
   #nodeReadable;
@@ -135,8 +193,15 @@ export class FastReadableStreamDefaultReader {
       if (stream._controller && stream._controller[kDequeueBytes]) stream._controller[kDequeueBytes](chunk);
       // Notify transform controller that data was consumed (may clear backpressure)
       if (stream._onPull) stream._onPull();
-      // Byte stream pull-after-read: LiteReadable auto-pull microtask handles demand.
-      // Don't sync-trigger here — it causes infinite loops with HWM>0 streams.
+      // Byte stream sync pull-after-read: trigger pull when desiredSize crosses from ≤0 to >0.
+      // This fires exactly once — pull refills, making desiredSize ≤0 again (no recursion).
+      if (stream._isByteStream && stream._pullFn && !nodeReadable.destroyed && stream._controller) {
+        const ds = stream._controller.desiredSize;
+        if (ds !== null && ds > 0 && ds - (chunk.byteLength || 0) <= 0) {
+          nodeReadable._readableState.reading = false;
+          nodeReadable.read(0);
+        }
+      }
       return _resolveReadResult(chunk, false);
     }
 
@@ -160,38 +225,21 @@ export class FastReadableStreamDefaultReader {
         if (idx !== -1) this.#pendingReads.splice(idx, 1);
       };
 
-      // LiteReadable fast path: single _dataCallback instead of 4 listener registrations
+      // LiteReadable fast path: FIFO callback queue instead of 4 listener registrations.
+      // Multiple concurrent reads are queued; each push dispatches to the oldest waiting read.
       if (nodeReadable._dataCallback !== undefined) {
-        const onData = (event, arg) => {
-          removePending();
-          if (event === 'data') {
-            const data = nodeReadable.read();
-            if (data !== null) {
-              if (stream._controller && stream._controller[kDequeueBytes]) stream._controller[kDequeueBytes](data);
-              if (stream._onPull) stream._onPull();
-              resolve({ value: data, done: false });
-            } else if (nodeReadable.readableEnded || nodeReadable.destroyed) {
-              resolve(DONE_RESULT);
-            } else {
-              // No data yet, re-register
-              this.#pendingReads.push(entry);
-              nodeReadable._dataCallback = onData;
-              return;
-            }
-          } else if (event === 'end') {
-            resolve(DONE_RESULT);
-          } else if (event === 'error') {
-            if (stream._errored) reject(stream._storedError);
-            else reject(unwrapError(arg));
-          } else if (event === 'close') {
-            if (stream._errored) reject(stream._storedError);
-            else if (nodeReadable.errored) reject(unwrapError(nodeReadable.errored));
-            else resolve(DONE_RESULT);
-          }
-        };
+        const readQueue = nodeReadable._readQueue || (nodeReadable._readQueue = []);
+        const queueEntry = { resolve, reject, entry, stream, removePending };
+        readQueue.push(queueEntry);
         entry.reject = reject;
-        entry.cleanup = () => { if (nodeReadable._dataCallback === onData) nodeReadable._dataCallback = null; };
-        nodeReadable._dataCallback = onData;
+        entry.cleanup = () => {
+          const idx = readQueue.indexOf(queueEntry);
+          if (idx !== -1) readQueue.splice(idx, 1);
+        };
+        // Install shared dispatcher if not already installed
+        if (!nodeReadable._dataCallback) {
+          nodeReadable._dataCallback = _createLiteDispatcher(nodeReadable);
+        }
         if (nodeReadable._readableState.reading) nodeReadable._readableState.reading = false;
         nodeReadable.read(0);
         return;
