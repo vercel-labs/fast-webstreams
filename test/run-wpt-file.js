@@ -88,7 +88,7 @@ async function run() {
     try {
       if (t.type === 'sync') {
         const testObj = {
-          step(fn) { fn(); },
+          step(fn) { return fn(); },
           step_func(fn) { return fn; },
           step_func_done(fn) { return fn || (() => {}); },
           unreached_func(msg) { return () => { throw new Error(`unreached: ${msg}`); }; },
@@ -100,7 +100,7 @@ async function run() {
       } else if (t.type === 'promise') {
         const cleanups = [];
         const testObj = {
-          step(fn) { fn(); },
+          step(fn) { return fn(); },
           step_func(fn) { return fn; },
           step_func_done(fn) { return fn || (() => {}); },
           unreached_func(msg) { return () => { throw new Error(`unreached: ${msg}`); }; },

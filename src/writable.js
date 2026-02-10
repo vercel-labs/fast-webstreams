@@ -286,7 +286,7 @@ export function _abortInternal(stream, reason) {
     return materializeWritable(stream).abort(reason);
   }
 
-  const state = stream[kWritableState];
+  let state = stream[kWritableState];
 
   // If already closed or errored, no-op
   if (state === 'closed' || state === 'errored') {
@@ -296,6 +296,14 @@ export function _abortInternal(stream, reason) {
   // Abort the controller's signal synchronously (spec requirement)
   if (stream._controller && stream._controller._abortSignal) {
     stream._controller._abortSignal(reason);
+  }
+
+  // Re-read state: the signal handler may have triggered a recursive abort
+  // that ran to completion (e.g., errored the stream). Using the stale local
+  // `state` would create an orphaned kPendingAbortRequest that never settles.
+  state = stream[kWritableState];
+  if (state === 'closed' || state === 'errored') {
+    return RESOLVED_UNDEFINED;
   }
 
   // If already erroring, store abort without calling sink.abort()

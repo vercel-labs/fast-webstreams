@@ -79,7 +79,9 @@ export function createHarnessGlobals(streamGlobals) {
       fn();
     } catch (e) {
       threw = true;
-      if (!(e instanceof Type)) {
+      // Use constructor.name instead of instanceof to handle cross-realm errors
+      // (V8 creates separate built-in error constructors per VM context)
+      if (e?.constructor?.name !== Type.name) {
         throw new Error(`assert_throws_js: expected ${Type.name} but got ${e?.constructor?.name}: ${e?.message}${formatMsg(msg)}`);
       }
     }
@@ -163,7 +165,8 @@ export function createHarnessGlobals(streamGlobals) {
       throw new Error(`promise_rejects_js: promise did not reject${formatMsg(msg)}`);
     } catch (e) {
       if (e instanceof Error && e.message.startsWith('promise_rejects_js:')) throw e;
-      if (!(e instanceof Type)) {
+      // Use constructor.name instead of instanceof to handle cross-realm errors
+      if (e?.constructor?.name !== Type.name) {
         throw new Error(`promise_rejects_js: expected ${Type.name} but got ${e?.constructor?.name}: ${e?.message}${formatMsg(msg)}`);
       }
     }

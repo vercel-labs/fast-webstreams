@@ -172,6 +172,19 @@ export function specPipeTo(source, dest, options = {}) {
     const sink = hasBatchWrite ? dest._underlyingSink : null;
     const ctrl = hasBatchWrite ? dest._controller : null;
 
+    // Synchronous pre-check: if source is already errored, transition dest to
+    // "erroring" immediately. This must happen BEFORE the dest constructor's
+    // start-completion microtask fires, so that _advanceQueueIfNeeded sees
+    // "erroring" (calls _finishErroring → sink.abort) instead of processing
+    // a pending close request (which would call sink.close instead of sink.abort).
+    // The reader.closed rejection handler will fire later and handle shutdown.
+    if (source._errored && !preventAbort) {
+      const destState = dest[kWritableState];
+      if (destState !== 'closed' && destState !== 'errored') {
+        dest._abortInternal(source._storedError);
+      }
+    }
+
     // --- Pump loop ---
     pipeLoop();
 
