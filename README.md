@@ -356,13 +356,12 @@ When both source and destination are Fast streams, `specPipeTo` uses a **write b
 | Implementation | Pass Rate | Tests |
 |---|---|---|
 | Native (Node.js v22) | 98.5% | 1099/1116 |
-| fast-webstreams | 98.4% | 1098/1116 |
+| fast-webstreams | 98.5% | 1099/1116 |
 
-The 18 remaining failures break down as follows:
+The 17 remaining failures break down as follows:
 
 - **8 tests**: `tee()` -- 1 error identity mismatch (non-Error objects through Node.js `destroy()`), 7 tests that monkey-patch the global `ReadableStream` constructor and expect `tee()` to use it (architectural mismatch -- our tee creates branches directly)
 - **5 tests**: `owning` type -- Node.js does not implement the `type: 'owning'` spec extension (native also fails all 5)
-- **1 test**: `then`-interception on tee -- `Promise.resolve(obj)` always triggers a thenable check on `obj` in pure JavaScript (native uses C++ and bypasses this)
 - **1 test**: async iterator prototype -- cross-realm `===` identity mismatch between host and VM context `AsyncIteratorPrototype` (native also fails)
 - **1 test**: BYOB templated -- WPT template expects `{value: undefined}` after cancel, but BYOB spec returns `{value: Uint8Array(0)}` (native also fails)
 - **1 test**: non-transferable buffers -- `enqueue()` does not call `TransferArrayBuffer` (adding it breaks fetch/undici which keeps buffer references after enqueue)

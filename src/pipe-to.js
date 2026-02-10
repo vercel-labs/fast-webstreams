@@ -375,16 +375,19 @@ export function specPipeTo(source, dest, options = {}) {
         // No sync data available at all — fall through to async read below.
       }
 
-      // Async fallback: wait for data via 'readable' event
-      reader.read().then(({ value, done }) => {
-        if (shuttingDown) return;
-        if (done) {
-          pumpClose();
-          return;
-        }
-        currentWrite = writer.write(value);
-        pipeLoop();
-      }, noop);
+      // Async fallback: use _readWithCallbacks to avoid {value,done} objects
+      // in promise resolution (avoids thenable interception on Object.prototype.then)
+      reader._readWithCallbacks(
+        (value) => {
+          if (shuttingDown) return;
+          currentWrite = writer.write(value);
+          pipeLoop();
+        },
+        () => {
+          if (!shuttingDown) pumpClose();
+        },
+        noop,
+      );
     }
 
     // --- Shutdown with action (spec: shutdownWithAction) ---

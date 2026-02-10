@@ -4,7 +4,7 @@
  */
 
 import { unwrapError, kDequeueBytes } from './controller.js';
-import { kLock, kNodeReadable, noop } from './utils.js';
+import { kLock, kNodeReadable, noop, RESOLVED_UNDEFINED } from './utils.js';
 
 // Cached done result — avoids allocating { value: undefined, done: true } + Promise per stream end
 const DONE_RESULT = { value: undefined, done: true };
@@ -37,7 +37,13 @@ function _createLiteDispatcher(nodeReadable) {
         const stream = entry.stream;
         if (stream._controller && stream._controller[kDequeueBytes]) stream._controller[kDequeueBytes](data);
         if (stream._onPull) stream._onPull();
-        entry.resolve({ value: data, done: false });
+        // Callback-based entry: dispatch via onChunk, resolve with undefined
+        if (entry.onChunk) {
+          entry.onChunk(data);
+          entry.resolve(undefined);
+        } else {
+          entry.resolve({ value: data, done: false });
+        }
         // If more data available and more reads waiting, dispatch again
         if (queue.length > 0 && nodeReadable.readableLength > 0) {
           dispatch('data');
@@ -48,7 +54,8 @@ function _createLiteDispatcher(nodeReadable) {
       } else if (nodeReadable.readableEnded || nodeReadable.destroyed) {
         queue.shift();
         entry.removePending();
-        entry.resolve(DONE_RESULT);
+        if (entry.onClose) { entry.onClose(); entry.resolve(undefined); }
+        else entry.resolve(DONE_RESULT);
       } else {
         // No data yet — re-register for next push
         nodeReadable._dataCallback = dispatch;
@@ -59,16 +66,26 @@ function _createLiteDispatcher(nodeReadable) {
       for (const entry of entries) {
         entry.removePending();
         if (event === 'end') {
-          entry.resolve(DONE_RESULT);
+          if (entry.onClose) { entry.onClose(); entry.resolve(undefined); }
+          else entry.resolve(DONE_RESULT);
         } else if (event === 'error') {
           const stream = entry.stream;
-          if (stream._errored) entry.reject(stream._storedError);
-          else entry.reject(unwrapError(arg));
+          const err = stream._errored ? stream._storedError : unwrapError(arg);
+          if (entry.onError) { entry.onError(err); entry.resolve(undefined); }
+          else entry.reject(err);
         } else if (event === 'close') {
           const stream = entry.stream;
-          if (stream._errored) entry.reject(stream._storedError);
-          else if (nodeReadable.errored) entry.reject(unwrapError(nodeReadable.errored));
-          else entry.resolve(DONE_RESULT);
+          if (stream._errored) {
+            if (entry.onError) { entry.onError(stream._storedError); entry.resolve(undefined); }
+            else entry.reject(stream._storedError);
+          } else if (nodeReadable.errored) {
+            const err = unwrapError(nodeReadable.errored);
+            if (entry.onError) { entry.onError(err); entry.resolve(undefined); }
+            else entry.reject(err);
+          } else {
+            if (entry.onClose) { entry.onClose(); entry.resolve(undefined); }
+            else entry.resolve(DONE_RESULT);
+          }
         }
       }
     }
@@ -343,6 +360,141 @@ export class FastReadableStreamDefaultReader {
     }
     if (nodeReadable.readableEnded) return READ_DONE;
     return null;
+  }
+
+  /**
+   * Callback-based internal read — avoids creating {value, done} objects entirely.
+   * Used by tee and specPipeTo to avoid thenable interception: Promise.resolve(obj)
+   * checks obj.then per ECMAScript spec, so passing {value, done} through promise
+   * resolution is observable when Object.prototype.then is patched. This method
+   * resolves with undefined instead, dispatching chunks via direct callbacks.
+   * Returns Promise<undefined> (never rejects — errors go through onError callback).
+   */
+  _readWithCallbacks(onChunk, onClose, onError) {
+    if (this.#released) {
+      onError(new TypeError('Reader has been released'));
+      return RESOLVED_UNDEFINED;
+    }
+
+    const stream = this.#stream;
+    const nodeReadable = this.#nodeReadable;
+
+    if (stream._errored) {
+      onError(stream._storedError);
+      return RESOLVED_UNDEFINED;
+    }
+    if (nodeReadable.errored) {
+      onError(unwrapError(nodeReadable.errored));
+      return RESOLVED_UNDEFINED;
+    }
+    if (nodeReadable.destroyed) {
+      onClose();
+      return RESOLVED_UNDEFINED;
+    }
+
+    // Sync fast path — data already in buffer
+    const chunk = nodeReadable.read();
+    if (chunk !== null) {
+      if (stream._controller && stream._controller[kDequeueBytes]) stream._controller[kDequeueBytes](chunk);
+      if (stream._onPull) stream._onPull();
+      onChunk(chunk);
+      return RESOLVED_UNDEFINED;
+    }
+
+    if (nodeReadable.readableEnded) {
+      onClose();
+      return RESOLVED_UNDEFINED;
+    }
+
+    // Async path — wait for data, resolve with undefined (no thenable check)
+    return new Promise((resolve) => {
+      const entry = { reject: null, cleanup: null };
+      this.#pendingReads.push(entry);
+      if (stream._onPull) stream._onPull();
+
+      const removePending = () => {
+        const idx = this.#pendingReads.indexOf(entry);
+        if (idx !== -1) this.#pendingReads.splice(idx, 1);
+      };
+
+      // LiteReadable fast path
+      if (nodeReadable._dataCallback !== undefined) {
+        const readQueue = nodeReadable._readQueue || (nodeReadable._readQueue = []);
+        const queueEntry = { resolve, reject: null, entry, stream, removePending, onChunk, onClose, onError };
+        readQueue.push(queueEntry);
+        entry.reject = (err) => {
+          const idx = readQueue.indexOf(queueEntry);
+          if (idx !== -1) readQueue.splice(idx, 1);
+          removePending();
+          onError(err);
+          resolve(undefined);
+        };
+        entry.cleanup = () => {
+          const idx = readQueue.indexOf(queueEntry);
+          if (idx !== -1) readQueue.splice(idx, 1);
+        };
+        if (!nodeReadable._dataCallback) {
+          nodeReadable._dataCallback = _createLiteDispatcher(nodeReadable);
+        }
+        if (nodeReadable._readableState.reading) nodeReadable._readableState.reading = false;
+        nodeReadable.read(0);
+        return;
+      }
+
+      // Node.js Readable path
+      const onReadable = () => {
+        cleanup();
+        removePending();
+        const data = nodeReadable.read();
+        if (data !== null) {
+          if (stream._controller && stream._controller[kDequeueBytes]) stream._controller[kDequeueBytes](data);
+          if (stream._onPull) stream._onPull();
+          onChunk(data);
+          resolve(undefined);
+        } else if (nodeReadable.readableEnded || nodeReadable.destroyed) {
+          onClose();
+          resolve(undefined);
+        } else {
+          this.#pendingReads.push(entry);
+          nodeReadable.once('readable', onReadable);
+          nodeReadable.once('end', onEndH);
+          nodeReadable.once('error', onErrorH);
+          nodeReadable.once('close', onCloseH);
+        }
+      };
+      const onEndH = () => { cleanup(); removePending(); onClose(); resolve(undefined); };
+      const onErrorH = (err) => {
+        cleanup(); removePending();
+        if (stream._errored) onError(stream._storedError);
+        else onError(unwrapError(err));
+        resolve(undefined);
+      };
+      const onCloseH = () => {
+        cleanup(); removePending();
+        if (stream._errored) { onError(stream._storedError); resolve(undefined); }
+        else if (nodeReadable.errored) { onError(unwrapError(nodeReadable.errored)); resolve(undefined); }
+        else { onClose(); resolve(undefined); }
+      };
+      const cleanup = () => {
+        nodeReadable.removeListener('readable', onReadable);
+        nodeReadable.removeListener('end', onEndH);
+        nodeReadable.removeListener('error', onErrorH);
+        nodeReadable.removeListener('close', onCloseH);
+      };
+
+      entry.reject = (err) => { cleanup(); removePending(); onError(err); resolve(undefined); };
+      entry.cleanup = cleanup;
+
+      nodeReadable.once('readable', onReadable);
+      nodeReadable.once('end', onEndH);
+      nodeReadable.once('error', onErrorH);
+      nodeReadable.once('close', onCloseH);
+
+      if (nodeReadable._readableState.reading) {
+        nodeReadable._readableState.reading = false;
+      }
+      nodeReadable.read(0);
+    });
   }
 
   cancel(reason) {

@@ -831,26 +831,28 @@ export class FastReadableStream {
     function readLoop() {
       if (reading) return RESOLVED_UNDEFINED;
       reading = true;
-      return reader.read().then(
-        ({ value, done }) => {
+      // Use _readWithCallbacks to avoid {value,done} objects in promise resolution.
+      // Promise.resolve({value,done}) triggers ECMAScript thenable check on the object,
+      // which is observable when Object.prototype.then is patched (WPT then-interception test).
+      return reader._readWithCallbacks(
+        (value) => {
           reading = false;
-          if (done) {
-            try {
-              if (!canceled1 && branch1Controller) branch1Controller.close();
-            } catch {}
-            try {
-              if (!canceled2 && branch2Controller) branch2Controller.close();
-            } catch {}
-            // Resolve any pending cancel promise (source is done)
-            cancelResolve(undefined);
-            return;
-          }
           try {
             if (!canceled1 && branch1Controller) branch1Controller.enqueue(value);
           } catch {}
           try {
             if (!canceled2 && branch2Controller) branch2Controller.enqueue(value);
           } catch {}
+        },
+        () => {
+          reading = false;
+          try {
+            if (!canceled1 && branch1Controller) branch1Controller.close();
+          } catch {}
+          try {
+            if (!canceled2 && branch2Controller) branch2Controller.close();
+          } catch {}
+          cancelResolve(undefined);
         },
         (r) => {
           reading = false;
@@ -860,7 +862,6 @@ export class FastReadableStream {
           try {
             if (!canceled2 && branch2Controller) branch2Controller.error(r);
           } catch {}
-          // Resolve any pending cancel promise (source errored)
           cancelResolve(undefined);
         },
       );
