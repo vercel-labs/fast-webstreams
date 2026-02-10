@@ -10,6 +10,17 @@ const kWrappedError = Symbol('kWrappedError');
 // Symbol for byte queue dequeue method (avoids polluting getOwnPropertyNames)
 export const kDequeueBytes = Symbol('kDequeueBytes');
 
+// Symbols for BYOB-specific methods (avoids polluting getOwnPropertyNames on prototype)
+export const kAddPendingPullInto = Symbol('addPendingPullInto');
+export const kHasPendingPullInto = Symbol('hasPendingPullInto');
+export const kGetByobRequest = Symbol('getByobRequest');
+export const kReleasePullIntoReads = Symbol('releasePullIntoReads');
+export const kCancelPendingPullIntos = Symbol('cancelPendingPullIntos');
+export const kWirePullIntoRead = Symbol('wirePullIntoRead');
+export const kTrySyncFillPullInto = Symbol('trySyncFillPullInto');
+export const kEnqueueRemainder = Symbol('enqueueRemainder');
+export const kGetNodeReadable = Symbol('getNodeReadable');
+
 // Shared unwrap helper — used by reader.js, writable.js
 export function unwrapError(err) {
   if (err && typeof err === 'object' && kWrappedError in err) {
@@ -73,7 +84,7 @@ export class FastReadableStreamDefaultController {
         if (chunk.buffer.detached) {
           throw new TypeError('Cannot enqueue a chunk with a detached buffer');
         }
-        // Check for SharedArrayBuffer (non-transferable)
+        // Check for SharedArrayBuffer or non-transferable buffer (e.g., WebAssembly.Memory)
         if (chunk.buffer instanceof SharedArrayBuffer) {
           throw new TypeError('Cannot enqueue a chunk backed by a SharedArrayBuffer');
         }
@@ -180,6 +191,25 @@ export class FastReadableStreamDefaultController {
         this.#byteQueueSize += rest.byteLength;
         this.#nodeReadable.push(rest);
       }
+      // Schedule re-pull for partial fill (double-deferred: first microtask waits
+      // for pullLock to clear, second microtask triggers the actual re-pull)
+      if (d._resolve) {
+        const controller = this;
+        queueMicrotask(() => {
+          queueMicrotask(() => {
+            if (d._resolve === null) return;
+            if (controller.#closed || controller.#errored) return;
+            const stream = controller._stream;
+            if (!stream || !stream._pullFn) return;
+            const nr = controller.#nodeReadable;
+            if (nr && !nr.destroyed && nr._onRead && !nr._readableState.ended) {
+              if (stream._pullLock) return;
+              nr._readableState.reading = false;
+              nr.read(0);
+            }
+          });
+        });
+      }
     }
   }
 
@@ -211,7 +241,7 @@ export class FastReadableStreamDefaultController {
   #processRemainingPullIntos() {
     while (this.#pendingPullIntos && this.#pendingPullIntos.length > 0) {
       const d = this.#pendingPullIntos[0];
-      if (this._trySyncFillPullInto(d)) {
+      if (this[kTrySyncFillPullInto](d)) {
         this.#commitPullIntoDescriptor(d);
         this.#pendingPullIntos.shift();
         this.#byobRequest = null;
@@ -363,7 +393,7 @@ export class FastReadableStreamDefaultController {
   /**
    * Add a pull-into descriptor (called by BYOB reader's read(view)).
    */
-  _addPendingPullInto(descriptor) {
+  [kAddPendingPullInto](descriptor) {
     if (!this.#pendingPullIntos) this.#pendingPullIntos = [];
     // Only invalidate byobRequest if this is the first descriptor.
     // Per spec: subsequent descriptors go to end of queue and don't
@@ -377,7 +407,7 @@ export class FastReadableStreamDefaultController {
   /**
    * Check if there are pending pull-into descriptors with active resolve callbacks.
    */
-  _hasPendingPullInto() {
+  [kHasPendingPullInto]() {
     if (!this.#pendingPullIntos || this.#pendingPullIntos.length === 0) return false;
     // Only return true if at least one descriptor has an active resolve
     return this.#pendingPullIntos.some(d => d._resolve !== null);
@@ -387,7 +417,7 @@ export class FastReadableStreamDefaultController {
    * Get the byobRequest for the first pending pull-into.
    * Returns the same object on repeated calls until invalidated.
    */
-  _getByobRequest() {
+  [kGetByobRequest]() {
     if (!this.#pendingPullIntos || this.#pendingPullIntos.length === 0) return null;
     if (this.#byobRequest) return this.#byobRequest;
 
@@ -453,19 +483,41 @@ export class FastReadableStreamDefaultController {
           controller.#commitPullIntoDescriptor(d);
           controller.#pendingPullIntos.shift();
           controller.#processRemainingPullIntos();
+          // After commit, trigger pull for remaining pending descriptors
+          if (controller.#pendingPullIntos && controller.#pendingPullIntos.length > 0 &&
+              controller.#pendingPullIntos[0]._resolve) {
+            queueMicrotask(() => {
+              queueMicrotask(() => {
+                const next = controller.#pendingPullIntos?.[0];
+                if (!next || next._resolve === null) return;
+                if (controller.#closed || controller.#errored) return;
+                const stream = controller._stream;
+                if (!stream || !stream._pullFn) return;
+                const nr = controller.#nodeReadable;
+                if (nr && !nr.destroyed && nr._onRead && !nr._readableState.ended) {
+                  if (stream._pullLock) return;
+                  nr._readableState.reading = false;
+                  nr.read(0);
+                }
+              });
+            });
+          }
         } else if (d._resolve) {
-          // Partial respond with pending descriptor: schedule re-pull
+          // Partial respond with pending descriptor: double-deferred re-pull
+          // (first microtask waits for sync pullLock to clear, second triggers pull)
           queueMicrotask(() => {
-            if (d._resolve === null) return; // Already fulfilled
-            if (controller.#closed || controller.#errored) return;
-            const stream = controller._stream;
-            if (!stream || !stream._pullFn) return;
-            const nr = controller.#nodeReadable;
-            if (nr && !nr.destroyed && nr._onRead && !nr._readableState.ended) {
-              if (stream._pullLock) return; // Will re-trigger when lock clears
-              nr._readableState.reading = false;
-              nr.read(0);
-            }
+            queueMicrotask(() => {
+              if (d._resolve === null) return;
+              if (controller.#closed || controller.#errored) return;
+              const stream = controller._stream;
+              if (!stream || !stream._pullFn) return;
+              const nr = controller.#nodeReadable;
+              if (nr && !nr.destroyed && nr._onRead && !nr._readableState.ended) {
+                if (stream._pullLock) return;
+                nr._readableState.reading = false;
+                nr.read(0);
+              }
+            });
           });
         }
       }
@@ -485,15 +537,24 @@ export class FastReadableStreamDefaultController {
       if (!ArrayBuffer.isView(newView)) {
         throw new TypeError('view must be a TypedArray or DataView');
       }
+      if (newView.buffer instanceof SharedArrayBuffer) {
+        throw new TypeError('view must not reference a SharedArrayBuffer');
+      }
+      // Save dimensions before potential transfer
+      const newViewByteOffset = newView.byteOffset;
       const bytesWritten = newView.byteLength;
       // Per spec: respondWithNewView(zero-length) on non-closed stream should throw
       if (bytesWritten === 0 && !controller.#closed) {
         throw new TypeError('bytesWritten must be positive when stream is readable');
       }
 
-      // Per spec: use the newView's buffer directly (preserves identity after transfer)
-      d.buffer = newView.buffer;
-      d.byteOffset = newView.byteOffset;
+      // Per spec: transfer the buffer (non-transferable throws)
+      let newBuffer;
+      try { newBuffer = newView.buffer.transfer(); } catch {
+        throw new TypeError('Cannot respondWithNewView with a non-transferable buffer');
+      }
+      d.buffer = newBuffer;
+      d.byteOffset = newViewByteOffset;
       d.bytesFilled = bytesWritten;
 
       // Invalidate old request
@@ -521,7 +582,7 @@ export class FastReadableStreamDefaultController {
    * The descriptors STAY on the controller (per spec: pull-into survives releaseLock).
    * Only the resolve/reject callbacks are cleared.
    */
-  _releasePullIntoReads() {
+  [kReleasePullIntoReads]() {
     if (!this.#pendingPullIntos) return;
     for (const d of this.#pendingPullIntos) {
       d._resolve = null;
@@ -534,7 +595,7 @@ export class FastReadableStreamDefaultController {
    * Fulfill all pending BYOB reads with {done: true, value: undefined}.
    * Called when the stream is canceled with pending BYOB reads.
    */
-  _cancelPendingPullIntos() {
+  [kCancelPendingPullIntos]() {
     if (!this.#pendingPullIntos) return;
     for (const d of this.#pendingPullIntos) {
       if (d._resolve) {
@@ -553,7 +614,7 @@ export class FastReadableStreamDefaultController {
    * For BYOB readers: wires with the original viewConstructor.
    * For default readers: just return false (default reader reads from queue).
    */
-  _wirePullIntoRead(resolve, reject) {
+  [kWirePullIntoRead](resolve, reject) {
     if (!this.#pendingPullIntos || this.#pendingPullIntos.length === 0) return false;
     const d = this.#pendingPullIntos[0];
     if (d._resolve) return false; // Already wired
@@ -566,7 +627,7 @@ export class FastReadableStreamDefaultController {
    * Try to fill a pull-into descriptor synchronously from LiteReadable buffer.
    * Returns true if the descriptor was filled enough (meets minimum + alignment).
    */
-  _trySyncFillPullInto(d) {
+  [kTrySyncFillPullInto](d) {
     const nr = this.#nodeReadable;
     const buf = nr._buffer;
     if (!buf || buf.length === 0) return false;
@@ -606,7 +667,7 @@ export class FastReadableStreamDefaultController {
   /**
    * Enqueue remainder bytes back into the byte queue (after element alignment).
    */
-  _enqueueRemainder(chunk) {
+  [kEnqueueRemainder](chunk) {
     this.#byteQueueSize += chunk.byteLength;
     this.#nodeReadable.push(chunk);
   }
@@ -614,7 +675,7 @@ export class FastReadableStreamDefaultController {
   /**
    * Get the node readable (for BYOB reader to check state).
    */
-  _getNodeReadable() {
+  [kGetNodeReadable]() {
     return this.#nodeReadable;
   }
 }

@@ -7,7 +7,7 @@
  * For byte streams WITH pull: delegates to native via materializeReadableAsBytes.
  */
 
-import { unwrapError } from './controller.js';
+import { unwrapError, kTrySyncFillPullInto, kEnqueueRemainder, kAddPendingPullInto, kReleasePullIntoReads } from './controller.js';
 import { materializeReadable, materializeReadableAsBytes } from './materialize.js';
 import { NativeReadableStream } from './natives.js';
 import { isFastReadable, kLock, kNativeOnly, kNodeReadable, noop } from './utils.js';
@@ -123,7 +123,6 @@ export class FastReadableStreamBYOBReader {
     if (view.buffer.detached) {
       return Promise.reject(new TypeError('view references a detached ArrayBuffer'));
     }
-
     const elementSize = view.BYTES_PER_ELEMENT || 1;
     const isDataView = view.constructor === DataView;
     const viewConstructor = isDataView ? DataView : view.constructor;
@@ -143,14 +142,23 @@ export class FastReadableStreamBYOBReader {
 
     if (stream._errored) return Promise.reject(stream._storedError);
 
-    // Create pull-into descriptor (copy buffer per spec transfer semantics)
-    const bufferCopy = new ArrayBuffer(view.buffer.byteLength);
-    new Uint8Array(bufferCopy).set(new Uint8Array(view.buffer));
+    // Save view dimensions BEFORE transfer (transfer detaches original, zeroing these)
+    const viewByteOffset = view.byteOffset;
+    const viewByteLength = view.byteLength;
+
+    // Transfer buffer per spec (detaches caller's view)
+    // Non-transferable buffers (e.g., WebAssembly.Memory) throw TypeError
+    let bufferCopy;
+    try {
+      bufferCopy = view.buffer.transfer();
+    } catch {
+      return Promise.reject(new TypeError('Cannot read into a non-transferable buffer'));
+    }
 
     const descriptor = {
       buffer: bufferCopy,
-      byteOffset: view.byteOffset,
-      byteLength: view.byteLength,
+      byteOffset: viewByteOffset,
+      byteLength: viewByteLength,
       bytesFilled: 0,
       minimumFill,
       elementSize,
@@ -162,7 +170,7 @@ export class FastReadableStreamBYOBReader {
     const controller = stream._controller;
 
     // Try sync fill from LiteReadable buffer
-    if (controller._trySyncFillPullInto(descriptor)) {
+    if (controller[kTrySyncFillPullInto](descriptor)) {
       const filledView = new viewConstructor(descriptor.buffer, descriptor.byteOffset,
         descriptor.bytesFilled / elementSize);
       return Promise.resolve({ value: filledView, done: false });
@@ -196,7 +204,7 @@ export class FastReadableStreamBYOBReader {
       const remainder = new Uint8Array(descriptor.buffer.slice(
         descriptor.byteOffset + descriptor.bytesFilled - remainderSize,
         descriptor.byteOffset + descriptor.bytesFilled));
-      controller._enqueueRemainder(remainder);
+      controller[kEnqueueRemainder](remainder);
       // Align bytesFilled
       descriptor.bytesFilled = alignedFill;
       const filledView = new viewConstructor(descriptor.buffer, descriptor.byteOffset,
@@ -234,7 +242,7 @@ export class FastReadableStreamBYOBReader {
       descriptor._resolve = resolve;
       descriptor._reject = reject;
       this.#pendingReads.push(descriptor);
-      controller._addPendingPullInto(descriptor);
+      controller[kAddPendingPullInto](descriptor);
 
       // Trigger pull synchronously — spec requires pull to fire immediately
       // when a BYOB read is added with empty buffer. The respond() method's
@@ -270,7 +278,7 @@ export class FastReadableStreamBYOBReader {
       for (const d of this.#pendingReads) {
         if (d._reject) d._reject(releasedError);
       }
-      stream._controller._releasePullIntoReads();
+      stream._controller[kReleasePullIntoReads]();
       this.#pendingReads = [];
     }
 

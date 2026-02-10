@@ -9,7 +9,7 @@
 import { pipeline, Readable } from 'node:stream';
 import { pipeline as pipelineWithSignal } from 'node:stream/promises';
 import { FastReadableStreamBYOBReader } from './byob-reader.js';
-import { FastReadableStreamDefaultController } from './controller.js';
+import { FastReadableStreamDefaultController, kHasPendingPullInto, kGetByobRequest, kCancelPendingPullIntos } from './controller.js';
 import { materializeReadable, materializeReadableAsBytes, materializeWritable } from './materialize.js';
 import { NativeReadableStream, NativeWritableStream } from './natives.js';
 import { specPipeTo } from './pipe-to.js';
@@ -378,13 +378,6 @@ export class FastReadableStream {
           stream._pullLock = true;
           queueMicrotask(() => {
             stream._pullLock = null;
-            // Re-pull if there are pending BYOB descriptors needing more data
-            if (controller._hasPendingPullInto && controller._hasPendingPullInto() &&
-                !nodeReadable.destroyed && !nodeReadable._readableState.ended &&
-                nodeReadable._onRead) {
-              nodeReadable._readableState.reading = false;
-              nodeReadable.read(0);
-            }
           });
         }
       } catch (e) {
@@ -410,10 +403,10 @@ export class FastReadableStream {
     controller._stream = this;
     // Byte streams: add byobRequest as own property (not on prototype — that's
     // ReadableStreamDefaultController which doesn't have byobRequest per spec).
-    // Delegates to controller._getByobRequest() for pending pull-into descriptors.
+    // Delegates to controller[kGetByobRequest]() for pending pull-into descriptors.
     if (type === 'bytes') {
       Object.defineProperty(controller, 'byobRequest', {
-        get() { return this._getByobRequest(); },
+        get() { return this[kGetByobRequest](); },
         configurable: true,
       });
     }
@@ -911,8 +904,8 @@ export class FastReadableStream {
     this._closed = true;
 
     // Fulfill pending BYOB reads with {done: true, value: undefined}
-    if (this._controller && this._controller._cancelPendingPullIntos) {
-      this._controller._cancelPendingPullIntos();
+    if (this._controller && this._controller[kCancelPendingPullIntos]) {
+      this._controller[kCancelPendingPullIntos]();
     }
 
     // Per spec: resolve reader's closedPromise synchronously
