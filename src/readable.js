@@ -33,6 +33,13 @@ import {
   _stats,
 } from './utils.js';
 
+// Shared byobRequest getter descriptor — avoids per-instance closure allocation.
+// The getter uses `this` dynamically so it's safe to share across all byte stream controllers.
+const _byobRequestDescriptor = {
+  get() { return this[kGetByobRequest](); },
+  configurable: true,
+};
+
 // ReadableStreamAsyncIteratorPrototype — shared by all async iterators
 // Per spec: extends AsyncIteratorPrototype, has next() and return() methods on the prototype
 const kIterReader = Symbol('kIterReader');
@@ -416,10 +423,7 @@ export class FastReadableStream {
     // ReadableStreamDefaultController which doesn't have byobRequest per spec).
     // Delegates to controller[kGetByobRequest]() for pending pull-into descriptors.
     if (type === 'bytes') {
-      Object.defineProperty(controller, 'byobRequest', {
-        get() { return this[kGetByobRequest](); },
-        configurable: true,
-      });
+      Object.defineProperty(controller, 'byobRequest', _byobRequestDescriptor);
     }
     this._controller = controller;
 

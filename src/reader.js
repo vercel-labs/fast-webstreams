@@ -133,8 +133,14 @@ export class FastReadableStreamDefaultReader {
         }
       } else if (nodeReadable.readableEnded) {
         this.#settleClose(true);
+      } else if (nodeReadable._dataCallback !== undefined) {
+        // LiteReadable: skip event listeners entirely. All close/error paths
+        // settle the reader directly via controller.close/error → reader._settleClosedFromError
+        // / _resolveClosedFromCancel. Avoids 4 closures + _listeners object + 3 wrapper
+        // objects (~953 bytes) per reader — significant for 300+ streams/request.
       } else {
-        // Listen for close events
+        // Node.js Readable: listen for close events (needed because Node internals
+        // can emit end/error/close independently of our controller)
         const onEnd = () => {
           cleanup();
           stream._closed = true;
