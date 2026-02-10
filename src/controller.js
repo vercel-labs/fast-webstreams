@@ -92,9 +92,15 @@ export class FastReadableStreamDefaultController {
         if (chunk.byteLength === 0) {
           throw new TypeError('Cannot enqueue a zero-length chunk');
         }
-        if (!(chunk instanceof Uint8Array)) {
-          chunk = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-        }
+        // Per spec: TransferArrayBuffer — detaches caller's buffer, gives us ownership.
+        // Non-transferable buffers (e.g., WebAssembly.Memory) throw TypeError.
+        // Capture offset/length before transfer (transfer zeroes the original view).
+        const savedOffset = chunk.byteOffset;
+        const savedLength = chunk.byteLength;
+        let transferred;
+        try { transferred = chunk.buffer.transfer(); }
+        catch { throw new TypeError('Cannot enqueue a chunk with a non-transferable buffer'); }
+        chunk = new Uint8Array(transferred, savedOffset, savedLength);
       } else if (chunk instanceof ArrayBuffer) {
         if (chunk.detached) {
           throw new TypeError('Cannot enqueue a chunk with a detached buffer');
@@ -102,6 +108,8 @@ export class FastReadableStreamDefaultController {
         if (chunk.byteLength === 0) {
           throw new TypeError('Cannot enqueue a zero-length chunk');
         }
+        try { chunk = chunk.transfer(); }
+        catch { throw new TypeError('Cannot enqueue a chunk with a non-transferable buffer'); }
       }
 
       // BYOB fill path: if there are pending pull-into descriptors

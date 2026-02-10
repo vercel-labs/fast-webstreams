@@ -103,8 +103,19 @@ export function materializeReadableAsBytes(fastReadable) {
     const origError = proto.error;
 
     ctrl.enqueue = function(chunk) {
+      // Copy chunk data before origEnqueue transfers the buffer (byte stream spec).
+      // Preserve the original byteOffset by allocating a full-size buffer copy
+      // and creating a view at the same offset. Native tee expects offset-preserving chunks.
+      // This is a Tier 2 path (tee materialization) where the copy cost is acceptable.
+      let nativeChunk;
+      if (ArrayBuffer.isView(chunk)) {
+        const bufCopy = chunk.buffer.slice(0);
+        nativeChunk = new Uint8Array(bufCopy, chunk.byteOffset, chunk.byteLength);
+      } else {
+        nativeChunk = chunk;
+      }
       origEnqueue.call(this, chunk);
-      try { nativeCtrl.enqueue(toUint8Array(chunk)); } catch {}
+      try { nativeCtrl.enqueue(nativeChunk); } catch {}
     };
     ctrl.close = function() {
       // Try native close FIRST — it throws TypeError for Uint16Array with
