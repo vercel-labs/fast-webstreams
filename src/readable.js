@@ -378,6 +378,13 @@ export class FastReadableStream {
           stream._pullLock = true;
           queueMicrotask(() => {
             stream._pullLock = null;
+            // Re-pull if there are pending BYOB descriptors needing more data
+            if (controller._hasPendingPullInto && controller._hasPendingPullInto() &&
+                !nodeReadable.destroyed && !nodeReadable._readableState.ended &&
+                nodeReadable._onRead) {
+              nodeReadable._readableState.reading = false;
+              nodeReadable.read(0);
+            }
           });
         }
       } catch (e) {
@@ -403,10 +410,10 @@ export class FastReadableStream {
     controller._stream = this;
     // Byte streams: add byobRequest as own property (not on prototype — that's
     // ReadableStreamDefaultController which doesn't have byobRequest per spec).
-    // Returns null until materializeReadableAsBytes overrides it with a proxy.
+    // Delegates to controller._getByobRequest() for pending pull-into descriptors.
     if (type === 'bytes') {
       Object.defineProperty(controller, 'byobRequest', {
-        get() { return null; },
+        get() { return this._getByobRequest(); },
         configurable: true,
       });
     }
@@ -696,38 +703,8 @@ export class FastReadableStream {
     }
     const mode = options ? (options.mode === undefined ? undefined : String(options.mode)) : undefined;
     if (mode === 'byob') {
-      if (this._isByteStream && !this[kNativeOnly]) {
-        // Fast byte stream: check lock before creating BYOB reader
-        if (this[kLock]) {
-          throw new TypeError('ReadableStream is locked');
-        }
-      }
-      // Tier 2: BYOB requires native byte stream support
-      const byobReader = new FastReadableStreamBYOBReader(this);
-      if (this._isByteStream && !this[kNativeOnly]) {
-        // Track lock on the fast stream so .locked returns true
-        const fastStream = this;
-        const origReleaseLock = byobReader.releaseLock.bind(byobReader);
-        fastStream[kLock] = byobReader;
-        byobReader.releaseLock = function() {
-          fastStream[kLock] = null;
-          // Re-enable Node readable's pull (disabled during materialization)
-          if (fastStream._pullFn) {
-            const nr = fastStream[kNodeReadable];
-            if (nr && nr._onRead !== undefined) {
-              nr._onRead = fastStream._pullFn; // LiteReadable
-            } else if (nr && nr._read) {
-              nr._read = fastStream._pullFn; // Node Readable
-            }
-            // Kickstart demand — next getReader().read() will trigger pull
-            if (nr && !nr.destroyed) {
-              nr._readableState.reading = false;
-            }
-          }
-          origReleaseLock();
-        };
-      }
-      return byobReader;
+      // Standalone BYOB reader handles lock check and kLock directly
+      return new FastReadableStreamBYOBReader(this);
     }
     if (mode !== undefined) {
       throw new TypeError(`Invalid mode: ${mode}`);
@@ -932,6 +909,11 @@ export class FastReadableStream {
 
     // Per spec: set state to "closed" synchronously BEFORE calling cancel
     this._closed = true;
+
+    // Fulfill pending BYOB reads with {done: true, value: undefined}
+    if (this._controller && this._controller._cancelPendingPullIntos) {
+      this._controller._cancelPendingPullIntos();
+    }
 
     // Per spec: resolve reader's closedPromise synchronously
     const reader = this[kLock];

@@ -107,8 +107,20 @@ export function materializeReadableAsBytes(fastReadable) {
       try { nativeCtrl.enqueue(toUint8Array(chunk)); } catch {}
     };
     ctrl.close = function() {
+      // Try native close FIRST — it throws TypeError for Uint16Array with
+      // unaligned bytesFilled ("Invalid state: Partial read").
+      // Tests 4, 8 expect close() to throw this error AND error the stream.
+      try {
+        nativeCtrl.close();
+      } catch (err) {
+        if (err.code === 'ERR_INVALID_STATE') {
+          // Alignment error from native — propagate to fast controller too
+          origError.call(this, err);
+          throw err;
+        }
+        // Swallow other errors (e.g., already closed)
+      }
       origClose.call(this);
-      try { nativeCtrl.close(); } catch {}
     };
     ctrl.error = function(e) {
       origError.call(this, e);

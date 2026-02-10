@@ -85,8 +85,9 @@ export class LiteReadable {
 
   read(n) {
     if (n === 0) {
-      // Trigger _read (pull) if nothing is buffered
-      if (this._buffer.length === 0 && this._onRead && !this._readableState.reading) {
+      // Trigger _read (pull) if nothing is buffered and not ended/destroyed
+      if (this._buffer.length === 0 && this._onRead && !this._readableState.reading &&
+          !this._readableState.ended && !this._destroyed) {
         this._readableState.reading = true;
         this._onRead();
         // Reset after sync return (async pull resets in its .then() handler).

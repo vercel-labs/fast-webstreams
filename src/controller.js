@@ -38,6 +38,9 @@ const kControllerBrand = Symbol('kControllerBrand');
 
 /**
  * ReadableStreamDefaultController adapter.
+ *
+ * For byte streams (type: 'bytes'), also manages pull-into descriptors
+ * to support BYOB reads without native delegation.
  */
 export class FastReadableStreamDefaultController {
   #nodeReadable;
@@ -46,6 +49,10 @@ export class FastReadableStreamDefaultController {
   #originalHWM;
   #byteQueueSize = 0;
   _stream = null; // Set by the stream constructor
+
+  // Pull-into state for BYOB reads (byte streams only, lazily allocated)
+  #pendingPullIntos = null;
+  #byobRequest = null;
 
   constructor(nodeReadable, originalHWM) {
     this.#nodeReadable = nodeReadable;
@@ -85,12 +92,161 @@ export class FastReadableStreamDefaultController {
           throw new TypeError('Cannot enqueue a zero-length chunk');
         }
       }
+
+      // BYOB fill path: if there are pending pull-into descriptors
+      if (this.#pendingPullIntos && this.#pendingPullIntos.length > 0) {
+        const firstD = this.#pendingPullIntos[0];
+        if (firstD._resolve === null) {
+          // Per spec step 7: released reader's pull-into (readerType "none").
+          // Commit partially filled buffer to queue, then proceed.
+          if (firstD.bytesFilled > 0) {
+            // Per spec: create a new buffer with just the filled bytes
+            // (not a view of the original pull-into buffer)
+            const committed = new Uint8Array(firstD.bytesFilled);
+            committed.set(new Uint8Array(firstD.buffer, firstD.byteOffset, firstD.bytesFilled));
+            this.#byteQueueSize += committed.byteLength;
+            this.#nodeReadable.push(committed);
+          }
+          this.#pendingPullIntos.shift();
+          this.#byobRequest = null;
+          // Check if there are more descriptors to fill
+          if (this.#pendingPullIntos.length > 0) {
+            this.#fillPendingPullIntosFromEnqueue(chunk);
+            return;
+          }
+          // Fall through to normal enqueue below
+        } else {
+          // Active reader's pull-into — fill it from enqueue
+          this.#fillPendingPullIntosFromEnqueue(chunk);
+          return;
+        }
+      }
     }
     // Track byte queue size for byte stream desiredSize
     if (this._stream && this._stream._isByteStream && chunk != null) {
       this.#byteQueueSize += chunk.byteLength || 0;
     }
     this.#nodeReadable.push(chunk);
+  }
+
+  /**
+   * Fill pending pull-into descriptors from an enqueued chunk.
+   * Per spec: ReadableByteStreamControllerEnqueue fills pull-intos first,
+   * then pushes remainder to byte queue.
+   */
+  #fillPendingPullIntosFromEnqueue(chunk) {
+    const pullIntos = this.#pendingPullIntos;
+    const d = pullIntos[0];
+
+    // Invalidate cached byobRequest (view is changing) — transfer buffer
+    if (this.#byobRequest) {
+      this.#byobRequest.view = null;
+      this.#byobRequest._responded = true;
+    }
+    // Transfer the descriptor's buffer so old views become detached
+    const newBuffer = d.buffer.transfer();
+    d.buffer = newBuffer;
+    this.#byobRequest = null;
+
+    // Copy bytes from chunk into the descriptor's buffer
+    const src = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    const remaining = d.byteLength - d.bytesFilled;
+    const toCopy = Math.min(src.byteLength, remaining);
+    const dst = new Uint8Array(d.buffer, d.byteOffset + d.bytesFilled, toCopy);
+    dst.set(src.subarray(0, toCopy));
+    d.bytesFilled += toCopy;
+
+    const leftover = src.byteLength - toCopy;
+
+    // Check if the descriptor is complete (aligned and meets minimum)
+    if (d.bytesFilled % d.elementSize === 0 && d.bytesFilled >= d.minimumFill) {
+      // Complete — fulfill or commit
+      this.#commitPullIntoDescriptor(d);
+      pullIntos.shift();
+
+      // Push leftover to byte queue (for subsequent reads)
+      if (leftover > 0) {
+        const rest = new Uint8Array(src.buffer, src.byteOffset + toCopy, leftover);
+        this.#byteQueueSize += rest.byteLength;
+        this.#nodeReadable.push(rest);
+      }
+
+      // After committing, try to fill remaining descriptors from queue
+      this.#processRemainingPullIntos();
+    } else {
+      // Not complete — chunk fully consumed but descriptor not filled
+      if (leftover > 0) {
+        const rest = new Uint8Array(src.buffer, src.byteOffset + toCopy, leftover);
+        this.#byteQueueSize += rest.byteLength;
+        this.#nodeReadable.push(rest);
+      }
+    }
+  }
+
+  /**
+   * Commit a completed pull-into descriptor — fulfill its read promise
+   * or push to byte queue if no active reader.
+   */
+  #commitPullIntoDescriptor(d) {
+    if (d._resolve) {
+      const filledView = new d.viewConstructor(d.buffer, d.byteOffset,
+        d.bytesFilled / d.elementSize);
+      d._resolve({ value: filledView, done: false });
+      d._resolve = null;
+      d._reject = null;
+    } else {
+      // No active reader (released) — push committed data to byte queue
+      // Per spec: committed for readerType "none" creates Uint8Array and enqueues
+      const committedChunk = new Uint8Array(d.buffer, d.byteOffset, d.bytesFilled);
+      this.#byteQueueSize += committedChunk.byteLength;
+      this.#nodeReadable.push(committedChunk);
+    }
+  }
+
+  /**
+   * After committing/shifting the first descriptor, try to fill remaining
+   * descriptors from the byte queue (LiteReadable buffer).
+   * Per spec: ReadableByteStreamControllerProcessPullIntoDescriptorsUsingQueue
+   */
+  #processRemainingPullIntos() {
+    while (this.#pendingPullIntos && this.#pendingPullIntos.length > 0) {
+      const d = this.#pendingPullIntos[0];
+      if (this._trySyncFillPullInto(d)) {
+        this.#commitPullIntoDescriptor(d);
+        this.#pendingPullIntos.shift();
+        this.#byobRequest = null;
+      } else {
+        break;
+      }
+    }
+  }
+
+  /**
+   * Commit a pull-into descriptor with done:true (closed stream).
+   * Per spec: ReadableByteStreamControllerCommitPullIntoDescriptor with done=true
+   */
+  #commitPullIntoDescriptorDone(d) {
+    if (d._resolve) {
+      // Create a zero-length (or filled-length) view for the done result
+      const filledView = new d.viewConstructor(d.buffer, d.byteOffset,
+        d.bytesFilled / d.elementSize);
+      d._resolve({ value: filledView, done: true });
+      d._resolve = null;
+      d._reject = null;
+    }
+    // If no resolve (released reader), just discard
+  }
+
+  /**
+   * Process remaining pull-intos after close+respond — fulfill all with done:true.
+   */
+  #processRemainingPullIntosClosed() {
+    while (this.#pendingPullIntos && this.#pendingPullIntos.length > 0) {
+      const d = this.#pendingPullIntos[0];
+      this.#commitPullIntoDescriptorDone(d);
+      this.#pendingPullIntos.shift();
+      this.#byobRequest = null;
+    }
   }
 
   // Called by reader when consuming a chunk (decrements byte queue tracking)
@@ -109,6 +265,21 @@ export class FastReadableStreamDefaultController {
     if (this.#closed || (this._stream && this._stream._closed)) {
       throw new TypeError('Cannot close an already closed stream');
     }
+
+    // Byte stream BYOB: alignment check on close
+    if (this.#pendingPullIntos && this.#pendingPullIntos.length > 0) {
+      const d = this.#pendingPullIntos[0];
+      if (d.bytesFilled > 0 && d.bytesFilled % d.elementSize !== 0) {
+        const e = new TypeError('Insufficient bytes to fill elements in the given buffer');
+        this.error(e);
+        throw e;
+      }
+      // Per spec: don't immediately fulfill pending pull-intos on close.
+      // They are fulfilled when respond(0) is called on the closed stream.
+      // But if there's no pull and no pending byobRequest (just queued data
+      // with a waiting read), we should resolve pending descriptors with done:true.
+    }
+
     this.#closed = true;
     const r = this.#nodeReadable;
     r.push(null);
@@ -142,6 +313,18 @@ export class FastReadableStreamDefaultController {
     } else {
       this.#nodeReadable.destroy(e);
     }
+    // Reject pending BYOB reads
+    if (this.#pendingPullIntos) {
+      for (const d of this.#pendingPullIntos) {
+        if (d._reject) {
+          d._reject(e);
+          d._resolve = null;
+          d._reject = null;
+        }
+      }
+      this.#pendingPullIntos = null;
+      this.#byobRequest = null;
+    }
     // Track error state on the stream for releaseLock to use
     if (this._stream) {
       this._stream._storedError = e;
@@ -173,6 +356,266 @@ export class FastReadableStreamDefaultController {
     const reader = this._stream?.[kLock];
     const pendingReads = reader?._pendingReadCount?.() ?? 0;
     return this.#originalHWM - Math.max(0, queueSize - pendingReads);
+  }
+
+  // --- BYOB pull-into management (byte streams only) ---
+
+  /**
+   * Add a pull-into descriptor (called by BYOB reader's read(view)).
+   */
+  _addPendingPullInto(descriptor) {
+    if (!this.#pendingPullIntos) this.#pendingPullIntos = [];
+    // Only invalidate byobRequest if this is the first descriptor.
+    // Per spec: subsequent descriptors go to end of queue and don't
+    // affect the first byobRequest (which survives releaseLock).
+    if (this.#pendingPullIntos.length === 0) {
+      this.#byobRequest = null;
+    }
+    this.#pendingPullIntos.push(descriptor);
+  }
+
+  /**
+   * Check if there are pending pull-into descriptors with active resolve callbacks.
+   */
+  _hasPendingPullInto() {
+    if (!this.#pendingPullIntos || this.#pendingPullIntos.length === 0) return false;
+    // Only return true if at least one descriptor has an active resolve
+    return this.#pendingPullIntos.some(d => d._resolve !== null);
+  }
+
+  /**
+   * Get the byobRequest for the first pending pull-into.
+   * Returns the same object on repeated calls until invalidated.
+   */
+  _getByobRequest() {
+    if (!this.#pendingPullIntos || this.#pendingPullIntos.length === 0) return null;
+    if (this.#byobRequest) return this.#byobRequest;
+
+    const d = this.#pendingPullIntos[0];
+    const view = new Uint8Array(d.buffer, d.byteOffset + d.bytesFilled,
+      d.byteLength - d.bytesFilled);
+
+    const controller = this;
+    const req = Object.create(null);
+
+    // view as data property
+    req.view = view;
+
+    req.respond = function respond(bytesWritten) {
+      // Double-respond prevention
+      if (req._responded) throw new TypeError('byobRequest already responded');
+      // Respond after cancel/error check
+      if (controller._stream && controller._stream._errored) {
+        throw new TypeError('Cannot respond on an errored stream');
+      }
+      if (controller._stream && controller._stream._closed && !controller.#closed) {
+        throw new TypeError('Cannot respond on a canceled stream');
+      }
+
+      bytesWritten = Number(bytesWritten);
+      if (Number.isNaN(bytesWritten) || bytesWritten < 0) {
+        throw new TypeError('bytesWritten must be non-negative');
+      }
+      // Per spec: respond(0) on non-closed stream should throw
+      if (bytesWritten === 0 && !controller.#closed) {
+        throw new TypeError('bytesWritten must be positive when stream is readable');
+      }
+      if (d.bytesFilled + bytesWritten > d.byteLength) {
+        throw new RangeError('bytesWritten out of range');
+      }
+      d.bytesFilled += bytesWritten;
+
+      // Transfer buffer per spec: old view's buffer becomes detached
+      const newBuffer = d.buffer.transfer();
+      d.buffer = newBuffer;
+
+      // Invalidate old request
+      req._responded = true;
+      req.view = null;
+      controller.#byobRequest = null;
+
+      if (controller.#closed) {
+        controller.#commitPullIntoDescriptorDone(d);
+        controller.#pendingPullIntos.shift();
+        controller.#processRemainingPullIntosClosed();
+      } else {
+        // Handle element-size remainder per spec
+        const remainderSize = d.bytesFilled % d.elementSize;
+        if (remainderSize > 0 && d.bytesFilled >= d.elementSize) {
+          // Enqueue remainder to byte queue, then commit aligned portion
+          const remainder = new Uint8Array(d.buffer.slice(
+            d.byteOffset + d.bytesFilled - remainderSize, d.byteOffset + d.bytesFilled));
+          controller.#byteQueueSize += remainder.byteLength;
+          controller.#nodeReadable.push(remainder);
+          d.bytesFilled -= remainderSize;
+        }
+        if (d.bytesFilled >= d.minimumFill && d.bytesFilled % d.elementSize === 0) {
+          controller.#commitPullIntoDescriptor(d);
+          controller.#pendingPullIntos.shift();
+          controller.#processRemainingPullIntos();
+        } else if (d._resolve) {
+          // Partial respond with pending descriptor: schedule re-pull
+          queueMicrotask(() => {
+            if (d._resolve === null) return; // Already fulfilled
+            if (controller.#closed || controller.#errored) return;
+            const stream = controller._stream;
+            if (!stream || !stream._pullFn) return;
+            const nr = controller.#nodeReadable;
+            if (nr && !nr.destroyed && nr._onRead && !nr._readableState.ended) {
+              if (stream._pullLock) return; // Will re-trigger when lock clears
+              nr._readableState.reading = false;
+              nr.read(0);
+            }
+          });
+        }
+      }
+    };
+
+    req.respondWithNewView = function respondWithNewView(newView) {
+      // Double-respond prevention
+      if (req._responded) throw new TypeError('byobRequest already responded');
+      // Respond after cancel/error check
+      if (controller._stream && controller._stream._errored) {
+        throw new TypeError('Cannot respond on an errored stream');
+      }
+      if (controller._stream && controller._stream._closed && !controller.#closed) {
+        throw new TypeError('Cannot respond on a canceled stream');
+      }
+
+      if (!ArrayBuffer.isView(newView)) {
+        throw new TypeError('view must be a TypedArray or DataView');
+      }
+      const bytesWritten = newView.byteLength;
+      // Per spec: respondWithNewView(zero-length) on non-closed stream should throw
+      if (bytesWritten === 0 && !controller.#closed) {
+        throw new TypeError('bytesWritten must be positive when stream is readable');
+      }
+
+      // Per spec: use the newView's buffer directly (preserves identity after transfer)
+      d.buffer = newView.buffer;
+      d.byteOffset = newView.byteOffset;
+      d.bytesFilled = bytesWritten;
+
+      // Invalidate old request
+      req._responded = true;
+      req.view = null;
+      controller.#byobRequest = null;
+
+      if (controller.#closed) {
+        controller.#commitPullIntoDescriptorDone(d);
+        controller.#pendingPullIntos.shift();
+        controller.#processRemainingPullIntosClosed();
+      } else if (d.bytesFilled % d.elementSize === 0 && d.bytesFilled >= d.minimumFill) {
+        controller.#commitPullIntoDescriptor(d);
+        controller.#pendingPullIntos.shift();
+        controller.#processRemainingPullIntos();
+      }
+    };
+
+    this.#byobRequest = req;
+    return req;
+  }
+
+  /**
+   * Invalidate pending pull-into read promises (called by BYOB reader releaseLock).
+   * The descriptors STAY on the controller (per spec: pull-into survives releaseLock).
+   * Only the resolve/reject callbacks are cleared.
+   */
+  _releasePullIntoReads() {
+    if (!this.#pendingPullIntos) return;
+    for (const d of this.#pendingPullIntos) {
+      d._resolve = null;
+      d._reject = null;
+    }
+    // Don't clear byobRequest — it survives releaseLock per spec
+  }
+
+  /**
+   * Fulfill all pending BYOB reads with {done: true, value: undefined}.
+   * Called when the stream is canceled with pending BYOB reads.
+   */
+  _cancelPendingPullIntos() {
+    if (!this.#pendingPullIntos) return;
+    for (const d of this.#pendingPullIntos) {
+      if (d._resolve) {
+        d._resolve({ value: undefined, done: true });
+        d._resolve = null;
+        d._reject = null;
+      }
+    }
+    this.#pendingPullIntos = null;
+    this.#byobRequest = null;
+  }
+
+  /**
+   * Wire a new read promise to the first pending pull-into descriptor
+   * (called by a second reader after first was released).
+   * For BYOB readers: wires with the original viewConstructor.
+   * For default readers: just return false (default reader reads from queue).
+   */
+  _wirePullIntoRead(resolve, reject) {
+    if (!this.#pendingPullIntos || this.#pendingPullIntos.length === 0) return false;
+    const d = this.#pendingPullIntos[0];
+    if (d._resolve) return false; // Already wired
+    d._resolve = resolve;
+    d._reject = reject;
+    return true;
+  }
+
+  /**
+   * Try to fill a pull-into descriptor synchronously from LiteReadable buffer.
+   * Returns true if the descriptor was filled enough (meets minimum + alignment).
+   */
+  _trySyncFillPullInto(d) {
+    const nr = this.#nodeReadable;
+    const buf = nr._buffer;
+    if (!buf || buf.length === 0) return false;
+
+    // Fill as much as possible from the buffer (up to byteLength, not just minimumFill)
+    while (buf.length > 0 && d.bytesFilled < d.byteLength) {
+      const chunk = buf[0];
+      const chunkBytes = chunk.byteLength;
+      const need = d.byteLength - d.bytesFilled;
+      const toCopy = Math.min(chunkBytes, need);
+
+      const src = new Uint8Array(chunk.buffer, chunk.byteOffset, toCopy);
+      const dst = new Uint8Array(d.buffer, d.byteOffset + d.bytesFilled, toCopy);
+      dst.set(src);
+      d.bytesFilled += toCopy;
+
+      // Dequeue bytes
+      this.#byteQueueSize -= toCopy;
+      if (this.#byteQueueSize < 0) this.#byteQueueSize = 0;
+
+      if (toCopy === chunkBytes) {
+        buf.shift(); // Consumed entire chunk
+      } else {
+        // Partial consumption — replace with remainder
+        buf[0] = new Uint8Array(chunk.buffer, chunk.byteOffset + toCopy, chunkBytes - toCopy);
+      }
+    }
+
+    // Update LiteReadable ended state
+    if (buf.length === 0 && nr._readableState && nr._readableState.ended) {
+      nr._ended = true;
+    }
+
+    return d.bytesFilled % d.elementSize === 0 && d.bytesFilled >= d.minimumFill;
+  }
+
+  /**
+   * Enqueue remainder bytes back into the byte queue (after element alignment).
+   */
+  _enqueueRemainder(chunk) {
+    this.#byteQueueSize += chunk.byteLength;
+    this.#nodeReadable.push(chunk);
+  }
+
+  /**
+   * Get the node readable (for BYOB reader to check state).
+   */
+  _getNodeReadable() {
+    return this.#nodeReadable;
   }
 }
 
