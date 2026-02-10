@@ -14,6 +14,7 @@
  */
 
 import { FastReadableStream, FastWritableStream, FastTransformStream } from '../../src/index.js';
+import { _initNativeReadableShell } from '../../src/readable.js';
 
 const { ReadableStream: NativeReadableStream, WritableStream: NativeWritableStream, TransformStream: NativeTransformStream } = globalThis;
 
@@ -86,6 +87,19 @@ function createFastReadable(chunk, totalBytes, chunkSize) {
     },
     { highWaterMark: countHWM }
   );
+}
+
+/**
+ * Wrap a native ReadableStream in a kNativeOnly FastReadableStream shell.
+ * Simulates what happens when undici/fetch creates a native stream and user
+ * code treats it as a FastReadableStream (e.g., after patchGlobalWebStreams).
+ * pipeThrough on this shell triggers _bridgeNativeToFast().
+ */
+function createNativeOnlyShell(chunk, totalBytes) {
+  const native = createByteReadable(chunk, totalBytes);
+  const shell = Object.create(FastReadableStream.prototype);
+  _initNativeReadableShell(shell, native);
+  return shell;
 }
 
 const NUM_TRANSFORMS = 3;
@@ -201,6 +215,55 @@ export default {
         const writable = new NativeWritableStream(
           { write(c) { bytesWritten += c.length; } },
           new ByteLengthQueuingStrategy({ highWaterMark }),
+        );
+        const ac = new AbortController();
+        await stream.pipeTo(writable, { signal: ac.signal });
+        return { bytesProcessed: bytesWritten };
+      },
+    },
+    {
+      name: 'fast-native-bridge',
+      fn: async ({ chunkSize, totalBytes, highWaterMark }) => {
+        const chunk = makeChunk(chunkSize);
+        const countHWM = Math.max(1, Math.ceil(highWaterMark / chunkSize));
+        // Native source wrapped as kNativeOnly shell — triggers _bridgeNativeToFast
+        // at first pipeThrough, then downstream uses Node.js pipeline (Tier 0)
+        let stream = createNativeOnlyShell(chunk, totalBytes);
+        for (let i = 0; i < NUM_TRANSFORMS; i++) {
+          stream = stream.pipeThrough(new FastTransformStream(
+            {},
+            { highWaterMark: countHWM },
+            { highWaterMark: countHWM },
+          ));
+        }
+        let bytesWritten = 0;
+        const writable = new FastWritableStream(
+          { write(c) { bytesWritten += c.length; } },
+          { highWaterMark: countHWM },
+        );
+        await stream.pipeTo(writable);
+        return { bytesProcessed: bytesWritten };
+      },
+    },
+    {
+      name: 'fast-native-bridge-signal',
+      fn: async ({ chunkSize, totalBytes, highWaterMark }) => {
+        const chunk = makeChunk(chunkSize);
+        const countHWM = Math.max(1, Math.ceil(highWaterMark / chunkSize));
+        // Native source wrapped as kNativeOnly shell + signal — triggers bridge,
+        // then Tier 0.5 (specPipeTo per hop with batch write optimization)
+        let stream = createNativeOnlyShell(chunk, totalBytes);
+        for (let i = 0; i < NUM_TRANSFORMS; i++) {
+          stream = stream.pipeThrough(new FastTransformStream(
+            {},
+            { highWaterMark: countHWM },
+            { highWaterMark: countHWM },
+          ));
+        }
+        let bytesWritten = 0;
+        const writable = new FastWritableStream(
+          { write(c) { bytesWritten += c.length; } },
+          { highWaterMark: countHWM },
         );
         const ac = new AbortController();
         await stream.pipeTo(writable, { signal: ac.signal });

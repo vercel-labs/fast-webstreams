@@ -10,15 +10,17 @@ Throughput at 1KB chunks, 100MB total (Node.js v22, Apple Silicon). This measure
 
 | | Node.js streams | fast-webstreams | Native WebStreams |
 |---|---|---|---|
-| **read loop** | 24,150 MB/s | **11,828 MB/s** | 3,332 MB/s |
-| **write loop** | 24,335 MB/s | **5,655 MB/s** | 2,361 MB/s |
-| **transform (pipeThrough)** | 8,842 MB/s | **6,770 MB/s** | 643 MB/s |
-| **pipeTo** | 15,960 MB/s | **2,657 MB/s** | 1,308 MB/s |
+| **read loop** | 18,913 MB/s | **9,874 MB/s** | 2,450 MB/s |
+| **write loop** | 18,142 MB/s | **4,245 MB/s** | 1,827 MB/s |
+| **transform (pipeThrough)** | 6,108 MB/s | **4,620 MB/s** | 461 MB/s |
+| **pipeTo** | 11,149 MB/s | **1,959 MB/s** | 1,007 MB/s |
+| **fetch bridge** | -- | **666 MB/s** | 201 MB/s |
 
-- **read loop is 3.5x faster than native WebStreams** -- synchronous reads from the Node.js buffer return `Promise.resolve()` with no event loop round-trip
-- **write loop is 2.4x faster than native WebStreams** -- direct sink calls bypass Node.js Writable, replacing the `process.nextTick()` deferral with a single microtask
-- **transform is 10.5x faster than native WebStreams** -- the Tier 0 pipeline path uses Node.js `pipeline()` internally with zero Promise allocations, reaching 77% of raw Node.js transform pipeline throughput
-- **pipeTo is 2.0x faster than native WebStreams** -- benefits from both the fast read path and the direct sink write path
+- **read loop is 4.0x faster than native WebStreams** -- synchronous reads from the Node.js buffer return `Promise.resolve()` with no event loop round-trip
+- **write loop is 2.3x faster than native WebStreams** -- direct sink calls bypass Node.js Writable, replacing the `process.nextTick()` deferral with a single microtask
+- **transform is 10.0x faster than native WebStreams** -- the Tier 0 pipeline path uses Node.js `pipeline()` internally with zero Promise allocations, reaching 76% of raw Node.js transform pipeline throughput
+- **pipeTo is 1.9x faster than native WebStreams** -- write batching calls the sink directly during the sync read loop, reducing N promises to 1 per batch
+- **fetch bridge is 3.3x faster than native WebStreams** -- native byte stream sources (from `fetch()`) are bridged to Fast with batched reads, enabling Node.js pipeline for downstream transforms
 
 When your transform does real work (CPU, I/O), the streaming overhead becomes negligible and all implementations converge. These benchmarks intentionally measure the worst case: tiny chunks, no-op transforms, pure overhead.
 
@@ -100,7 +102,7 @@ Node.js WebStreams are slow. The built-in implementation is written in pure Java
 
 `fast-webstreams` solves this by using Node.js native streams (`Readable`, `Writable`, `Transform`) as the actual data transport. These are implemented in C++ within Node.js and have been optimized over a decade. The WHATWG API is a thin adapter layer on top.
 
-The result: `reader.read()` loops run approximately 3.5x faster than native WebStreams, and `pipeThrough` chains operate within 10% of raw Node.js stream performance at 1KB+ chunk sizes.
+The result: `reader.read()` loops run approximately 4x faster than native WebStreams, and `pipeThrough` chains operate within 25% of raw Node.js stream performance at 1KB+ chunk sizes.
 
 ## Architecture: Three Tiers
 
@@ -142,7 +144,7 @@ Operations that need full spec compliance or interact with native WebStreams fal
 
 Byte streams use a lightweight `LiteReadable` buffer (faster than Node.js `Readable` for construction and sync reads). Byte streams without a `pull` callback -- the React Flight / Server Components pattern of `start(c) { ctrl = c }` + external `enqueue` -- run entirely on the fast path.
 
-Byte streams with `pull` callbacks (e.g. from `fetch()` response bodies via `patchGlobalWebStreams()`) use a native `ReadableByteStreamController` internally for pull coordination, since Node.js's `fetch` implementation (undici) depends on C++ internal slots of the native controller. The data is then bridged to a Fast shell so downstream `pipeThrough` and `pipeTo` operations still use the fast path.
+Byte streams with `pull` callbacks (e.g. from `fetch()` response bodies via `patchGlobalWebStreams()`) use a standalone BYOB reader implementation with pull coordination via `LiteReadable`. When a native byte stream (from `fetch()` / undici) flows through `pipeThrough`, the library **bridges** it to a Fast stream by reading from the native reader and enqueuing into a Fast controller. The bridge uses **batched reads** -- within a single pull call, it chains multiple native `reader.read()` calls while HWM headroom exists, eliminating the pull coordinator roundtrip between consecutive chunks. This makes the bridge path 3.3x faster than native WebStreams, while downstream transforms use the zero-promise Node.js pipeline.
 
 ## Fast Path vs Compat Mode
 
@@ -175,7 +177,7 @@ while (true) {
 }
 ```
 
-`reader.read()` performs a synchronous `nodeReadable.read()` from the Node.js internal buffer. When data is already buffered, it returns `Promise.resolve({ value, done })` with no event loop round-trip. This path is approximately 3.5x faster than native `ReadableStream`.
+`reader.read()` performs a synchronous `nodeReadable.read()` from the Node.js internal buffer. When data is already buffered, it returns `Promise.resolve({ value, done })` with no event loop round-trip. This path is approximately 4x faster than native `ReadableStream`.
 
 **2. pipeThrough with FastTransformStream (Tier 0 -- Node.js pipeline)**
 
@@ -207,7 +209,7 @@ const sink = new FastWritableStream({
 await source.pipeThrough(transform).pipeTo(sink);
 ```
 
-When all streams in a `pipeThrough` / `pipeTo` chain are Fast streams with default options, `fast-webstreams` builds a single `pipeline()` call across the entire chain. Data flows through Node.js C++ internals with zero Promise allocations. This is approximately 10.5x faster than native `pipeThrough` at 1KB chunk sizes.
+When all streams in a `pipeThrough` / `pipeTo` chain are Fast streams with default options, `fast-webstreams` builds a single `pipeline()` call across the entire chain. Data flows through Node.js C++ internals with zero Promise allocations. This is approximately 10x faster than native `pipeThrough` at 1KB chunk sizes.
 
 **3. WritableStream with simple write sink (Tier 1 -- direct dispatch)**
 
@@ -341,9 +343,11 @@ The reader registers `end`, `error`, and `close` lifecycle listeners at construc
 
 All user-provided callbacks (`pull`, `write`, `transform`, `flush`, `cancel`, `abort`) are invoked via `Reflect.apply(fn, thisArg, args)` rather than `fn.call(thisArg, ...args)`. This is required because WPT tests monkey-patch `Function.prototype.call` to verify that implementations do not use `.call()`.
 
-### Spec-Compliant pipeTo
+### Spec-Compliant pipeTo with Write Batching
 
 The `specPipeTo` implementation follows the WHATWG `ReadableStreamPipeTo` algorithm directly: it acquires a reader and writer, pumps chunks in a loop, and handles error propagation, cancellation, and abort signal semantics. The Tier 0 pipeline fast path is only used for `pipeThrough` chains (where upstream links are set), never for standalone `pipeTo`, because Node.js `pipeline()` does not match WHATWG error propagation semantics.
+
+When both source and destination are Fast streams, `specPipeTo` uses a **write batching** optimization: instead of calling `writer.write()` per chunk (which allocates a Promise, a writeRequest object, and a microtask deferral each), it calls the sink's `write()` function directly via `Reflect.apply` during the sync read loop. For sync sinks, this reduces N promises to 1 per batch (up to HWM chunks). The writable's `kInFlightWriteRequest` sentinel is set during the batch to maintain correct state machine invariants. Error identity is preserved -- thrown errors go through `controller.error()` with the original error object.
 
 ## WPT Compliance
 
@@ -458,7 +462,7 @@ test/
 
 bench/
   run.js              Benchmark entry point
-  scenarios/          passthrough, transform-cpu, compression, backpressure, chunk-accumulation
+  scenarios/          passthrough, transform-cpu, compression, backpressure, chunk-accumulation, fetch-bridge
   results/            Timestamped JSON + Markdown reports
 
 vendor/wpt/streams/   Web Platform Test files

@@ -205,9 +205,16 @@ function _bridgeNativeToFast(nativeOnlyStream) {
   const nativeReader = nativeStream.getReader();
   return new FastReadableStream({
     pull(controller) {
-      return nativeReader.read().then(({ value, done }) => {
-        if (done) controller.close();
-        else controller.enqueue(value);
+      return nativeReader.read().then(function pump({ value, done }) {
+        if (done) { controller.close(); return; }
+        controller.enqueue(value);
+        // Batch: drain native reader while HWM headroom exists.
+        // Chains reads within a single pull call, eliminating the
+        // pull coordinator roundtrip (queueMicrotask + read(0) + pullFn)
+        // between consecutive chunks.
+        if (controller.desiredSize > 0) {
+          return nativeReader.read().then(pump);
+        }
       });
     },
     cancel(reason) {

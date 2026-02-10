@@ -10,6 +10,9 @@ import { kLock, kNodeReadable, noop } from './utils.js';
 const DONE_RESULT = { value: undefined, done: true };
 const DONE_PROMISE = Promise.resolve(DONE_RESULT);
 
+// Sentinel for _readSyncRaw() — signals end-of-stream without object allocation
+export const READ_DONE = Symbol('READ_DONE');
+
 function _resolveReadResult(value, done) {
   if (done) return DONE_PROMISE;
   return Promise.resolve({ value, done: false });
@@ -318,6 +321,27 @@ export class FastReadableStreamDefaultReader {
       return { value: chunk, done: false };
     }
     if (nodeReadable.readableEnded) return DONE_RESULT;
+    return null;
+  }
+
+  /**
+   * Raw sync read — returns the chunk directly, READ_DONE for end-of-stream,
+   * or null if no data is available. Avoids {value, done} object allocation.
+   * Used by specPipeTo batch path.
+   */
+  _readSyncRaw() {
+    if (this.#released) return null;
+    const stream = this.#stream;
+    if (stream._errored) return null;
+    const nodeReadable = this.#nodeReadable;
+    if (nodeReadable.errored || nodeReadable.destroyed) return null;
+    const chunk = nodeReadable.read();
+    if (chunk !== null) {
+      if (stream._controller && stream._controller[kDequeueBytes]) stream._controller[kDequeueBytes](chunk);
+      if (stream._onPull) stream._onPull();
+      return chunk;
+    }
+    if (nodeReadable.readableEnded) return READ_DONE;
     return null;
   }
 

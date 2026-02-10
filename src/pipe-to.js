@@ -10,7 +10,8 @@
  */
 
 import { isThenable, kLock, kNodeReadable, kStoredError, kWritableState, noop, RESOLVED_UNDEFINED, _stats } from './utils.js';
-import { kInFlightWriteRequest, kWriteRequests, kStarted, kCloseRequest, kInFlightCloseRequest, _advanceQueueIfNeeded } from './writable.js';
+import { kInFlightWriteRequest, kWriteRequests, kStarted, kCloseRequest, kInFlightCloseRequest, _advanceQueueIfNeeded, _getDesiredSize } from './writable.js';
+import { READ_DONE } from './reader.js';
 
 /**
  * Wait for a write promise to settle, resolving to undefined regardless of outcome.
@@ -174,10 +175,22 @@ export function specPipeTo(source, dest, options = {}) {
     // --- Pump loop ---
     pipeLoop();
 
+    // Re-enter pump after backpressure or batch completion.
+    // For batch-eligible dests, bypass writer.desiredSize getter (avoids
+    // released-check + brand-check + _getDesiredSize indirection per call).
     function pipeLoop() {
       if (shuttingDown) return;
 
-      if (writer.desiredSize > 0) {
+      if (hasBatchWrite) {
+        const ds = _getDesiredSize(dest);
+        if (ds !== null && ds > 0) {
+          pumpRead();
+        } else {
+          writer.ready.then(() => {
+            if (!shuttingDown) pumpRead();
+          }, noop);
+        }
+      } else if (writer.desiredSize > 0) {
         pumpRead();
       } else {
         writer.ready.then(() => {
@@ -204,6 +217,20 @@ export function specPipeTo(source, dest, options = {}) {
       }
     }
 
+    // Batch-aware re-entry: after clearing the sentinel, check desiredSize
+    // directly and call pumpRead() without going through pipeLoop overhead.
+    function batchReenter() {
+      if (shuttingDown) return;
+      const ds = _getDesiredSize(dest);
+      if (ds !== null && ds > 0) {
+        pumpRead();
+      } else {
+        writer.ready.then(() => {
+          if (!shuttingDown) pumpRead();
+        }, noop);
+      }
+    }
+
     function pumpRead() {
       if (shuttingDown) return;
 
@@ -211,103 +238,105 @@ export function specPipeTo(source, dest, options = {}) {
       // Drains all available buffered chunks in one go before yielding to the
       // microtask queue, amortizing the yield cost across multiple chunks.
       if (hasSyncRead) {
-        let syncResult = reader._readSync();
 
         // Batch write path: when both reader and writer are Fast, bypass writer.write()
-        // and call the sink directly. Reduces N promises to 1 per batch.
-        if (syncResult !== null && hasBatchWrite &&
+        // and call the sink directly. Uses _readSyncRaw() to avoid {value, done}
+        // object allocation per chunk. Reduces N promises to 1 per batch.
+        if (hasBatchWrite &&
             dest[kStarted] &&
             dest[kWritableState] === 'writable' &&
             !dest[kInFlightWriteRequest] &&
             dest[kWriteRequests].length === 0 &&
             !dest[kCloseRequest]) {
-          // Set sentinel to block concurrent writes from _advanceQueueIfNeeded
-          dest[kInFlightWriteRequest] = true;
 
-          let batchCount = 0;
-          const hwm = dest._hwm;
+          let chunk = reader._readSyncRaw();
+          if (chunk !== null) {
+            // Set sentinel to block concurrent writes from _advanceQueueIfNeeded
+            dest[kInFlightWriteRequest] = true;
 
-          batch_loop:
-          while (syncResult !== null) {
-            if (syncResult.done) {
-              // Clear sentinel before shutdown
-              dest[kInFlightWriteRequest] = null;
-              pumpClose();
-              return;
-            }
+            let batchCount = 0;
+            const hwm = dest._hwm;
 
-            try {
-              const result = Reflect.apply(sinkWrite, sink, [syncResult.value, ctrl]);
-              if (isThenable(result)) {
-                // Async write — wait for it, then re-enter pipeLoop
-                batchCount++;
-                currentWrite = result.then(
-                  () => {
-                    dest[kInFlightWriteRequest] = null;
-                    const w = dest[kWritableState];
-                    if (w === 'erroring' || w === 'errored') return;
-                    const writer_ = dest[kLock];
-                    if (writer_ && w === 'writable') {
-                      writer_._updateReadyForBackpressure(dest);
-                    }
-                    _advanceQueueIfNeeded(dest);
-                    pipeLoop();
-                  },
-                  (err) => {
-                    dest[kInFlightWriteRequest] = null;
-                    // Error identity preserved — controller.error uses original error
-                    ctrl.error(err);
-                  },
-                );
+            while (chunk !== null) {
+              if (chunk === READ_DONE) {
+                dest[kInFlightWriteRequest] = null;
+                pumpClose();
                 return;
               }
-            } catch (err) {
-              dest[kInFlightWriteRequest] = null;
-              ctrl.error(err);
-              return;
-            }
 
-            batchCount++;
-            if (shuttingDown) {
-              dest[kInFlightWriteRequest] = null;
-              return;
-            }
-
-            // Check writable state (may have changed via abort signal, etc.)
-            if (dest[kWritableState] !== 'writable') {
-              dest[kInFlightWriteRequest] = null;
-              return;
-            }
-
-            // Backpressure: stop batch after hwm chunks
-            if (batchCount >= hwm) {
-              break batch_loop;
-            }
-
-            syncResult = reader._readSync();
-          }
-
-          // End of batch (all sync). Clear sentinel and re-enter pipeLoop via microtask.
-          // The microtask deferral allows events (abort signal, errors) to fire between batches.
-          currentWrite = new Promise((resolve) => {
-            queueMicrotask(() => {
-              dest[kInFlightWriteRequest] = null;
-              if (dest[kWritableState] === 'writable') {
-                const writer_ = dest[kLock];
-                if (writer_) {
-                  writer_._updateReadyForBackpressure(dest);
+              try {
+                const result = Reflect.apply(sinkWrite, sink, [chunk, ctrl]);
+                if (isThenable(result)) {
+                  // Async write — wait for it, then re-enter directly
+                  currentWrite = result.then(
+                    () => {
+                      dest[kInFlightWriteRequest] = null;
+                      const w = dest[kWritableState];
+                      if (w === 'erroring' || w === 'errored') return;
+                      const writer_ = dest[kLock];
+                      if (writer_ && w === 'writable') {
+                        writer_._updateReadyForBackpressure(dest);
+                      }
+                      _advanceQueueIfNeeded(dest);
+                      batchReenter();
+                    },
+                    (err) => {
+                      dest[kInFlightWriteRequest] = null;
+                      ctrl.error(err);
+                    },
+                  );
+                  return;
                 }
-                _advanceQueueIfNeeded(dest);
+              } catch (err) {
+                dest[kInFlightWriteRequest] = null;
+                ctrl.error(err);
+                return;
               }
-              resolve();
-              pipeLoop();
+
+              batchCount++;
+              if (shuttingDown) {
+                dest[kInFlightWriteRequest] = null;
+                return;
+              }
+
+              // Check writable state (may have changed via abort signal, etc.)
+              if (dest[kWritableState] !== 'writable') {
+                dest[kInFlightWriteRequest] = null;
+                return;
+              }
+
+              // Backpressure: stop batch after hwm chunks
+              if (batchCount >= hwm) {
+                break;
+              }
+
+              chunk = reader._readSyncRaw();
+            }
+
+            // End of batch (all sync). Clear sentinel and re-enter via microtask.
+            // The microtask deferral allows events (abort signal, errors) to fire between batches.
+            currentWrite = new Promise((resolve) => {
+              queueMicrotask(() => {
+                dest[kInFlightWriteRequest] = null;
+                if (dest[kWritableState] === 'writable') {
+                  const writer_ = dest[kLock];
+                  if (writer_) {
+                    writer_._updateReadyForBackpressure(dest);
+                  }
+                  _advanceQueueIfNeeded(dest);
+                }
+                resolve();
+                batchReenter();
+              });
             });
-          });
-          return;
+            return;
+          }
+          // _readSyncRaw returned null on first call — no sync data, fall through
         }
 
         // Non-batch sync path: use writer.write() per chunk (transform shells, etc.)
         let didSync = false;
+        let syncResult = reader._readSync();
         while (syncResult !== null) {
           if (syncResult.done) {
             pumpClose();
