@@ -76,10 +76,16 @@ function _PatchedReadableStream(underlyingSource, strategy) {
 _PatchedReadableStream.prototype = FastReadableStream.prototype;
 _PatchedReadableStream.from = FastReadableStream.from;
 
-export function patchGlobalWebStreams() {
+export function patchGlobalWebStreams(options) {
+  const opts = options || {};
   globalThis.ReadableStream = _PatchedReadableStream;
   globalThis.WritableStream = FastWritableStream;
-  globalThis.TransformStream = FastTransformStream;
+  // TransformStream patching is optional — Next.js chains 5-8 transforms per
+  // SSR request (buffered, metadata, flight injection, etc.) and native C++
+  // TransformStream handles passthrough transforms faster than Node.js Transform.
+  if (!opts.skipTransform) {
+    globalThis.TransformStream = FastTransformStream;
+  }
   globalThis.ByteLengthQueuingStrategy = NativeByteLengthQueuingStrategy;
   globalThis.CountQueuingStrategy = NativeCountQueuingStrategy;
 
@@ -102,15 +108,17 @@ export function patchGlobalWebStreams() {
     },
     configurable: true,
   });
-  Object.defineProperty(NativeTransformStream, Symbol.hasInstance, {
-    value(instance) {
-      if (_origHasInstanceTS) {
-        try { if (_origHasInstanceTS.value.call(NativeTransformStream, instance)) return true; } catch {}
-      }
-      return instance instanceof FastTransformStream || isFastTransform(instance);
-    },
-    configurable: true,
-  });
+  if (!opts.skipTransform) {
+    Object.defineProperty(NativeTransformStream, Symbol.hasInstance, {
+      value(instance) {
+        if (_origHasInstanceTS) {
+          try { if (_origHasInstanceTS.value.call(NativeTransformStream, instance)) return true; } catch {}
+        }
+        return instance instanceof FastTransformStream || isFastTransform(instance);
+      },
+      configurable: true,
+    });
+  }
 }
 
 /**
