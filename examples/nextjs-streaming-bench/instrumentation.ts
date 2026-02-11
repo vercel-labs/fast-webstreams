@@ -8,7 +8,7 @@ export async function register() {
   const cwd = process.cwd();
   const candidates = [join(cwd, ".next/server/app/bench-fast")];
 
-  if (candidates.some((p) => existsSync(p))) {
+  if (process.env.FAST_STREAMS !== "0" && candidates.some((p) => existsSync(p))) {
     const { patchGlobalWebStreams } = await import(
       "experimental-fast-webstreams"
     );

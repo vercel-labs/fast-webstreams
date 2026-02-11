@@ -3,3 +3,4 @@ bench/results/*.json
 bench/results/*.md
 todo/
 .vercel
+.next/

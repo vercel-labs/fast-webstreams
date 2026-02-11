@@ -144,6 +144,36 @@ async function runIteration(
       await consumeReader(stream);
       break;
     }
+    case "nextjs-ssr": {
+      // Real Next.js pattern: React Fizz byte stream (type:'bytes', pull,
+      // HWM:0) → 8 transform chain → pipeTo writable sink.
+      let n = 0;
+      const source = new RS(
+        {
+          type: "bytes",
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          pull(controller: any) {
+            if (n >= config.chunks) {
+              controller.close();
+              return;
+            }
+            controller.enqueue(new Uint8Array(data));
+            n++;
+          },
+        },
+        { highWaterMark: 0 }
+      );
+      // Chain 8 transforms (Next.js: buffered, metadata, flight, head, etc.)
+      let stream = source;
+      for (let t = 0; t < 8; t++) {
+        stream = stream.pipeThrough(makeTransform());
+      }
+      // Consume via pipeTo (simulates HTTP response writer)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const sink = new WS({ write(chunk: any) { bytes += chunk.byteLength; } });
+      await stream.pipeTo(sink);
+      break;
+    }
     default:
       await consumeReader(makeSource());
   }
