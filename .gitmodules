@@ -1,0 +1,6 @@
+[submodule "vendor/wpt"]
+	path = vendor/wpt
+	url = git@github.com:web-platform-tests/wpt.git
+[submodule "vendor/cf-vs-vercel-bench"]
+	path = vendor/cf-vs-vercel-bench
+	url = git@github.com:t3dotgg/cf-vs-vercel-bench.git
