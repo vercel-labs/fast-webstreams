@@ -1,11 +1,10 @@
-import { patchGlobalWebStreams } from "experimental-fast-webstreams";
 import { connection } from "next/server";
 import BenchPage from "../bench-shared";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 122;
 
-patchGlobalWebStreams();
+// Patching handled by instrumentation.ts (detects bench-fast dir)
 
 export default async function Page({
   searchParams,
