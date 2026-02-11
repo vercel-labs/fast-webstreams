@@ -723,22 +723,59 @@ export class FastReadableStream {
       return materializeReadable(this).getReader();
     }
 
-    // Resolve upstream chain: start specPipeTo for each deferred hop
-    // (same logic as pipeTo Tier 0.5, needed when getReader() is called
-    // on the result of pipeThrough instead of pipeTo)
+    // Resolve upstream chain when getReader() is called on pipeThrough result.
+    // Prefer Tier 0 (Node.js pipeline) over specPipeTo — pipeline processes
+    // chunks without Promise chains (~3.5µs saved per chunk).
     if (this[kUpstream]) {
-      _stats.tier05_upstream++;
-      const hops = [];
-      let current = this;
-      while (current[kUpstream]) {
-        hops.push({ source: current[kUpstream], writable: current._upstreamWritable });
-        const next = current[kUpstream];
-        current[kUpstream] = null; // Clear ALL upstream links to prevent double-locking
-        current = next;
+      // Check if we can use pipeline (no byte sources — LiteReadable lacks pipe/flowing)
+      let hasByteSource = false;
+      let cur = this;
+      while (cur) {
+        if (cur._isByteStream) { hasByteSource = true; break; }
+        cur = cur[kUpstream];
       }
-      for (const hop of hops) {
-        if (hop.source && hop.writable) {
-          specPipeTo(hop.source, hop.writable, {}).catch(noop);
+
+      if (!hasByteSource) {
+        // Tier 0 for getReader: build pipeline chain, data flows into last
+        // transform's Node buffer. Reader reads from there (Tier 1 sync).
+        _stats.tier0_pipeline++;
+        const chain = [];
+        let current = this;
+        while (current) {
+          chain.push(current[kNodeReadable]);
+          current = current[kUpstream];
+        }
+        chain.reverse();
+        // Clear all upstream links
+        current = this;
+        while (current[kUpstream]) {
+          const next = current[kUpstream];
+          current[kUpstream] = null;
+          current._upstreamWritable = null;
+          current = next;
+        }
+        // Start pipeline — data flows source → transforms → last transform's buffer
+        pipeline(chain, (err) => {
+          if (err) {
+            this._errored = true;
+            this._storedError = err;
+          }
+        });
+      } else {
+        // Fallback: specPipeTo for each hop (byte streams can't use pipeline)
+        _stats.tier05_upstream++;
+        const hops = [];
+        let current = this;
+        while (current[kUpstream]) {
+          hops.push({ source: current[kUpstream], writable: current._upstreamWritable });
+          const next = current[kUpstream];
+          current[kUpstream] = null;
+          current = next;
+        }
+        for (const hop of hops) {
+          if (hop.source && hop.writable) {
+            specPipeTo(hop.source, hop.writable, {}).catch(noop);
+          }
         }
       }
     }
