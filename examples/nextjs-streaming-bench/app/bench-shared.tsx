@@ -3,11 +3,16 @@ import { Suspense } from "react";
 async function DataSection({
   id,
   rowCount,
+  delayMs,
 }: {
   id: number;
   rowCount: number;
+  delayMs: number;
 }) {
-  await Promise.resolve();
+  // Real setTimeout to force React to flush separate streaming chunks.
+  // Stagger by id so components resolve at different ticks — without this
+  // React batches everything into one chunk and stream overhead disappears.
+  await new Promise((r) => setTimeout(r, delayMs));
 
   const rows = Array.from({ length: rowCount }, (_, j) => {
     const idx = id * rowCount + j;
@@ -41,24 +46,38 @@ async function DataSection({
 export default async function BenchPage({
   searchParams,
 }: {
-  searchParams: Promise<{ n?: string; rows?: string }>;
+  searchParams: Promise<{
+    n?: string;
+    rows?: string;
+    delay?: string;
+    groups?: string;
+  }>;
 }) {
-  const { n, rows } = await searchParams;
-  const count = Math.min(parseInt(n || "100"), 500);
-  const rowCount = Math.min(parseInt(rows || "20"), 100);
+  const params = await searchParams;
+  const count = Math.min(parseInt(params.n || "200"), 500);
+  const rowCount = Math.min(parseInt(params.rows || "20"), 100);
+  // How many distinct resolution times (spreads components across ticks)
+  const groups = Math.min(parseInt(params.groups || "50"), count);
+  // Base delay per group in ms
+  const delay = Math.max(parseInt(params.delay || "1"), 1);
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 p-8 max-w-4xl mx-auto">
       <h1 className="text-2xl font-bold mb-1">Streaming Benchmark</h1>
       <p className="text-zinc-500 text-sm mb-6">
-        {count} Suspense boundaries x {rowCount} rows each
+        {count} Suspense boundaries x {rowCount} rows | {groups} groups x{" "}
+        {delay}ms delay
       </p>
       {Array.from({ length: count }, (_, i) => (
         <Suspense
           key={i}
           fallback={<div className="mb-2 h-4 bg-zinc-900 rounded" />}
         >
-          <DataSection id={i} rowCount={rowCount} />
+          <DataSection
+            id={i}
+            rowCount={rowCount}
+            delayMs={(i % groups) * delay + 1}
+          />
         </Suspense>
       ))}
     </div>

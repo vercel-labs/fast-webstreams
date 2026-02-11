@@ -557,8 +557,8 @@ function computePageStats(results: PageResult[]): PageStats {
 }
 
 function PageStreamingBenchmark() {
-  const [nativeUrl, setNativeUrl] = useState("/bench-native?n=100&rows=20");
-  const [fastUrl, setFastUrl] = useState("/bench-fast?n=100&rows=20");
+  const [nativeUrl, setNativeUrl] = useState("/bench-native?n=200&rows=20&groups=50&delay=1");
+  const [fastUrl, setFastUrl] = useState("/bench-fast?n=200&rows=20&groups=50&delay=1");
   const [iterations, setIterations] = useState(10);
   const [warmup, setWarmup] = useState(2);
   const [running, setRunning] = useState(false);
