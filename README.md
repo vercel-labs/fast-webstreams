@@ -1,6 +1,6 @@
 # experimental-fast-webstreams
 
-WHATWG WebStreams API (`ReadableStream`, `WritableStream`, `TransformStream`) backed by Node.js native streams for dramatically better performance.
+WHATWG WebStreams API (`ReadableStream`, `WritableStream`, `TransformStream`) backed by Node.js native streams for substantially better performance.
 
 Node.js ships a pure-JavaScript implementation of the WHATWG Streams spec. Every `reader.read()` allocates promises, every `pipeTo()` builds a chain of microtasks, and every chunk traverses a full JavaScript-level queue. `fast-webstreams` replaces this machinery with Node.js native streams (`Readable`, `Writable`, `Transform`) under the hood, while exposing the same WHATWG API surface.
 
