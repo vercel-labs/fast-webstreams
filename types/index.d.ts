@@ -50,8 +50,14 @@ export declare const FastWritableStreamDefaultWriter: {
   prototype: WritableStreamDefaultWriter;
 };
 
+export interface PatchOptions {
+  /** Keep TransformStream native. Recommended for Next.js where native C++
+   *  handles the 5-8 chained SSR transforms faster than Node.js Transform. */
+  skipTransform?: boolean;
+}
+
 /** Replace global ReadableStream, WritableStream, TransformStream with fast alternatives. */
-export declare function patchGlobalWebStreams(): void;
+export declare function patchGlobalWebStreams(options?: PatchOptions): void;
 
 /** Restore the original native stream constructors. */
 export declare function unpatchGlobalWebStreams(): void;
