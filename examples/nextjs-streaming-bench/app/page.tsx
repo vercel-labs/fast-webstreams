@@ -591,29 +591,32 @@ function PageStreamingBenchmark() {
     setFastStats(null);
     abortRef.current = new AbortController();
 
-    const total = (warmup + iterations) * 2;
-    let step = 0;
+    const totalRounds = warmup + iterations;
 
-    // Native
+    // Warmup both endpoints
+    for (let i = 0; i < warmup; i++) {
+      setProgress(`Warming up... (${i + 1}/${warmup})`);
+      await measurePage(nativeUrl);
+      await measurePage(fastUrl);
+    }
+
+    // Interleave: alternate native/fast to eliminate ordering bias
+    // (GC pressure, thermal throttling, memory fragmentation)
     const nativeResults: PageResult[] = [];
-    for (let i = 0; i < warmup + iterations; i++) {
-      step++;
-      setProgress(`Warming up native... (${step}/${total})`);
-      if (i >= warmup) setProgress(`Running native... (${step}/${total})`);
-      const r = await measurePage(nativeUrl);
-      if (i >= warmup) nativeResults.push(r);
-    }
-    setNativeStats(computePageStats(nativeResults));
-
-    // Fast
     const fastResults: PageResult[] = [];
-    for (let i = 0; i < warmup + iterations; i++) {
-      step++;
-      setProgress(`Warming up fast... (${step}/${total})`);
-      if (i >= warmup) setProgress(`Running fast... (${step}/${total})`);
-      const r = await measurePage(fastUrl);
-      if (i >= warmup) fastResults.push(r);
+    for (let i = 0; i < iterations; i++) {
+      setProgress(`Running ${i + 1}/${iterations}...`);
+      // Alternate which goes first each iteration
+      if (i % 2 === 0) {
+        nativeResults.push(await measurePage(nativeUrl));
+        fastResults.push(await measurePage(fastUrl));
+      } else {
+        fastResults.push(await measurePage(fastUrl));
+        nativeResults.push(await measurePage(nativeUrl));
+      }
     }
+
+    setNativeStats(computePageStats(nativeResults));
     setFastStats(computePageStats(fastResults));
 
     setRunning(false);

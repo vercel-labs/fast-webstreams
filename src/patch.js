@@ -55,8 +55,17 @@ function _PatchedReadableStream(underlyingSource, strategy) {
     const shell = Object.create(native);
     _initNativeReadableShell(shell, native);
     shell.getReader = function(opts) { return FastReadableStream.prototype.getReader.call(this, opts); };
-    shell.pipeTo = function(dest, opts) { return FastReadableStream.prototype.pipeTo.call(this, dest, opts); };
-    shell.pipeThrough = function(t, opts) { return FastReadableStream.prototype.pipeThrough.call(this, t, opts); };
+    // Delegate to native when counterpart isn't Fast — this shell has native
+    // internal slots (via Object.create) so native pipeThrough/pipeTo work.
+    // Fast's specPipeTo doesn't stream correctly with native writable targets.
+    shell.pipeTo = function(dest, opts) {
+      if (!isFastWritable(dest)) return NativeReadableStream.prototype.pipeTo.call(this, dest, opts);
+      return FastReadableStream.prototype.pipeTo.call(this, dest, opts);
+    };
+    shell.pipeThrough = function(t, opts) {
+      if (!isFastTransform(t)) return NativeReadableStream.prototype.pipeThrough.call(this, t, opts);
+      return FastReadableStream.prototype.pipeThrough.call(this, t, opts);
+    };
     shell.tee = function() { return FastReadableStream.prototype.tee.call(this); };
     shell.cancel = function(r) { return FastReadableStream.prototype.cancel.call(this, r); };
     shell._cancelInternal = FastReadableStream.prototype._cancelInternal;
@@ -79,10 +88,9 @@ _PatchedReadableStream.from = FastReadableStream.from;
 export function patchGlobalWebStreams(options) {
   const opts = options || {};
   globalThis.ReadableStream = _PatchedReadableStream;
-  globalThis.WritableStream = FastWritableStream;
-  // TransformStream patching is optional — Next.js chains 5-8 transforms per
-  // SSR request (buffered, metadata, flight injection, etc.) and native C++
-  // TransformStream handles passthrough transforms faster than Node.js Transform.
+  if (!opts.skipWritable) {
+    globalThis.WritableStream = FastWritableStream;
+  }
   if (!opts.skipTransform) {
     globalThis.TransformStream = FastTransformStream;
   }
@@ -99,15 +107,17 @@ export function patchGlobalWebStreams(options) {
     },
     configurable: true,
   });
-  Object.defineProperty(NativeWritableStream, Symbol.hasInstance, {
-    value(instance) {
-      if (_origHasInstanceWS) {
-        try { if (_origHasInstanceWS.value.call(NativeWritableStream, instance)) return true; } catch {}
-      }
-      return instance instanceof FastWritableStream || isFastWritable(instance);
-    },
-    configurable: true,
-  });
+  if (!opts.skipWritable) {
+    Object.defineProperty(NativeWritableStream, Symbol.hasInstance, {
+      value(instance) {
+        if (_origHasInstanceWS) {
+          try { if (_origHasInstanceWS.value.call(NativeWritableStream, instance)) return true; } catch {}
+        }
+        return instance instanceof FastWritableStream || isFastWritable(instance);
+      },
+      configurable: true,
+    });
+  }
   if (!opts.skipTransform) {
     Object.defineProperty(NativeTransformStream, Symbol.hasInstance, {
       value(instance) {

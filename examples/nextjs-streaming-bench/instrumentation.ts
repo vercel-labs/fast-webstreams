@@ -12,11 +12,8 @@ export async function register() {
     const { patchGlobalWebStreams } = await import(
       "experimental-fast-webstreams"
     );
-    // skipTransform: Next.js chains 5-8 TransformStreams per SSR request
-    // (buffered, metadata, flight injection, etc.) — native C++ handles
-    // these faster than Node.js Transform wrapping.
-    patchGlobalWebStreams({ skipTransform: true });
-    console.log("[fast-webstreams] patched globals (skipTransform)");
+    patchGlobalWebStreams();
+    console.log("[fast-webstreams] patched globals");
   } else {
     console.log("[fast-webstreams] not patched (bench-fast not found)");
   }

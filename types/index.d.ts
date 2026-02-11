@@ -54,6 +54,9 @@ export interface PatchOptions {
   /** Keep TransformStream native. Recommended for Next.js where native C++
    *  handles the 5-8 chained SSR transforms faster than Node.js Transform. */
   skipTransform?: boolean;
+  /** Keep WritableStream native. Should be set when skipTransform is true,
+   *  since native pipeTo needs real native WritableStream internal slots. */
+  skipWritable?: boolean;
 }
 
 /** Replace global ReadableStream, WritableStream, TransformStream with fast alternatives. */
