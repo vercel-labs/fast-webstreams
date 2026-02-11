@@ -3,31 +3,29 @@ import { Suspense } from "react";
 export const dynamic = "force-dynamic";
 export const maxDuration = 123;
 
-async function DataSection({ id }: { id: number }) {
-  // Force async boundary — each resolves on a separate tick to create streaming chunks
-  await new Promise((r) => setTimeout(r, 0));
+// Minimal async yield — just enough to trigger Suspense streaming
+// without adding timer latency that would dwarf stream overhead.
+async function DataSection({ id, rowCount }: { id: number; rowCount: number }) {
+  await Promise.resolve();
 
-  const rows = Array.from({ length: 10 }, (_, j) => ({
-    name: `Item ${id * 10 + j}`,
-    value: (Math.random() * 1000).toFixed(2),
-    status: ["active", "pending", "complete"][j % 3],
-    ts: Date.now(),
-  }));
+  const rows = Array.from({ length: rowCount }, (_, j) => {
+    const idx = id * rowCount + j;
+    return (
+      <tr key={j} className="border-b border-zinc-800">
+        <td className="py-1 pr-4">{`Item ${idx}`}</td>
+        <td className="py-1 pr-4 font-mono">{(idx * 7.13).toFixed(2)}</td>
+        <td className="py-1 pr-4">{["active", "pending", "complete"][j % 3]}</td>
+        <td className="py-1 pr-4 font-mono text-zinc-500">{`${idx}-${(idx * 31) % 9999}`}</td>
+        <td className="py-1 font-mono text-zinc-600">{`row-${idx}-data-placeholder-text`}</td>
+      </tr>
+    );
+  });
 
   return (
-    <section className="mb-4">
-      <h2 className="text-lg font-semibold mb-2">Section {id}</h2>
+    <section className="mb-2">
+      <h3 className="text-xs font-semibold text-zinc-500 mb-1">Section {id}</h3>
       <table className="w-full text-sm">
-        <tbody>
-          {rows.map((row, j) => (
-            <tr key={j} className="border-b border-zinc-800">
-              <td className="py-1 pr-4">{row.name}</td>
-              <td className="py-1 pr-4 font-mono">{row.value}</td>
-              <td className="py-1 pr-4">{row.status}</td>
-              <td className="py-1 font-mono text-zinc-500">{row.ts}</td>
-            </tr>
-          ))}
-        </tbody>
+        <tbody>{rows}</tbody>
       </table>
     </section>
   );
@@ -36,25 +34,24 @@ async function DataSection({ id }: { id: number }) {
 export default async function BenchPage({
   searchParams,
 }: {
-  searchParams: Promise<{ n?: string }>;
+  searchParams: Promise<{ n?: string; rows?: string }>;
 }) {
-  const { n } = await searchParams;
-  const count = Math.min(parseInt(n || "50"), 200);
+  const { n, rows } = await searchParams;
+  const count = Math.min(parseInt(n || "100"), 500);
+  const rowCount = Math.min(parseInt(rows || "20"), 100);
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 p-8 max-w-4xl mx-auto">
-      <h1 className="text-2xl font-bold mb-1">Streaming Benchmark Page</h1>
+      <h1 className="text-2xl font-bold mb-1">Streaming Benchmark</h1>
       <p className="text-zinc-500 text-sm mb-6">
-        {count} async Suspense boundaries, each rendering a data table
+        {count} Suspense boundaries x {rowCount} rows each
       </p>
       {Array.from({ length: count }, (_, i) => (
         <Suspense
           key={i}
-          fallback={
-            <div className="mb-4 h-16 bg-zinc-900 rounded animate-pulse" />
-          }
+          fallback={<div className="mb-2 h-4 bg-zinc-900 rounded" />}
         >
-          <DataSection id={i} />
+          <DataSection id={i} rowCount={rowCount} />
         </Suspense>
       ))}
     </div>

@@ -85,6 +85,18 @@ async function runIteration(
     }
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function makeTransform() {
+    // Explicit JS callback — without this, native gets a C++ optimized
+    // identity transform while Fast goes through Node.js Transform machinery.
+    return new TS({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      transform(chunk: any, controller: any) {
+        controller.enqueue(chunk);
+      },
+    });
+  }
+
   const start = performance.now();
 
   switch (config.scenario) {
@@ -93,15 +105,15 @@ async function runIteration(
       break;
     }
     case "pipe-through": {
-      await consumeReader(makeSource().pipeThrough(new TS()));
+      await consumeReader(makeSource().pipeThrough(makeTransform()));
       break;
     }
     case "multi-transform": {
       await consumeReader(
         makeSource()
-          .pipeThrough(new TS())
-          .pipeThrough(new TS())
-          .pipeThrough(new TS())
+          .pipeThrough(makeTransform())
+          .pipeThrough(makeTransform())
+          .pipeThrough(makeTransform())
       );
       break;
     }
@@ -113,19 +125,22 @@ async function runIteration(
       break;
     }
     case "byte-stream": {
-      let i = 0;
+      // React Flight pattern: save controller in start(), enqueue externally
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let ctrl: any;
       const stream = new RS({
         type: "bytes",
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        pull(controller: any) {
-          if (i >= config.chunks) {
-            controller.close();
-            return;
-          }
-          controller.enqueue(new Uint8Array(data));
-          i++;
+        start(controller: any) {
+          ctrl = controller;
         },
       });
+      // Enqueue all chunks, then close
+      for (let j = 0; j < config.chunks; j++) {
+        ctrl.enqueue(new Uint8Array(data));
+      }
+      ctrl.close();
+      // Drain
       await consumeReader(stream);
       break;
     }

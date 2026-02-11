@@ -41,10 +41,10 @@ type Config = {
 
 const SCENARIOS: { id: Scenario; label: string; desc: string }[] = [
   { id: "read-loop", label: "Read Loop", desc: "reader.read() consumption" },
-  { id: "pipe-through", label: "Pipe Through", desc: "1 passthrough transform" },
-  { id: "multi-transform", label: "3x Transform", desc: "3 chained transforms" },
+  { id: "pipe-through", label: "Pipe Through", desc: "1 transform with JS callback" },
+  { id: "multi-transform", label: "3x Transform", desc: "3 chained JS transforms" },
   { id: "pipe-to", label: "Pipe To", desc: "pipeTo() a writable sink" },
-  { id: "byte-stream", label: "Byte Stream", desc: "type: 'bytes' pull-based" },
+  { id: "byte-stream", label: "Byte Stream", desc: "type: 'bytes' start+enqueue" },
 ];
 
 const PRESETS: { name: string; desc: string; config: Partial<Config> }[] = [
@@ -557,8 +557,8 @@ function computePageStats(results: PageResult[]): PageStats {
 }
 
 function PageStreamingBenchmark() {
-  const [nativeUrl, setNativeUrl] = useState("/bench-native?n=50");
-  const [fastUrl, setFastUrl] = useState("/bench-fast?n=50");
+  const [nativeUrl, setNativeUrl] = useState("/bench-native?n=100&rows=20");
+  const [fastUrl, setFastUrl] = useState("/bench-fast?n=100&rows=20");
   const [iterations, setIterations] = useState(10);
   const [warmup, setWarmup] = useState(2);
   const [running, setRunning] = useState(false);
