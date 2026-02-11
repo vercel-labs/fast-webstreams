@@ -6,12 +6,7 @@ export async function register() {
   // On Vercel, split functions only contain their own route files,
   // so bench-fast existing means this IS the fast function.
   const cwd = process.cwd();
-  const candidates = [
-    join(cwd, ".next/server/app/bench-fast"),
-    join(cwd, "app/bench-fast"),
-    // Vercel serverless output
-    join(cwd, ".next/server/chunks/app/bench-fast"),
-  ];
+  const candidates = [join(cwd, ".next/server/app/bench-fast")];
 
   if (candidates.some((p) => existsSync(p))) {
     const { patchGlobalWebStreams } = await import(
@@ -19,5 +14,7 @@ export async function register() {
     );
     patchGlobalWebStreams();
     console.log("[fast-webstreams] patched globals");
+  } else {
+    console.log("[fast-webstreams] not patched (bench-fast not found)");
   }
 }
