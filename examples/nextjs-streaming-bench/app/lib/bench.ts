@@ -98,7 +98,7 @@ async function runIteration(
     });
   }
 
-  const start = performance.now();
+  let start = performance.now();
 
   switch (config.scenario) {
     case "read-loop": {
@@ -182,20 +182,9 @@ async function runIteration(
       const res = await fetch(
         `${config._baseUrl}/api/data?chunks=${config.chunks}&size=${config.size}`
       );
+      start = performance.now(); // measure only body consumption, not fetch latency
       const text = await res.text();
       bytes = text.length;
-      break;
-    }
-    case "fetch-json": {
-      // Pattern: const data = await fetch(url).then(r => r.json())
-      // Uses a small payload since JSON.parse dominates at large sizes
-      const res = await fetch(
-        `${config._baseUrl}/api/data?chunks=${Math.min(config.chunks, 100)}&size=${Math.min(config.size, 256)}`
-      );
-      try {
-        await res.text(); // consume body (not valid JSON, just measure read)
-      } catch { /* expected */ }
-      bytes = Math.min(config.chunks, 100) * Math.min(config.size, 256);
       break;
     }
     case "fetch-stream": {
@@ -203,6 +192,7 @@ async function runIteration(
       const res = await fetch(
         `${config._baseUrl}/api/data?chunks=${config.chunks}&size=${config.size}`
       );
+      start = performance.now();
       await consumeReader(res.body!);
       break;
     }
@@ -217,6 +207,7 @@ async function runIteration(
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         transform(chunk: any, controller: any) { controller.enqueue(chunk); },
       });
+      start = performance.now();
       await consumeReader(res.body!.pipeThrough(ft));
       break;
     }
@@ -236,6 +227,7 @@ async function runIteration(
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         write(chunk: any) { bytes += chunk.byteLength; },
       });
+      start = performance.now();
       await stream.pipeTo(fws);
       break;
     }
