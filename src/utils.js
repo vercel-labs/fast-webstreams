@@ -183,6 +183,11 @@ export class LiteReadable {
     if (!this._listeners) return;
     const arr = this._listeners[event];
     if (!arr || arr.length === 0) return;
+    // Fast path: single non-once listener — no snapshot needed
+    if (arr.length === 1 && !arr[0].once) {
+      arr[0].fn(arg);
+      return;
+    }
     // Snapshot: iterate a copy so once-removal doesn't skip entries
     const snapshot = arr.slice();
     // Remove once entries first
