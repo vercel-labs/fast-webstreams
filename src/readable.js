@@ -113,11 +113,20 @@ function _getAsyncIteratorPrototype() {
   return _readableStreamAsyncIteratorPrototype;
 }
 
-// Brand checks: accept both Fast and native streams
+// Brand checks: accept both Fast and native streams.
+// Must verify internal state, not just prototype chain, because
+// Object.setPrototypeOf(FastReadableStream.prototype, NativeReadableStream.prototype)
+// makes Object.create(FastReadableStream.prototype) pass instanceof NativeReadableStream.
+const _nativeLockedGetter = Object.getOwnPropertyDescriptor(NativeReadableStream.prototype, 'locked')?.get;
 function _isReadableStream(obj) {
   if (obj == null) return false;
   if (typeof obj !== 'object' && typeof obj !== 'function') return false;
-  return isFastReadable(obj) || obj instanceof NativeReadableStream;
+  if (isFastReadable(obj)) return true;
+  // Check for genuine native ReadableStream (has C++ internal slots)
+  if (_nativeLockedGetter) {
+    try { _nativeLockedGetter.call(obj); return true; } catch { return false; }
+  }
+  return obj instanceof NativeReadableStream;
 }
 
 function _isWritableStream(obj) {
@@ -1018,5 +1027,44 @@ export class FastReadableStream {
 
   [Symbol.asyncIterator](options) {
     return this.values(options);
+  }
+}
+
+// Place NativeReadableStream.prototype in the prototype chain so that
+// Function.prototype[Symbol.hasInstance].call(NativeReadableStream, fastInstance)
+// returns true. This satisfies undici's WebIDL brand check on Node 24+
+// (webidl.is.ReadableStream) which uses a prototype chain walk that bypasses
+// our Symbol.hasInstance override.
+Object.setPrototypeOf(FastReadableStream.prototype, NativeReadableStream.prototype);
+
+// Shadow Node.js internal symbols that exist as getters on NativeReadableStream.prototype.
+// These access C++ internal slots and would throw on Fast instances. Undici's extractBody
+// calls isDisturbed/isErrored which read these symbols.
+const _kDisturbed = Symbol.for('nodejs.stream.disturbed');
+const _kErrored = Symbol.for('nodejs.stream.errored');
+const _kReadable = Symbol.for('nodejs.stream.readable');
+
+Object.defineProperty(FastReadableStream.prototype, _kDisturbed, {
+  get() { return this[kLock] !== null; },
+  configurable: true,
+});
+Object.defineProperty(FastReadableStream.prototype, _kErrored, {
+  get() { return this._errored ? (this._storedError || true) : false; },
+  configurable: true,
+});
+Object.defineProperty(FastReadableStream.prototype, _kReadable, {
+  get() { return (this._closed || this._errored) ? false : true; },
+  configurable: true,
+});
+
+// Suppress structured clone/transfer symbols inherited from NativeReadableStream.prototype.
+// Fast streams don't support structured clone transfer — these inherited getters would
+// access C++ internal slots and throw.
+for (const sym of Object.getOwnPropertySymbols(NativeReadableStream.prototype)) {
+  const desc = sym.description;
+  if (desc && (desc.includes('transfer') || desc.includes('deserialize'))) {
+    Object.defineProperty(FastReadableStream.prototype, sym, {
+      value: undefined, configurable: true, writable: true,
+    });
   }
 }

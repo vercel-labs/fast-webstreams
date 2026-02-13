@@ -177,47 +177,87 @@ async function runIteration(
     // --- Fetch scenarios: real fetch() against /api/data endpoint ---
 
     // --- Fetch scenarios ---
-    // Use Response + stream to test the same codepath as fetch().text()
-    // without local-fetch shortcuts. The Response body goes through
-    // the same WebStreams pipeline as a real fetch response.
+    // Real fetch bodies are byte streams (type:'bytes', pull, HWM:0) from
+    // undici. We create matching byte streams, wrap in Response, and test
+    // .text(), .body reader, pipeThrough, pipeTo — the actual patterns.
 
     case "fetch-text": {
-      // Pattern: await response.text()
-      // Tests: ReadableStream → TextDecoder → string concatenation
-      const body = makeSource();
+      // Pattern: await (await fetch(url)).text()
+      let n = 0;
+      const body = new RS(
+        {
+          type: "bytes",
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          pull(controller: any) {
+            if (n >= config.chunks) { controller.close(); return; }
+            controller.enqueue(new Uint8Array(data));
+            n++;
+          },
+        },
+        { highWaterMark: 0 }
+      );
       const response = new Response(body);
       const text = await response.text();
       bytes = text.length;
       break;
     }
     case "fetch-stream": {
-      // Pattern: response.body.getReader() read loop
-      const body = makeSource();
+      // Pattern: (await fetch(url)).body.getReader() read loop
+      let n = 0;
+      const body = new RS(
+        {
+          type: "bytes",
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          pull(controller: any) {
+            if (n >= config.chunks) { controller.close(); return; }
+            controller.enqueue(new Uint8Array(data));
+            n++;
+          },
+        },
+        { highWaterMark: 0 }
+      );
       const response = new Response(body);
       await consumeReader(response.body!);
       break;
     }
     case "fetch-transform": {
-      // Pattern: response.body.pipeThrough(transform) → read
-      const body = makeSource();
+      // Pattern: (await fetch(url)).body.pipeThrough(transform) → read
+      let n = 0;
+      const body = new RS(
+        {
+          type: "bytes",
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          pull(controller: any) {
+            if (n >= config.chunks) { controller.close(); return; }
+            controller.enqueue(new Uint8Array(data));
+            n++;
+          },
+        },
+        { highWaterMark: 0 }
+      );
       const response = new Response(body);
-      const ft = new TS({
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        transform(chunk: any, controller: any) { controller.enqueue(chunk); },
-      });
-      await consumeReader(response.body!.pipeThrough(ft));
+      await consumeReader(response.body!.pipeThrough(makeTransform()));
       break;
     }
     case "fetch-forward": {
-      // Pattern: response.body → 3 transforms → pipeTo sink
-      const body = makeSource();
+      // Pattern: (await fetch(url)).body → 3 transforms → pipeTo sink
+      let n = 0;
+      const body = new RS(
+        {
+          type: "bytes",
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          pull(controller: any) {
+            if (n >= config.chunks) { controller.close(); return; }
+            controller.enqueue(new Uint8Array(data));
+            n++;
+          },
+        },
+        { highWaterMark: 0 }
+      );
       const response = new Response(body);
       let stream: ReadableStream = response.body!;
       for (let t = 0; t < 3; t++) {
-        stream = stream.pipeThrough(new TS({
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          transform(chunk: any, controller: any) { controller.enqueue(chunk); },
-        }));
+        stream = stream.pipeThrough(makeTransform());
       }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const sink = new WS({ write(chunk: any) { bytes += chunk.byteLength; } });

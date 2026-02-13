@@ -24,10 +24,14 @@ import {
 
 import { isFastReadable, isFastWritable, isFastTransform } from './utils.js';
 
-// Save original Symbol.hasInstance descriptors for unpatch
-const _origHasInstanceRS = Object.getOwnPropertyDescriptor(NativeReadableStream, Symbol.hasInstance);
-const _origHasInstanceWS = Object.getOwnPropertyDescriptor(NativeWritableStream, Symbol.hasInstance);
-const _origHasInstanceTS = Object.getOwnPropertyDescriptor(NativeTransformStream, Symbol.hasInstance);
+// Save original Symbol.hasInstance descriptors for unpatch.
+// getOwnPropertyDescriptor returns undefined if there's no OWN hasInstance
+// (inherited from Function.prototype). Fall back to the default so native
+// objects still pass instanceof checks (needed for Response, fetch, etc.).
+const _defaultHasInstance = { value: Function.prototype[Symbol.hasInstance], configurable: true };
+const _origHasInstanceRS = Object.getOwnPropertyDescriptor(NativeReadableStream, Symbol.hasInstance) || _defaultHasInstance;
+const _origHasInstanceWS = Object.getOwnPropertyDescriptor(NativeWritableStream, Symbol.hasInstance) || _defaultHasInstance;
+const _origHasInstanceTS = Object.getOwnPropertyDescriptor(NativeTransformStream, Symbol.hasInstance) || _defaultHasInstance;
 
 /**
  * Replace the global stream constructors with fast alternatives.
@@ -49,41 +53,54 @@ function _PatchedReadableStream(underlyingSource, strategy) {
     underlyingSource.type === 'bytes' &&
     typeof underlyingSource.pull === 'function'
   ) {
-    // Must return genuine native stream — undici uses C++ internal slots for body I/O.
-    // Object.create(native) gives us native internal slots + Fast prototype methods.
+    // Return genuine native stream with Fast methods bolted on.
+    // Must keep native internal slots so undici WebIDL brand checks pass
+    // (new Response(stream) needs webidl.is.ReadableStream to succeed).
+    // Object.create(native) does NOT preserve internal slots — they're
+    // per-object, not inherited. Instead, add Fast methods directly.
     const native = new NativeReadableStream(underlyingSource, strategy);
-    const shell = Object.create(native);
-    _initNativeReadableShell(shell, native);
-    shell.getReader = function(opts) { return FastReadableStream.prototype.getReader.call(this, opts); };
-    // Delegate to native when counterpart isn't Fast — this shell has native
-    // internal slots (via Object.create) so native pipeThrough/pipeTo work.
-    // Fast's specPipeTo doesn't stream correctly with native writable targets.
-    shell.pipeTo = function(dest, opts) {
+    _initNativeReadableShell(native, native);
+    native.getReader = function(opts) { return FastReadableStream.prototype.getReader.call(this, opts); };
+    // Delegate to native when counterpart isn't Fast — this object has native
+    // internal slots so native pipeThrough/pipeTo work correctly.
+    native.pipeTo = function(dest, opts) {
       if (!isFastWritable(dest)) return NativeReadableStream.prototype.pipeTo.call(this, dest, opts);
       return FastReadableStream.prototype.pipeTo.call(this, dest, opts);
     };
-    shell.pipeThrough = function(t, opts) {
+    native.pipeThrough = function(t, opts) {
       if (!isFastTransform(t)) return NativeReadableStream.prototype.pipeThrough.call(this, t, opts);
       return FastReadableStream.prototype.pipeThrough.call(this, t, opts);
     };
-    shell.tee = function() { return FastReadableStream.prototype.tee.call(this); };
-    shell.cancel = function(r) { return FastReadableStream.prototype.cancel.call(this, r); };
-    shell._cancelInternal = FastReadableStream.prototype._cancelInternal;
-    shell.values = function(opts) { return FastReadableStream.prototype.values.call(this, opts); };
-    shell[Symbol.asyncIterator] = FastReadableStream.prototype[Symbol.asyncIterator];
+    native.tee = function() { return FastReadableStream.prototype.tee.call(this); };
+    native.cancel = function(r) { return FastReadableStream.prototype.cancel.call(this, r); };
+    native._cancelInternal = FastReadableStream.prototype._cancelInternal;
+    native.values = function(opts) { return FastReadableStream.prototype.values.call(this, opts); };
+    native[Symbol.asyncIterator] = FastReadableStream.prototype[Symbol.asyncIterator];
     const lockedDesc = Object.getOwnPropertyDescriptor(FastReadableStream.prototype, 'locked');
     if (lockedDesc) {
-      Object.defineProperty(shell, 'locked', {
+      Object.defineProperty(native, 'locked', {
         get() { return lockedDesc.get.call(this); },
         configurable: true,
       });
     }
-    return shell;
+    return native;
   }
   return new FastReadableStream(underlyingSource, strategy);
 }
 _PatchedReadableStream.prototype = FastReadableStream.prototype;
 _PatchedReadableStream.from = FastReadableStream.from;
+// Must accept native ReadableStream instances too (byte streams with pull
+// return genuine native objects). Without this, undici's
+// `obj instanceof globalThis.ReadableStream` fails for byte streams because
+// native prototype chain doesn't include FastReadableStream.prototype.
+Object.defineProperty(_PatchedReadableStream, Symbol.hasInstance, {
+  value(instance) {
+    return instance instanceof FastReadableStream
+      || instance instanceof NativeReadableStream
+      || isFastReadable(instance);
+  },
+  configurable: true,
+});
 
 export function patchGlobalWebStreams(options) {
   const opts = options || {};

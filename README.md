@@ -60,6 +60,8 @@ Native constructor references are captured at import time, so internal code and 
 
 The global patch is compatible with Node.js `fetch()` -- response bodies from `fetch()` are automatically bridged to use the fast path for downstream `pipeThrough` and `pipeTo` operations.
 
+`FastReadableStream` inherits from the native `ReadableStream` prototype chain (`Object.setPrototypeOf`), so instances pass undici's WebIDL brand checks. This means `new Response(fastStream)`, `response.text()`, `response.json()`, and any API that accepts a `ReadableStream` body work out of the box -- no monkey-patching required.
+
 ### TypeScript
 
 Type declarations are included. The exports re-export the standard WHATWG stream types, so existing TypeScript code works without changes.
