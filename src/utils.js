@@ -107,7 +107,7 @@ export class LiteReadable {
       // schedule read(0) to trigger demand (mirrors Node.js maybeReadMore).
       // Guard with _autoPullPending to prevent infinite microtask loops
       // (read(0) → pull → enqueue → readable → read → consumption → auto-pull → repeat).
-      if (this._buffer.length === 0 && this._onRead && !this._destroyed && !this._autoPullPending) {
+      if (this._buffer.length === 0 && this._onRead && !this._destroyed && !this._autoPullPending && this._hwm > 0) {
         this._autoPullPending = true;
         queueMicrotask(() => {
           this._autoPullPending = false;

@@ -9,7 +9,7 @@
  * https://streams.spec.whatwg.org/#readable-stream-pipe-to
  */
 
-import { isThenable, kLock, kNodeReadable, kStoredError, kWritableState, noop, RESOLVED_UNDEFINED, _stats } from './utils.js';
+import { isThenable, kLock, kNodeReadable, kNodeWritable, kStoredError, kWritableState, noop, RESOLVED_UNDEFINED, _stats } from './utils.js';
 import { kInFlightWriteRequest, kWriteRequests, kStarted, kCloseRequest, kInFlightCloseRequest, _advanceQueueIfNeeded, _getDesiredSize } from './writable.js';
 import { READ_DONE } from './reader.js';
 
@@ -251,6 +251,90 @@ export function specPipeTo(source, dest, options = {}) {
       // Drains all available buffered chunks in one go before yielding to the
       // microtask queue, amortizing the yield cost across multiple chunks.
       if (hasSyncRead) {
+
+        // Transform shell batch: call _origTransform directly, bypassing
+        // writer.write() and the writable state machine (~2 Promises per chunk → 0).
+        if (dest._isTransformShell && dest._origTransform &&
+            dest[kStarted] && dest[kWritableState] === 'writable' &&
+            !dest[kInFlightWriteRequest] && dest[kWriteRequests].length === 0 &&
+            !dest[kCloseRequest] && !dest._transformBackpressure) {
+
+          let chunk = reader._readSyncRaw();
+          if (chunk !== null) {
+            dest[kInFlightWriteRequest] = true;
+            const origTransform = dest._origTransform;
+            const nodeWritable = dest[kNodeWritable];
+            const ts = dest._transformStream;
+            let batchCount = 0;
+            const hwm = dest._hwm || 1;
+
+            while (chunk !== null) {
+              if (chunk === READ_DONE) {
+                dest[kInFlightWriteRequest] = null;
+                pumpClose();
+                return;
+              }
+
+              let syncCompleted = false;
+              let transformErr = null;
+              let asyncResolve = null;
+              try {
+                if (ts) ts._inTransformCallback = true;
+                origTransform.call(nodeWritable, chunk, 'utf8', (err) => {
+                  if (ts) ts._inTransformCallback = false;
+                  if (err) {
+                    transformErr = err;
+                    if (asyncResolve) {
+                      dest[kInFlightWriteRequest] = null;
+                      if (ts && ts._controller) try { ts._controller.error(err); } catch {}
+                      asyncResolve();
+                    }
+                    return;
+                  }
+                  syncCompleted = true;
+                  if (asyncResolve) {
+                    asyncResolve();
+                    if (!shuttingDown) queueMicrotask(pipeLoop);
+                  }
+                });
+              } catch (err) {
+                if (ts) ts._inTransformCallback = false;
+                dest[kInFlightWriteRequest] = null;
+                if (ts && ts._controller) try { ts._controller.error(err); } catch {}
+                return;
+              }
+
+              if (transformErr) {
+                dest[kInFlightWriteRequest] = null;
+                if (ts && ts._controller) try { ts._controller.error(transformErr); } catch {}
+                return;
+              }
+
+              if (!syncCompleted) {
+                // Async transform — wait for callback, then resume pump
+                currentWrite = new Promise((resolve) => { asyncResolve = resolve; });
+                return;
+              }
+
+              batchCount++;
+              if (shuttingDown) { dest[kInFlightWriteRequest] = null; return; }
+              if (dest[kWritableState] !== 'writable') { dest[kInFlightWriteRequest] = null; return; }
+              if (dest._transformBackpressure) break;
+              if (batchCount >= hwm) break;
+
+              chunk = reader._readSyncRaw();
+            }
+
+            dest[kInFlightWriteRequest] = null;
+            currentWrite = new Promise((resolve) => {
+              queueMicrotask(() => {
+                resolve();
+                batchReenter();
+              });
+            });
+            return;
+          }
+        }
 
         // Batch write path: when both reader and writer are Fast, bypass writer.write()
         // and call the sink directly. Uses _readSyncRaw() to avoid {value, done}

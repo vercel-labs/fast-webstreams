@@ -216,6 +216,7 @@ export class FastTransformStream {
     this._startCompleted = false;
 
     const onStartCompleted = () => {
+      startPromise = null;
       self._startCompleted = true;
       // Per spec: after start, update backpressure based on readable desiredSize.
       // If readable has room (desiredSize > 0), clear backpressure to allow writes.

@@ -236,7 +236,7 @@ function _bridgeNativeToFast(nativeOnlyStream) {
     cancel(reason) {
       return nativeReader.cancel(reason);
     },
-  });
+  }, { highWaterMark: 64 });
 }
 
 export class FastReadableStream {

@@ -236,6 +236,27 @@ export class FastReadableStreamDefaultReader {
       return _resolveReadResult(undefined, true);
     }
 
+    // Sync pull fast path: try pulling synchronously before creating async Promise.
+    // If pull enqueues synchronously (common for byte stream pull callbacks),
+    // return Promise.resolve() instead of new Promise + FIFO queue overhead.
+    if (nodeReadable._onRead !== undefined &&
+        !nodeReadable._readableState.reading &&
+        !nodeReadable._readableState.ended && !nodeReadable._destroyed &&
+        stream._pullFn && !stream._pullLock) {
+      nodeReadable._readableState.reading = true;
+      nodeReadable._onRead();
+      nodeReadable._readableState.reading = false;
+      const pulled = nodeReadable.read();
+      if (pulled !== null) {
+        if (stream._controller && stream._controller[kDequeueBytes]) stream._controller[kDequeueBytes](pulled);
+        if (stream._onPull) stream._onPull();
+        return _resolveReadResult(pulled, false);
+      }
+      if (nodeReadable.readableEnded) {
+        return _resolveReadResult(undefined, true);
+      }
+    }
+
     // Data not available yet — wait for data
     return new Promise((resolve, reject) => {
       // Track this pending read for releaseLock
