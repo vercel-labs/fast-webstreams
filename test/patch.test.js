@@ -259,3 +259,138 @@ describe('unpatch: restores native constructors', () => {
     assert.ok(s instanceof FastReadableStream);
   });
 });
+
+describe('patch: prototype chain brand check (Node 24+ WebIDL compat)', () => {
+  afterEach(() => unpatchGlobalWebStreams());
+
+  it('FastReadableStream passes Function.prototype[Symbol.hasInstance] for native RS', () => {
+    const s = new FastReadableStream();
+    assert.ok(
+      Function.prototype[Symbol.hasInstance].call(OriginalReadableStream, s),
+      'FastReadableStream should pass native brand check via prototype chain',
+    );
+  });
+
+  it('Object.create(FastReadableStream.prototype) fails brand check in _isReadableStream', () => {
+    patchGlobalWebStreams();
+    const fake = Object.create(FastReadableStream.prototype);
+    const rs = new ReadableStream({ start(c) { c.close(); } });
+    assert.throws(
+      () => rs.pipeThrough({ readable: fake, writable: new WritableStream() }),
+      TypeError,
+      'pipeThrough should reject a fake readable that lacks internal state',
+    );
+  });
+
+  it('Symbol.toStringTag is inherited from native prototype', () => {
+    const s = new FastReadableStream();
+    assert.strictEqual(
+      Object.prototype.toString.call(s),
+      '[object ReadableStream]',
+    );
+  });
+});
+
+describe('patch: new Response(FastReadableStream) integration', () => {
+  afterEach(() => unpatchGlobalWebStreams());
+
+  it('new Response(stream) succeeds for default-type stream', async () => {
+    const s = new FastReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('hello'));
+        c.close();
+      },
+    });
+    const resp = new Response(s);
+    assert.strictEqual(resp.body, s, 'body should be same ref');
+    assert.strictEqual(await resp.text(), 'hello');
+  });
+
+  it('new Response(stream) succeeds for byte stream', async () => {
+    const s = new FastReadableStream({
+      type: 'bytes',
+      start(c) {
+        c.enqueue(new TextEncoder().encode('bytes'));
+        c.close();
+      },
+    });
+    const resp = new Response(s);
+    assert.strictEqual(await resp.text(), 'bytes');
+  });
+
+  it('new Response(stream) succeeds for byte stream closed in start (empty body)', () => {
+    const s = new FastReadableStream({ type: 'bytes', start(c) { c.close(); } });
+    const resp = new Response(s);
+    assert.strictEqual(resp.status, 200);
+  });
+
+  it('Response.json() works with FastReadableStream body', async () => {
+    const s = new FastReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('{"a":1}'));
+        c.close();
+      },
+    });
+    const json = await new Response(s).json();
+    assert.deepStrictEqual(json, { a: 1 });
+  });
+});
+
+describe('patch: byte+pull kNativeOnly no recursion', () => {
+  afterEach(() => unpatchGlobalWebStreams());
+
+  it('locked does not recurse on byte+pull patched stream', () => {
+    patchGlobalWebStreams();
+    const s = new ReadableStream({
+      type: 'bytes',
+      pull(c) { c.enqueue(new Uint8Array([1])); c.close(); },
+    });
+    // This would stack overflow before the fix
+    assert.strictEqual(s.locked, false);
+  });
+
+  it('getReader does not recurse on byte+pull patched stream', async () => {
+    patchGlobalWebStreams();
+    const s = new ReadableStream({
+      type: 'bytes',
+      pull(c) { c.enqueue(new Uint8Array([65, 66])); c.close(); },
+    });
+    const reader = s.getReader();
+    const { value } = await reader.read();
+    assert.strictEqual(new TextDecoder().decode(value), 'AB');
+    reader.releaseLock();
+  });
+
+  it('tee does not recurse on byte+pull patched stream', async () => {
+    patchGlobalWebStreams();
+    const s = new ReadableStream({
+      type: 'bytes',
+      pull(c) { c.enqueue(new Uint8Array([84])); c.close(); },
+    });
+    const [b1, b2] = s.tee();
+    assert.strictEqual(await new Response(b1).text(), 'T');
+    assert.strictEqual(await new Response(b2).text(), 'T');
+  });
+
+  it('cancel does not recurse on byte+pull patched stream', async () => {
+    patchGlobalWebStreams();
+    const s = new ReadableStream({
+      type: 'bytes',
+      pull(c) { c.enqueue(new Uint8Array([1])); },
+    });
+    await s.cancel('done');
+    // No stack overflow = pass
+  });
+
+  it('new Response(byte+pull stream).text() works end-to-end', async () => {
+    patchGlobalWebStreams();
+    const s = new ReadableStream({
+      type: 'bytes',
+      pull(c) {
+        c.enqueue(new TextEncoder().encode('pull-data'));
+        c.close();
+      },
+    });
+    assert.strictEqual(await new Response(s).text(), 'pull-data');
+  });
+});

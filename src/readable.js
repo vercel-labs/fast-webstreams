@@ -535,10 +535,12 @@ export class FastReadableStream {
       }
 
       // Tier 0: kNativeOnly source → delegate to native pipeTo (C++ speed)
+      // Use NativeReadableStream.prototype.pipeTo directly to avoid recursion
+      // when kMaterialized === this (self-referential native shell from patch.js).
       if (this[kNativeOnly]) {
         const nativeSrc = materializeReadable(this);
         const nativeDst = isFastWritable(destination) ? materializeWritable(destination) : destination;
-        return nativeSrc.pipeTo(nativeDst, { preventAbort, preventCancel, preventClose, signal });
+        return NativeReadableStream.prototype.pipeTo.call(nativeSrc, nativeDst, { preventAbort, preventCancel, preventClose, signal });
       }
 
       if (this[kLock]) {
@@ -673,10 +675,11 @@ export class FastReadableStream {
         return readable;
       }
       // Fallback: cascade to native (transform is not fully Fast)
+      // Use native prototype method to avoid recursion for self-referential kMaterialized.
       const nativeSrc = materializeReadable(this);
       const nativeDst = isFastWritable(writable) ? materializeWritable(writable) : writable;
       const nativeRd = isFastReadable(readable) ? materializeReadable(readable) : readable;
-      nativeSrc.pipeThrough(
+      NativeReadableStream.prototype.pipeThrough.call(nativeSrc,
         { writable: nativeDst, readable: nativeRd },
         { preventAbort, preventCancel, preventClose, signal },
       );
@@ -727,9 +730,10 @@ export class FastReadableStream {
       throw new TypeError(`Invalid mode: ${mode}`);
     }
 
-    // For native-only streams (byte, custom size), delegate reader too
+    // For native-only streams (byte, custom size), delegate reader too.
+    // Use native prototype method to avoid recursion for self-referential kMaterialized.
     if (this[kNativeOnly]) {
-      return materializeReadable(this).getReader();
+      return NativeReadableStream.prototype.getReader.call(materializeReadable(this), options);
     }
 
     // Resolve upstream chain when getReader() is called on pipeThrough result.
@@ -805,10 +809,11 @@ export class FastReadableStream {
     // For native-only or byte streams, delegate to native tee
     // (byte streams need native tee to produce byte-type branches)
     if (this[kNativeOnly] || this._isByteStream) {
+      // Use native prototype method to avoid recursion for self-referential kMaterialized.
       const nativeStream = this[kNativeOnly]
         ? materializeReadable(this)
         : materializeReadableAsBytes(this);
-      const [b1, b2] = nativeStream.tee();
+      const [b1, b2] = NativeReadableStream.prototype.tee.call(nativeStream);
       return [
         _initNativeReadableShell(Object.create(FastReadableStream.prototype), b1),
         _initNativeReadableShell(Object.create(FastReadableStream.prototype), b2),
@@ -948,9 +953,10 @@ export class FastReadableStream {
    * Internal cancel — bypasses lock check (called by reader.cancel())
    */
   _cancelInternal(reason) {
-    // For native-only streams, delegate
+    // For native-only streams, delegate.
+    // Use native prototype method to avoid recursion for self-referential kMaterialized.
     if (this[kNativeOnly]) {
-      return materializeReadable(this).cancel(reason);
+      return NativeReadableStream.prototype.cancel.call(materializeReadable(this), reason);
     }
 
     // Per spec: if errored, reject immediately
@@ -1007,7 +1013,7 @@ export class FastReadableStream {
   }
 
   get locked() {
-    if (this[kNativeOnly] && this[kMaterialized]) return this[kMaterialized].locked;
+    if (this[kNativeOnly] && this[kMaterialized] && this[kMaterialized] !== this) return this[kMaterialized].locked;
     return this[kLock] !== null;
   }
 
