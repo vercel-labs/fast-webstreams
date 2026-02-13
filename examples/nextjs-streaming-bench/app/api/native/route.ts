@@ -32,7 +32,7 @@ export async function GET(request: Request) {
   );
 
   const result = await runBenchmark(
-    { scenario, chunks, size, iterations, warmup },
+    { scenario, chunks, size, iterations, warmup, _baseUrl: url.origin },
     NativeRS,
     NativeTS,
     NativeWS

@@ -4,7 +4,7 @@ import { useState, useCallback, useRef } from "react";
 
 // --- Types ---
 
-type Scenario = "read-loop" | "pipe-through" | "multi-transform" | "pipe-to" | "byte-stream" | "nextjs-ssr";
+type Scenario = "read-loop" | "pipe-through" | "multi-transform" | "pipe-to" | "byte-stream" | "nextjs-ssr" | "fetch-text" | "fetch-stream" | "fetch-transform" | "fetch-forward";
 
 type BenchStats = {
   median: number;
@@ -46,6 +46,10 @@ const SCENARIOS: { id: Scenario; label: string; desc: string }[] = [
   { id: "pipe-to", label: "Pipe To", desc: "pipeTo() a writable sink" },
   { id: "byte-stream", label: "Byte Stream", desc: "type: 'bytes' start+enqueue" },
   { id: "nextjs-ssr", label: "Next.js SSR", desc: "byte stream → 8 transforms → sink" },
+  { id: "fetch-text", label: "Fetch .text()", desc: "fetch() → response.text()" },
+  { id: "fetch-stream", label: "Fetch Stream", desc: "fetch() → body reader.read() loop" },
+  { id: "fetch-transform", label: "Fetch Transform", desc: "fetch() → pipeThrough → read" },
+  { id: "fetch-forward", label: "Fetch Forward", desc: "fetch() → 3 transforms → sink" },
 ];
 
 const PRESETS: { name: string; desc: string; config: Partial<Config> }[] = [
