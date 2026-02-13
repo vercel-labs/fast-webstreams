@@ -11,7 +11,7 @@ import { pipeline as pipelineWithSignal } from 'node:stream/promises';
 import { FastReadableStreamBYOBReader } from './byob-reader.js';
 import { FastReadableStreamDefaultController, kDequeueBytes, kHasPendingPullInto, kGetByobRequest, kCancelPendingPullIntos } from './controller.js';
 import { materializeReadable, materializeReadableAsBytes, materializeWritable } from './materialize.js';
-import { NativeReadableStream, NativeWritableStream } from './natives.js';
+import { NativeReadableStream, NativeTransformStream, NativeWritableStream } from './natives.js';
 import { specPipeTo } from './pipe-to.js';
 import { FastReadableStreamDefaultReader } from './reader.js';
 import {
@@ -390,6 +390,7 @@ export function _initNativeReadableShell(target, nativeStream) {
   target._pullLock = null;
   target._pullFn = null;
   target._onChunkRead = null;
+  target._byteStreamSyncPull = false;
   return target;
 }
 
@@ -663,10 +664,11 @@ export class FastReadableStream {
     if (type === 'bytes') {
       const ctrl = controller;
       const nr = nodeReadable;
-      this._onChunkRead = pullFn
+      // A1: For HWM=0 byte streams, desiredSize is always ≤0 after kDequeueBytes,
+      // so the pull-after-read check never passes. Skip it entirely.
+      this._onChunkRead = (pullFn && hwm > 0)
         ? (chunk) => {
             ctrl[kDequeueBytes](chunk);
-            // Byte stream sync pull-after-read: trigger pull when desiredSize crosses from ≤0 to >0
             const ds = ctrl.desiredSize;
             if (ds !== null && ds > 0 && ds - (chunk.byteLength || 0) <= 0) {
               nr._readableState.reading = false;
@@ -677,6 +679,9 @@ export class FastReadableStream {
     } else {
       this._onChunkRead = null;
     }
+
+    // A3: Byte stream HWM=0 sync pull marker — reader.read() skips empty buffer check
+    this._byteStreamSyncPull = (type === 'bytes' && !!pullFn && hwm === 0);
 
     _stats.readableCreated++;
 
@@ -978,13 +983,31 @@ export class FastReadableStream {
       while (_cur) {
         if (_cur._nativeSource) {
           _stats.bridge++;
-          const nodeWritable = _cur._nativeSourceWritable?.[kNodeWritable];
+          const writable = _cur._nativeSourceWritable;
+
+          // Native delegation: single-hop kNativeOnly → FastTransformStream → getReader()
+          // Create native TransformStream with same transformer, keep entire pipeline in C++.
+          if (_cur === this && !this[kUpstream] && writable?._isTransformShell) {
+            const ts = writable._transformStream;
+            if (ts?._transformer) {
+              const nativeTS = new NativeTransformStream(ts._transformer);
+              NativeReadableStream.prototype.pipeTo.call(
+                _cur._nativeSource, nativeTS.writable
+              ).catch(noop);
+              _cur._nativeSource = null;
+              _cur._nativeSourceWritable = null;
+              this[kLock] = 'native-delegate';
+              return NativeReadableStream.prototype.getReader.call(nativeTS.readable);
+            }
+          }
+
+          const nodeWritable = writable?.[kNodeWritable];
           if (nodeWritable && typeof nodeWritable.write === 'function') {
             // Direct feed: native reader → nodeTransform.write() (skip Writable.toWeb)
             _startNativeDirectFeed(_cur._nativeSource, nodeWritable);
           } else {
             // Fallback: materialize + native pipeTo
-            const nativeWritable = materializeWritable(_cur._nativeSourceWritable);
+            const nativeWritable = materializeWritable(writable);
             NativeReadableStream.prototype.pipeTo.call(
               _cur._nativeSource, nativeWritable,
             ).catch(noop); // errors propagate via Node Transform

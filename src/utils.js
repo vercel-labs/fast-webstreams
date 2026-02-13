@@ -80,6 +80,9 @@ export class LiteReadable {
       return;
     }
     this._buffer.push(chunk);
+    // A2: Skip notification during sync pull when no async reader is waiting.
+    // reader.read() fast path reads the buffer immediately after _onRead() returns.
+    if (this._readableState.reading && !this._dataCallback) return;
     if (this._dataCallback) { const cb = this._dataCallback; this._dataCallback = null; cb('data'); }
     else this._emit('readable');
   }

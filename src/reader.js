@@ -212,40 +212,63 @@ export class FastReadableStreamDefaultReader {
       return _resolveReadResult(undefined, true);
     }
 
-    // Tier 1: sync fast path — data already in buffer
-    const chunk = nodeReadable.read();
-    if (chunk !== null) {
-      // Consolidated byte stream accounting (kDequeueBytes + pull-after-read).
-      // For non-byte streams, _onChunkRead is null → zero overhead.
-      if (stream._onChunkRead) stream._onChunkRead(chunk);
-      // Notify transform controller that data was consumed (may clear backpressure)
-      if (stream._onPull) stream._onPull();
-      return _resolveReadResult(chunk, false);
-    }
-
-    // Check if ended
-    if (nodeReadable.readableEnded) {
-      return _resolveReadResult(undefined, true);
-    }
-
-    // Sync pull fast path: try pulling synchronously before creating async Promise.
-    // If pull enqueues synchronously (common for byte stream pull callbacks),
-    // return Promise.resolve() instead of new Promise + FIFO queue overhead.
-    if (nodeReadable._onRead !== undefined &&
-        !nodeReadable._readableState.reading &&
-        !nodeReadable._readableState.ended && !nodeReadable._destroyed &&
-        stream._pullFn && !stream._pullLock) {
-      nodeReadable._readableState.reading = true;
-      nodeReadable._onRead();
-      nodeReadable._readableState.reading = false;
-      const pulled = nodeReadable.read();
-      if (pulled !== null) {
-        if (stream._onChunkRead) stream._onChunkRead(pulled);
-        if (stream._onPull) stream._onPull();
-        return _resolveReadResult(pulled, false);
+    // A3: Byte stream HWM=0 fast path — simplified guards, no _onPull checks
+    if (stream._byteStreamSyncPull) {
+      const chunk = nodeReadable.read();
+      if (chunk !== null) {
+        if (stream._onChunkRead) stream._onChunkRead(chunk);
+        return _resolveReadResult(chunk, false);
       }
+      if (nodeReadable.readableEnded) return DONE_PROMISE;
+      // Simplified sync pull: skip _onRead/_pullFn/_reading guards (guaranteed for _byteStreamSyncPull)
+      if (!stream._pullLock && !nodeReadable._readableState.ended && !nodeReadable._destroyed) {
+        nodeReadable._readableState.reading = true;
+        nodeReadable._onRead();
+        nodeReadable._readableState.reading = false;
+        const pulled = nodeReadable.read();
+        if (pulled !== null) {
+          if (stream._onChunkRead) stream._onChunkRead(pulled);
+          return _resolveReadResult(pulled, false);
+        }
+        if (nodeReadable.readableEnded) return DONE_PROMISE;
+      }
+      // Async pull in progress — fall through to async wait path below
+    } else {
+      // Tier 1: sync fast path — data already in buffer
+      const chunk = nodeReadable.read();
+      if (chunk !== null) {
+        // Consolidated byte stream accounting (kDequeueBytes + pull-after-read).
+        // For non-byte streams, _onChunkRead is null → zero overhead.
+        if (stream._onChunkRead) stream._onChunkRead(chunk);
+        // Notify transform controller that data was consumed (may clear backpressure)
+        if (stream._onPull) stream._onPull();
+        return _resolveReadResult(chunk, false);
+      }
+
+      // Check if ended
       if (nodeReadable.readableEnded) {
         return _resolveReadResult(undefined, true);
+      }
+
+      // Sync pull fast path: try pulling synchronously before creating async Promise.
+      // If pull enqueues synchronously (common for byte stream pull callbacks),
+      // return Promise.resolve() instead of new Promise + FIFO queue overhead.
+      if (nodeReadable._onRead !== undefined &&
+          !nodeReadable._readableState.reading &&
+          !nodeReadable._readableState.ended && !nodeReadable._destroyed &&
+          stream._pullFn && !stream._pullLock) {
+        nodeReadable._readableState.reading = true;
+        nodeReadable._onRead();
+        nodeReadable._readableState.reading = false;
+        const pulled = nodeReadable.read();
+        if (pulled !== null) {
+          if (stream._onChunkRead) stream._onChunkRead(pulled);
+          if (stream._onPull) stream._onPull();
+          return _resolveReadResult(pulled, false);
+        }
+        if (nodeReadable.readableEnded) {
+          return _resolveReadResult(undefined, true);
+        }
       }
     }
 
