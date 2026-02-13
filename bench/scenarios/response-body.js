@@ -15,6 +15,7 @@ export default {
   variants: [
     {
       name: 'web-response-text',
+      skipIf: ({ chunkSize }) => chunkSize < 1024,
       fn: async ({ chunkSize, totalBytes, highWaterMark }) => {
         const chunk = makeChunk(chunkSize);
         let remaining = totalBytes;
@@ -38,6 +39,7 @@ export default {
     },
     {
       name: 'fast-response-text',
+      skipIf: ({ chunkSize }) => chunkSize < 1024,
       fn: async ({ chunkSize, totalBytes }) => {
         const chunk = makeChunk(chunkSize);
         let remaining = totalBytes;
@@ -59,6 +61,7 @@ export default {
     },
     {
       name: 'web-response-forward',
+      skipIf: ({ chunkSize }) => chunkSize < 1024,
       fn: async ({ chunkSize, totalBytes, highWaterMark }) => {
         const chunk = makeChunk(chunkSize);
         let remaining = totalBytes;
@@ -94,6 +97,7 @@ export default {
     },
     {
       name: 'fast-response-forward',
+      skipIf: ({ chunkSize }) => chunkSize < 1024,
       fn: async ({ chunkSize, totalBytes, highWaterMark }) => {
         const chunk = makeChunk(chunkSize);
         const countHWM = Math.max(1, Math.ceil(highWaterMark / chunkSize));
@@ -124,6 +128,69 @@ export default {
 
         await response.body.pipeThrough(transform).pipeTo(writable);
         return { bytesProcessed: bytesWritten };
+      },
+    },
+    {
+      name: 'web-fetch-transform',
+      fn: async ({ chunkSize, totalBytes }) => {
+        // Exact Next.js bench pattern: byte stream (HWM=0) → Response → pipeThrough → reader loop
+        const data = makeChunk(chunkSize);
+        const numChunks = totalBytes / chunkSize;
+        let n = 0;
+        const body = new ReadableStream(
+          {
+            type: 'bytes',
+            pull(controller) {
+              if (n >= numChunks) { controller.close(); return; }
+              controller.enqueue(new Uint8Array(data));
+              n++;
+            },
+          },
+          { highWaterMark: 0 },
+        );
+        const response = new Response(body);
+        const transformed = response.body.pipeThrough(new TransformStream({
+          transform(chunk, ctrl) { ctrl.enqueue(chunk); },
+        }));
+        const reader = transformed.getReader();
+        let bytesRead = 0;
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          bytesRead += value.length;
+        }
+        return { bytesProcessed: bytesRead };
+      },
+    },
+    {
+      name: 'fast-fetch-transform',
+      fn: async ({ chunkSize, totalBytes }) => {
+        // Same pattern with Fast streams
+        const data = makeChunk(chunkSize);
+        const numChunks = totalBytes / chunkSize;
+        let n = 0;
+        const body = new FastReadableStream(
+          {
+            type: 'bytes',
+            pull(controller) {
+              if (n >= numChunks) { controller.close(); return; }
+              controller.enqueue(new Uint8Array(data));
+              n++;
+            },
+          },
+        );
+        const response = new Response(body);
+        const transformed = response.body.pipeThrough(new FastTransformStream({
+          transform(chunk, ctrl) { ctrl.enqueue(chunk); },
+        }));
+        const reader = transformed.getReader();
+        let bytesRead = 0;
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          bytesRead += value.length;
+        }
+        return { bytesProcessed: bytesRead };
       },
     },
   ],

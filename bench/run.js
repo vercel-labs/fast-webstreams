@@ -45,7 +45,7 @@ const CHUNK_FILTERS = {
   backpressure: (chunkSize) => chunkSize >= 1024,                                // Skip chunks < 1KB
   compression: (chunkSize) => chunkSize >= 1024,                                 // Skip chunks < 1KB (CompressionStream degrades non-linearly)
   'multi-transform': (chunkSize) => chunkSize >= 1024,                           // Skip < 1KB (per-chunk overhead dominates)
-  'response-body': (chunkSize) => chunkSize >= 1024 && chunkSize <= 65536,       // 1KB-64KB (text concat at 1MB is trivially fast)
+  'response-body': (chunkSize) => chunkSize <= 65536,                            // ≤64KB (fetch-transform needs small chunks; text concat at 1MB is trivially fast)
   'byte-stream': (chunkSize) => chunkSize >= 1024,                               // Skip < 1KB (pre-buffering tiny Uint8Arrays not representative)
 };
 
@@ -163,7 +163,8 @@ async function main() {
     console.log(`Scenario: ${scenario.name}`);
     console.log(`  ${scenario.description}`);
 
-    const totalBytes = REDUCED_TOTAL[scenario.name] ?? baseTotalBytes;
+    // CLI --total-bytes overrides REDUCED_TOTAL; REDUCED_TOTAL overrides DEFAULTS
+    const totalBytes = opts.totalBytes != null ? baseTotalBytes : (REDUCED_TOTAL[scenario.name] ?? baseTotalBytes);
     if (totalBytes !== baseTotalBytes) {
       console.log(`  (using reduced total: ${formatBytes(totalBytes)})`);
     }
