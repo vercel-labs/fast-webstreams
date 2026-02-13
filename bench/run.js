@@ -24,24 +24,29 @@ const RESULTS_DIR = join(__dirname, 'results');
 
 // Default parameters
 const DEFAULTS = {
-  chunkSizes: [64, 1024, 16384, 65536, 262144, 1048576],
+  chunkSizes: [1024, 16384, 65536, 1048576],
   totalBytes: 100 * 1024 * 1024, // 100MB
   highWaterMark: 16384,           // 16KB
-  warmup: 5,
+  warmup: 3,
   iterations: 10,
 };
 
 // Scenarios with reduced totalBytes
 const REDUCED_TOTAL = {
-  backpressure: 10 * 1024 * 1024, // 10MB for backpressure (slow by design)
-  compression: 10 * 1024 * 1024,  // 10MB for compression (CompressionStream is slow at small chunks)
+  backpressure: 10 * 1024 * 1024,    // 10MB for backpressure (slow by design)
+  compression: 10 * 1024 * 1024,     // 10MB for compression (CompressionStream is slow at small chunks)
+  'byte-stream': 50 * 1024 * 1024,   // 50MB for byte-stream (pre-buffered, memory-heavy)
+  'response-body': 20 * 1024 * 1024, // 20MB for response-body (avoids string concat GC)
 };
 
 // Smart filtering: skip combinations that don't make sense
 const CHUNK_FILTERS = {
-  'chunk-accumulation': (chunkSize) => chunkSize <= 16384,   // Skip chunks > 16KB
-  backpressure: (chunkSize) => chunkSize >= 1024,            // Skip chunks < 1KB
-  compression: (chunkSize) => chunkSize >= 1024,             // Skip chunks < 1KB (CompressionStream degrades non-linearly)
+  'chunk-accumulation': (chunkSize) => chunkSize <= 16384,                       // Skip chunks > 16KB
+  backpressure: (chunkSize) => chunkSize >= 1024,                                // Skip chunks < 1KB
+  compression: (chunkSize) => chunkSize >= 1024,                                 // Skip chunks < 1KB (CompressionStream degrades non-linearly)
+  'multi-transform': (chunkSize) => chunkSize >= 1024,                           // Skip < 1KB (per-chunk overhead dominates)
+  'response-body': (chunkSize) => chunkSize >= 1024 && chunkSize <= 65536,       // 1KB-64KB (text concat at 1MB is trivially fast)
+  'byte-stream': (chunkSize) => chunkSize >= 1024,                               // Skip < 1KB (pre-buffering tiny Uint8Arrays not representative)
 };
 
 function parseArgs() {

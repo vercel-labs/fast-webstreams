@@ -8,6 +8,9 @@ import compression from './compression.js';
 import chunkAccumulation from './chunk-accumulation.js';
 import backpressure from './backpressure.js';
 import fetchBridge from './fetch-bridge.js';
+import byteStream from './byte-stream.js';
+import multiTransform from './multi-transform.js';
+import responseBody from './response-body.js';
 
 const scenarios = [
   passthrough,
@@ -16,6 +19,9 @@ const scenarios = [
   chunkAccumulation,
   backpressure,
   fetchBridge,
+  byteStream,
+  multiTransform,
+  responseBody,
 ];
 
 export const scenarioMap = new Map(scenarios.map((s) => [s.name, s]));

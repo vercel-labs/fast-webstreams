@@ -397,5 +397,67 @@ export default {
         return { bytesProcessed: bytesWritten };
       },
     },
+    {
+      name: 'web-byte-read-loop',
+      fn: async ({ chunkSize, totalBytes }) => {
+        const chunk = makeChunk(chunkSize);
+        let remaining = totalBytes;
+        const readable = new ReadableStream({
+          type: 'bytes',
+          pull(controller) {
+            if (remaining <= 0) {
+              controller.close();
+              return;
+            }
+            const size = Math.min(chunk.length, remaining);
+            remaining -= size;
+            const buf = new Uint8Array(size);
+            buf.set(size === chunk.length ? chunk : chunk.subarray(0, size));
+            controller.enqueue(buf);
+          },
+        });
+        const reader = readable.getReader();
+        let bytesRead = 0;
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          bytesRead += value.length;
+        }
+
+        return { bytesProcessed: bytesRead };
+      },
+    },
+    {
+      name: 'fast-byte-read-loop',
+      fn: async ({ chunkSize, totalBytes }) => {
+        const chunk = makeChunk(chunkSize);
+        let remaining = totalBytes;
+        const readable = new FastReadableStream({
+          type: 'bytes',
+          pull(controller) {
+            if (remaining <= 0) {
+              controller.close();
+              return;
+            }
+            const size = Math.min(chunk.length, remaining);
+            remaining -= size;
+            const buf = new Uint8Array(size);
+            buf.set(size === chunk.length ? chunk : chunk.subarray(0, size));
+            controller.enqueue(buf);
+          },
+        });
+        const reader = readable.getReader();
+        let bytesRead = 0;
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          bytesRead += value.length;
+        }
+
+        return { bytesProcessed: bytesRead };
+      },
+    },
   ],
 };
