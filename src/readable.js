@@ -286,6 +286,36 @@ function _startDirectFeed(lite, nodeTransform, sourceStream) {
 }
 
 /**
+ * Direct feed: native ReadableStream → nodeTransform via Node Readable bridge.
+ * Readable.fromWeb() buffers chunks (HWM=64), sync feedLoop drains in batches.
+ * Eliminates per-chunk Promise on the write side; batches amortize read Promises.
+ */
+function _startNativeDirectFeed(nativeSource, nodeTransform) {
+  const nodeReadable = Readable.fromWeb(nativeSource, { objectMode: true, highWaterMark: 64 });
+
+  function feedLoop() {
+    let chunk;
+    while ((chunk = nodeReadable.read()) !== null) {
+      if (nodeTransform.destroyed) { nodeReadable.destroy(); return; }
+      if (!nodeTransform.write(chunk)) {
+        nodeTransform.once('drain', feedLoop);
+        return;
+      }
+    }
+    // Buffer empty — wait for more data
+    if (!nodeReadable.readableEnded) {
+      nodeReadable.once('readable', feedLoop);
+    }
+  }
+
+  nodeReadable.on('end', () => { if (!nodeTransform.destroyed) nodeTransform.end(); });
+  nodeReadable.on('error', (err) => { if (!nodeTransform.destroyed) nodeTransform.destroy(err); });
+  nodeTransform.on('error', (err) => { if (!nodeReadable.destroyed) nodeReadable.destroy(err); });
+
+  feedLoop();
+}
+
+/**
  * Collect the full pipeline chain by walking upstream links.
  * Returns an array of Node.js streams: [source, ...transforms, dest]
  * Wraps LiteReadable instances in Node Readable for pipeline compatibility.
@@ -948,10 +978,17 @@ export class FastReadableStream {
       while (_cur) {
         if (_cur._nativeSource) {
           _stats.bridge++;
-          const nativeWritable = materializeWritable(_cur._nativeSourceWritable);
-          NativeReadableStream.prototype.pipeTo.call(
-            _cur._nativeSource, nativeWritable,
-          ).catch(noop); // errors propagate via Node Transform
+          const nodeWritable = _cur._nativeSourceWritable?.[kNodeWritable];
+          if (nodeWritable && typeof nodeWritable.write === 'function') {
+            // Direct feed: native reader → nodeTransform.write() (skip Writable.toWeb)
+            _startNativeDirectFeed(_cur._nativeSource, nodeWritable);
+          } else {
+            // Fallback: materialize + native pipeTo
+            const nativeWritable = materializeWritable(_cur._nativeSourceWritable);
+            NativeReadableStream.prototype.pipeTo.call(
+              _cur._nativeSource, nativeWritable,
+            ).catch(noop); // errors propagate via Node Transform
+          }
           _cur._nativeSource = null;
           _cur._nativeSourceWritable = null;
         }
