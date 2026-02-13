@@ -975,6 +975,33 @@ export class FastReadableStream {
       return NativeReadableStream.prototype.getReader.call(materializeReadable(this), options);
     }
 
+    // Native delegation for pull-only byte streams: create native stream, return native reader.
+    // Entire read loop stays in C++ — eliminates Promise/object allocation overhead.
+    // Gate: byte stream + pull + no start (controller not saved externally) + no upstream + empty buffer.
+    if (this._isByteStream && this._pullFn && !this[kUpstream] && !this._nativeSource &&
+        !this._byteSource.start && this[kNodeReadable].readableLength === 0) {
+      const us = this._byteSource;
+      const userPull = us.pull;
+      const userCancel = us.cancel;
+      const nativeSource = { type: 'bytes' };
+      nativeSource.pull = function(controller) {
+        return userPull.call(us, controller);
+      };
+      if (userCancel) {
+        nativeSource.cancel = function(reason) {
+          return userCancel.call(us, reason);
+        };
+      }
+      // Disable Fast pull coordinator (prevent auto-pull microtask from firing)
+      this[kNodeReadable]._onRead = null;
+      this[kLock] = 'native-delegate';
+      _stats.tier1_getReader++;
+      const hwm = this[kNodeReadable]._hwm;
+      return NativeReadableStream.prototype.getReader.call(
+        new NativeReadableStream(nativeSource, hwm > 0 ? { highWaterMark: hwm } : undefined)
+      );
+    }
+
     // Resolve deferred native sources: use C++ pipeTo for zero-promise first hop.
     // Data flows: native → materializedWritable → Node Transform → reader reads output.
     // Walks all upstream nodes for chained pipeThrough.
