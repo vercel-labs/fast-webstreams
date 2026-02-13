@@ -46,6 +46,7 @@ export function resolveHWM(strategy, defaultHWM = 1) {
 export class LiteReadable {
   constructor(hwm) {
     this._buffer = [];
+    this._bufferHead = 0;
     this._ended = false;
     this._destroyed = false;
     this._errored = null;
@@ -60,15 +61,15 @@ export class LiteReadable {
   }
 
   get readableHighWaterMark() { return this._hwm; }
-  get readableLength() { return this._buffer.length; }
-  get readableEnded() { return this._ended && this._buffer.length === 0; }
+  get readableLength() { return this._buffer.length - this._bufferHead; }
+  get readableEnded() { return this._ended && this._buffer.length === this._bufferHead; }
   get destroyed() { return this._destroyed; }
   get errored() { return this._errored; }
 
   push(chunk) {
     if (chunk === null) {
       this._readableState.ended = true;
-      if (this._buffer.length === 0) {
+      if (this._buffer.length === this._bufferHead) {
         this._ended = true;
         if (this._dataCallback) { const cb = this._dataCallback; this._dataCallback = null; cb('end'); }
         else this._emit('end');
@@ -86,7 +87,7 @@ export class LiteReadable {
   read(n) {
     if (n === 0) {
       // Trigger _read (pull) if nothing is buffered and not ended/destroyed
-      if (this._buffer.length === 0 && this._onRead && !this._readableState.reading &&
+      if (this._buffer.length === this._bufferHead && this._onRead && !this._readableState.reading &&
           !this._readableState.ended && !this._destroyed) {
         this._readableState.reading = true;
         this._onRead();
@@ -97,22 +98,29 @@ export class LiteReadable {
       }
       return null;
     }
-    if (this._buffer.length > 0) {
-      const chunk = this._buffer.shift();
+    if (this._buffer.length > this._bufferHead) {
+      const chunk = this._buffer[this._bufferHead];
+      this._buffer[this._bufferHead] = undefined; // GC
+      this._bufferHead++;
+      // Compact when head is past 512 and more than half consumed
+      if (this._bufferHead > 512 && this._bufferHead > (this._buffer.length >>> 1)) {
+        this._buffer = this._buffer.slice(this._bufferHead);
+        this._bufferHead = 0;
+      }
       // If buffer drained and ended, mark ended
-      if (this._buffer.length === 0 && this._readableState.ended) {
+      if (this._buffer.length === this._bufferHead && this._readableState.ended) {
         this._ended = true;
       }
       // Auto-pull after consumption: if buffer drained and pull is set,
       // schedule read(0) to trigger demand (mirrors Node.js maybeReadMore).
       // Guard with _autoPullPending to prevent infinite microtask loops
       // (read(0) → pull → enqueue → readable → read → consumption → auto-pull → repeat).
-      if (this._buffer.length === 0 && this._onRead && !this._destroyed && !this._autoPullPending && this._hwm > 0) {
+      if (this._buffer.length === this._bufferHead && this._onRead && !this._destroyed && !this._autoPullPending && this._hwm > 0) {
         this._autoPullPending = true;
         queueMicrotask(() => {
           this._autoPullPending = false;
           if (!this._destroyed && !this._readableState.reading && this._onRead &&
-              this._buffer.length === 0) {
+              this._buffer.length === this._bufferHead) {
             this._isAutoPull = true;
             this.read(0);
             this._isAutoPull = false;

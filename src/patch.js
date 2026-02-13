@@ -24,6 +24,12 @@ import {
 
 import { isFastReadable, isFastWritable, isFastTransform } from './utils.js';
 
+// Capture the original Response.body getter for wrapping.
+const _origBodyGetter = typeof Response !== 'undefined'
+  ? Object.getOwnPropertyDescriptor(Response.prototype, 'body')?.get
+  : null;
+const _bodyCache = new WeakMap();
+
 // Save original Symbol.hasInstance descriptors for unpatch.
 // getOwnPropertyDescriptor returns undefined if there's no OWN hasInstance
 // (inherited from Function.prototype). Fall back to the default so native
@@ -114,6 +120,26 @@ export function patchGlobalWebStreams(options) {
   globalThis.ByteLengthQueuingStrategy = NativeByteLengthQueuingStrategy;
   globalThis.CountQueuingStrategy = NativeCountQueuingStrategy;
 
+  // Wrap Response.body to return a kNativeOnly FastReadableStream shell.
+  // This enables downstream Fast pipeThrough/pipeTo to use deferred resolution
+  // → pipeline() instead of falling through to native pipeTo (triple promise/chunk).
+  if (_origBodyGetter) {
+    Object.defineProperty(Response.prototype, 'body', {
+      get() {
+        const nativeBody = _origBodyGetter.call(this);
+        if (!nativeBody || isFastReadable(nativeBody)) return nativeBody;
+        let wrapper = _bodyCache.get(this);
+        if (!wrapper) {
+          wrapper = _initNativeReadableShell(Object.create(FastReadableStream.prototype), nativeBody);
+          _bodyCache.set(this, wrapper);
+        }
+        return wrapper;
+      },
+      configurable: true,
+      enumerable: true,
+    });
+  }
+
   // Make Fast instances pass instanceof checks against the captured native constructors.
   Object.defineProperty(NativeReadableStream, Symbol.hasInstance, {
     value(instance) {
@@ -157,6 +183,15 @@ export function unpatchGlobalWebStreams() {
   globalThis.TransformStream = NativeTransformStream;
   globalThis.ByteLengthQueuingStrategy = NativeByteLengthQueuingStrategy;
   globalThis.CountQueuingStrategy = NativeCountQueuingStrategy;
+
+  // Restore original Response.body getter
+  if (_origBodyGetter) {
+    Object.defineProperty(Response.prototype, 'body', {
+      get: _origBodyGetter,
+      configurable: true,
+      enumerable: true,
+    });
+  }
 
   // Restore original Symbol.hasInstance
   if (_origHasInstanceRS) {

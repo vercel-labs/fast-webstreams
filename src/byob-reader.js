@@ -179,7 +179,7 @@ export class FastReadableStreamBYOBReader {
     // Check if stream closed/ended after sync fill attempt
     const nodeReadable = stream[kNodeReadable];
     const isEnded = stream._closed || nodeReadable.readableEnded ||
-      (nodeReadable._ended && nodeReadable._buffer && nodeReadable._buffer.length === 0);
+      (nodeReadable._ended && nodeReadable.readableLength === 0);
 
     // Handle partial fill with element-size remainder:
     // If we have enough bytes for at least one element but have a non-aligned remainder,

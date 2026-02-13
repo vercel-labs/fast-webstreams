@@ -9,7 +9,7 @@
 import { pipeline, Readable } from 'node:stream';
 import { pipeline as pipelineWithSignal } from 'node:stream/promises';
 import { FastReadableStreamBYOBReader } from './byob-reader.js';
-import { FastReadableStreamDefaultController, kHasPendingPullInto, kGetByobRequest, kCancelPendingPullIntos } from './controller.js';
+import { FastReadableStreamDefaultController, kDequeueBytes, kHasPendingPullInto, kGetByobRequest, kCancelPendingPullIntos } from './controller.js';
 import { materializeReadable, materializeReadableAsBytes, materializeWritable } from './materialize.js';
 import { NativeReadableStream, NativeWritableStream } from './natives.js';
 import { specPipeTo } from './pipe-to.js';
@@ -252,6 +252,7 @@ export function _initNativeReadableShell(target, nativeStream) {
   target._byteSource = null;
   target._pullLock = null;
   target._pullFn = null;
+  target._onChunkRead = null;
   return target;
 }
 
@@ -519,6 +520,27 @@ export class FastReadableStream {
     this._pullLock = null;
     this._pullFn = pullFn;
     this._pipelineDemand = false;
+
+    // Pre-bound chunk-read callback for byte streams (consolidates kDequeueBytes + onPull + pull-after-read).
+    // For non-byte default-type streams, null → zero overhead on the 3.4x-native fast path.
+    if (type === 'bytes') {
+      const ctrl = controller;
+      const nr = nodeReadable;
+      this._onChunkRead = pullFn
+        ? (chunk) => {
+            ctrl[kDequeueBytes](chunk);
+            // Byte stream sync pull-after-read: trigger pull when desiredSize crosses from ≤0 to >0
+            const ds = ctrl.desiredSize;
+            if (ds !== null && ds > 0 && ds - (chunk.byteLength || 0) <= 0) {
+              nr._readableState.reading = false;
+              nr.read(0);
+            }
+          }
+        : (chunk) => { ctrl[kDequeueBytes](chunk); };
+    } else {
+      this._onChunkRead = null;
+    }
+
     _stats.readableCreated++;
 
     // For byte streams (hwm=0), pull is demand-driven — triggered by pending reads,

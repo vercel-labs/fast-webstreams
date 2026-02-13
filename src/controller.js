@@ -638,11 +638,12 @@ export class FastReadableStreamDefaultController {
   [kTrySyncFillPullInto](d) {
     const nr = this.#nodeReadable;
     const buf = nr._buffer;
-    if (!buf || buf.length === 0) return false;
+    let head = nr._bufferHead;
+    if (!buf || buf.length === head) return false;
 
     // Fill as much as possible from the buffer (up to byteLength, not just minimumFill)
-    while (buf.length > 0 && d.bytesFilled < d.byteLength) {
-      const chunk = buf[0];
+    while (buf.length > head && d.bytesFilled < d.byteLength) {
+      const chunk = buf[head];
       const chunkBytes = chunk.byteLength;
       const need = d.byteLength - d.bytesFilled;
       const toCopy = Math.min(chunkBytes, need);
@@ -657,15 +658,19 @@ export class FastReadableStreamDefaultController {
       if (this.#byteQueueSize < 0) this.#byteQueueSize = 0;
 
       if (toCopy === chunkBytes) {
-        buf.shift(); // Consumed entire chunk
+        buf[head] = undefined; // GC
+        head++;
       } else {
         // Partial consumption — replace with remainder
-        buf[0] = new Uint8Array(chunk.buffer, chunk.byteOffset + toCopy, chunkBytes - toCopy);
+        buf[head] = new Uint8Array(chunk.buffer, chunk.byteOffset + toCopy, chunkBytes - toCopy);
       }
     }
 
+    // Update head on LiteReadable
+    nr._bufferHead = head;
+
     // Update LiteReadable ended state
-    if (buf.length === 0 && nr._readableState && nr._readableState.ended) {
+    if (buf.length === head && nr._readableState && nr._readableState.ended) {
       nr._ended = true;
     }
 

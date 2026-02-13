@@ -5,6 +5,8 @@
 
 import { FastReadableStream, FastWritableStream, FastTransformStream } from '../../src/index.js';
 import { _initNativeReadableShell } from '../../src/readable.js';
+import { patchGlobalWebStreams, unpatchGlobalWebStreams } from '../../src/patch.js';
+import { NativeReadableStream } from '../../src/natives.js';
 
 function makeChunk(size) {
   return Buffer.alloc(size, 0x41);
@@ -192,6 +194,45 @@ export default {
           bytesRead += value.length;
         }
         return { bytesProcessed: bytesRead };
+      },
+    },
+    {
+      name: 'fast-fetch-transform-patched',
+      fn: async ({ chunkSize, totalBytes }) => {
+        // Truly native source (simulating fetch) + patchGlobalWebStreams() active.
+        // Response.body returns kNativeOnly shell → deferred resolution → pipeline()
+        patchGlobalWebStreams();
+        try {
+          const data = makeChunk(chunkSize);
+          const numChunks = totalBytes / chunkSize;
+          let n = 0;
+          // Use NativeReadableStream directly to simulate fetch() body
+          const body = new NativeReadableStream(
+            {
+              type: 'bytes',
+              pull(controller) {
+                if (n >= numChunks) { controller.close(); return; }
+                controller.enqueue(new Uint8Array(data));
+                n++;
+              },
+            },
+            { highWaterMark: 0 },
+          );
+          const response = new Response(body);
+          const transformed = response.body.pipeThrough(new FastTransformStream({
+            transform(chunk, ctrl) { ctrl.enqueue(chunk); },
+          }));
+          const reader = transformed.getReader();
+          let bytesRead = 0;
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            bytesRead += value.length;
+          }
+          return { bytesProcessed: bytesRead };
+        } finally {
+          unpatchGlobalWebStreams();
+        }
       },
     },
     {

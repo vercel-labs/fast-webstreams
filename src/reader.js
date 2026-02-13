@@ -215,19 +215,11 @@ export class FastReadableStreamDefaultReader {
     // Tier 1: sync fast path — data already in buffer
     const chunk = nodeReadable.read();
     if (chunk !== null) {
-      // Track byte dequeue for byte stream desiredSize
-      if (stream._controller && stream._controller[kDequeueBytes]) stream._controller[kDequeueBytes](chunk);
+      // Consolidated byte stream accounting (kDequeueBytes + pull-after-read).
+      // For non-byte streams, _onChunkRead is null → zero overhead.
+      if (stream._onChunkRead) stream._onChunkRead(chunk);
       // Notify transform controller that data was consumed (may clear backpressure)
       if (stream._onPull) stream._onPull();
-      // Byte stream sync pull-after-read: trigger pull when desiredSize crosses from ≤0 to >0.
-      // This fires exactly once — pull refills, making desiredSize ≤0 again (no recursion).
-      if (stream._isByteStream && stream._pullFn && !nodeReadable.destroyed && stream._controller) {
-        const ds = stream._controller.desiredSize;
-        if (ds !== null && ds > 0 && ds - (chunk.byteLength || 0) <= 0) {
-          nodeReadable._readableState.reading = false;
-          nodeReadable.read(0);
-        }
-      }
       return _resolveReadResult(chunk, false);
     }
 
@@ -248,7 +240,7 @@ export class FastReadableStreamDefaultReader {
       nodeReadable._readableState.reading = false;
       const pulled = nodeReadable.read();
       if (pulled !== null) {
-        if (stream._controller && stream._controller[kDequeueBytes]) stream._controller[kDequeueBytes](pulled);
+        if (stream._onChunkRead) stream._onChunkRead(pulled);
         if (stream._onPull) stream._onPull();
         return _resolveReadResult(pulled, false);
       }
