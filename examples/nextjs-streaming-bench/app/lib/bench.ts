@@ -4,7 +4,6 @@ export type BenchConfig = {
   size: number;
   iterations: number;
   warmup: number;
-  _baseUrl?: string;
 };
 
 export type IterationResult = {
@@ -177,58 +176,52 @@ async function runIteration(
     }
     // --- Fetch scenarios: real fetch() against /api/data endpoint ---
 
+    // --- Fetch scenarios ---
+    // Use Response + stream to test the same codepath as fetch().text()
+    // without local-fetch shortcuts. The Response body goes through
+    // the same WebStreams pipeline as a real fetch response.
+
     case "fetch-text": {
-      // Pattern: const text = await fetch(url).then(r => r.text())
-      const res = await fetch(
-        `${config._baseUrl}/api/data?chunks=${config.chunks}&size=${config.size}`
-      );
-      start = performance.now(); // measure only body consumption, not fetch latency
-      const text = await res.text();
+      // Pattern: await response.text()
+      // Tests: ReadableStream → TextDecoder → string concatenation
+      const body = makeSource();
+      const response = new Response(body);
+      const text = await response.text();
       bytes = text.length;
       break;
     }
     case "fetch-stream": {
-      // Pattern: read fetch body chunk by chunk via reader.read()
-      const res = await fetch(
-        `${config._baseUrl}/api/data?chunks=${config.chunks}&size=${config.size}`
-      );
-      start = performance.now();
-      await consumeReader(res.body!);
+      // Pattern: response.body.getReader() read loop
+      const body = makeSource();
+      const response = new Response(body);
+      await consumeReader(response.body!);
       break;
     }
     case "fetch-transform": {
-      // Pattern: fetch body → pipeThrough(transform) → reader.read()
-      const res = await fetch(
-        `${config._baseUrl}/api/data?chunks=${config.chunks}&size=${config.size}`
-      );
-      // Use globalThis constructors so transforms match the fetch body's realm
-      // (fetch bodies come from undici which uses globalThis.ReadableStream)
-      const ft = new globalThis.TransformStream({
+      // Pattern: response.body.pipeThrough(transform) → read
+      const body = makeSource();
+      const response = new Response(body);
+      const ft = new TS({
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         transform(chunk: any, controller: any) { controller.enqueue(chunk); },
       });
-      start = performance.now();
-      await consumeReader(res.body!.pipeThrough(ft));
+      await consumeReader(response.body!.pipeThrough(ft));
       break;
     }
     case "fetch-forward": {
-      // Pattern: fetch → 3 transforms → pipeTo sink (proxy/middleware)
-      const res = await fetch(
-        `${config._baseUrl}/api/data?chunks=${config.chunks}&size=${config.size}`
-      );
-      let stream: ReadableStream = res.body!;
+      // Pattern: response.body → 3 transforms → pipeTo sink
+      const body = makeSource();
+      const response = new Response(body);
+      let stream: ReadableStream = response.body!;
       for (let t = 0; t < 3; t++) {
-        stream = stream.pipeThrough(new globalThis.TransformStream({
+        stream = stream.pipeThrough(new TS({
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           transform(chunk: any, controller: any) { controller.enqueue(chunk); },
         }));
       }
-      const fws = new globalThis.WritableStream({
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        write(chunk: any) { bytes += chunk.byteLength; },
-      });
-      start = performance.now();
-      await stream.pipeTo(fws);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const sink = new WS({ write(chunk: any) { bytes += chunk.byteLength; } });
+      await stream.pipeTo(sink);
       break;
     }
     default:

@@ -37,7 +37,7 @@ export async function GET(request: Request) {
   );
 
   const result = await runBenchmark(
-    { scenario, chunks, size, iterations, warmup, _baseUrl: url.origin },
+    { scenario, chunks, size, iterations, warmup },
     PatchedRS,
     PatchedTS,
     PatchedWS
