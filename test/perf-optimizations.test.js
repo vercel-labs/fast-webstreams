@@ -238,6 +238,79 @@ describe('opt3: bridge HWM for native-to-fast conversion', () => {
   });
 });
 
+describe('opt3b: native first-hop deferred bridge', () => {
+  it('kNativeOnly → pipeThrough → getReader uses native pipe (bridge-transform)', async () => {
+    const { _initNativeReadableShell } = await import('../src/readable.js');
+    const N = 100;
+    let i = 0;
+    const native = new ReadableStream({
+      pull(c) {
+        if (i >= N) { c.close(); return; }
+        c.enqueue(`item-${i++}`);
+      },
+    });
+    const shell = _initNativeReadableShell(Object.create(FastReadableStream.prototype), native);
+    const ts = new FastTransformStream({
+      transform(chunk, ctrl) { ctrl.enqueue(chunk.toUpperCase()); },
+    });
+    const chunks = await collectReader(shell.pipeThrough(ts));
+    assert.strictEqual(chunks.length, N);
+    assert.strictEqual(chunks[0], 'ITEM-0');
+    assert.strictEqual(chunks[N - 1], `ITEM-${N - 1}`);
+  });
+
+  it('kNativeOnly → pipeThrough → pipeTo uses bridge + pipeline (bridge-forward)', async () => {
+    const { _initNativeReadableShell } = await import('../src/readable.js');
+    const N = 100;
+    let i = 0;
+    const native = new ReadableStream({
+      pull(c) {
+        if (i >= N) { c.close(); return; }
+        c.enqueue(`item-${i++}`);
+      },
+    });
+    const shell = _initNativeReadableShell(Object.create(FastReadableStream.prototype), native);
+    const ts = new FastTransformStream();
+    const result = [];
+    const ws = new FastWritableStream({ write(c) { result.push(c); } });
+    await shell.pipeThrough(ts).pipeTo(ws);
+    assert.strictEqual(result.length, N);
+    assert.strictEqual(result[0], 'item-0');
+    assert.strictEqual(result[N - 1], `item-${N - 1}`);
+  });
+
+  it('kNativeOnly byte stream → pipeThrough → getReader', async () => {
+    const { _initNativeReadableShell } = await import('../src/readable.js');
+    const native = new ReadableStream({
+      type: 'bytes',
+      start(c) {
+        c.enqueue(new Uint8Array([1, 2, 3]));
+        c.enqueue(new Uint8Array([4, 5, 6]));
+        c.close();
+      },
+    });
+    const shell = _initNativeReadableShell(Object.create(FastReadableStream.prototype), native);
+    const ts = new FastTransformStream();
+    const chunks = await collectReader(shell.pipeThrough(ts));
+    assert.strictEqual(chunks.length, 2);
+  });
+
+  it('kNativeOnly → pipeThrough → cancel propagates', async () => {
+    const { _initNativeReadableShell } = await import('../src/readable.js');
+    const native = new ReadableStream({
+      pull(c) { c.enqueue('data'); },
+    });
+    const shell = _initNativeReadableShell(Object.create(FastReadableStream.prototype), native);
+    const ts = new FastTransformStream();
+    const readable = shell.pipeThrough(ts);
+    const reader = readable.getReader();
+    const { value } = await reader.read();
+    assert.ok(value);
+    await reader.cancel('done');
+    // Should not hang — cancel propagates through native pipe
+  });
+});
+
 // ─── Opt 4: Transform batch writes in specPipeTo ─────────────────────────────
 
 describe('opt4: transform shell batch writes', () => {

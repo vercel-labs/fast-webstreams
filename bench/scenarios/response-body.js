@@ -4,6 +4,7 @@
  */
 
 import { FastReadableStream, FastWritableStream, FastTransformStream } from '../../src/index.js';
+import { _initNativeReadableShell } from '../../src/readable.js';
 
 function makeChunk(size) {
   return Buffer.alloc(size, 0x41);
@@ -191,6 +192,70 @@ export default {
           bytesRead += value.length;
         }
         return { bytesProcessed: bytesRead };
+      },
+    },
+    {
+      name: 'fast-bridge-transform',
+      fn: async ({ chunkSize, totalBytes }) => {
+        // Real bridge path: native ReadableStream (simulating fetch) → kNativeOnly → bridge → Fast transform
+        const data = makeChunk(chunkSize);
+        const numChunks = totalBytes / chunkSize;
+        let n = 0;
+        const native = new ReadableStream({
+          type: 'bytes',
+          pull(controller) {
+            if (n >= numChunks) { controller.close(); return; }
+            controller.enqueue(new Uint8Array(data));
+            n++;
+          },
+        }, { highWaterMark: 0 });
+        // Wrap as kNativeOnly FastReadableStream (what happens when fetch body enters Fast world)
+        const bridged = _initNativeReadableShell(Object.create(FastReadableStream.prototype), native);
+        const transformed = bridged.pipeThrough(new FastTransformStream({
+          transform(chunk, ctrl) { ctrl.enqueue(chunk); },
+        }));
+        const reader = transformed.getReader();
+        let bytesRead = 0;
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          bytesRead += value.length;
+        }
+        return { bytesProcessed: bytesRead };
+      },
+    },
+    {
+      name: 'fast-bridge-forward',
+      skipIf: ({ chunkSize }) => chunkSize < 1024,
+      fn: async ({ chunkSize, totalBytes, highWaterMark }) => {
+        // Real bridge path: native → kNativeOnly → bridge → Fast transform → Fast writable
+        const chunk = makeChunk(chunkSize);
+        const countHWM = Math.max(1, Math.ceil(highWaterMark / chunkSize));
+        let remaining = totalBytes;
+        const native = new ReadableStream({
+          type: 'bytes',
+          pull(controller) {
+            if (remaining <= 0) { controller.close(); return; }
+            const size = Math.min(chunk.length, remaining);
+            remaining -= size;
+            const buf = new Uint8Array(size);
+            buf.set(size === chunk.length ? chunk : chunk.subarray(0, size));
+            controller.enqueue(buf);
+          },
+        });
+        const bridged = _initNativeReadableShell(Object.create(FastReadableStream.prototype), native);
+        const transform = new FastTransformStream(
+          { transform(c, ctrl) { ctrl.enqueue(c); } },
+          { highWaterMark: countHWM },
+          { highWaterMark: countHWM },
+        );
+        let bytesWritten = 0;
+        const writable = new FastWritableStream(
+          { write(c) { bytesWritten += c.length; } },
+          { highWaterMark: countHWM },
+        );
+        await bridged.pipeThrough(transform).pipeTo(writable);
+        return { bytesProcessed: bytesWritten };
       },
     },
   ],
