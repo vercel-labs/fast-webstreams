@@ -1052,6 +1052,46 @@ export class FastReadableStream {
     if (this[kUpstream]) {
       const upstream = this[kUpstream];
 
+      // Native delegation: pull-only byte stream → transform(no start) → getReader()
+      // Creates all-C++ pipeline, eliminates JS per-chunk overhead.
+      if (!upstream[kUpstream] &&                                    // single hop
+          upstream._isByteStream && upstream._pullFn &&              // byte stream with pull
+          !upstream._byteSource?.start &&                            // no start (controller not saved)
+          upstream[kNodeReadable].readableLength === 0 &&            // empty buffer
+          this._upstreamWritable?._isTransformShell) {               // transform writable
+        const ts = this._upstreamWritable._transformStream;
+        if (ts?._transformer && !ts._transformer.start) {            // transformer without start
+          const us = upstream._byteSource;
+          const userPull = us.pull;
+          const userCancel = us.cancel;
+          const nativeSource = { type: 'bytes' };
+          nativeSource.pull = function(controller) {
+            return userPull.call(us, controller);
+          };
+          if (userCancel) {
+            nativeSource.cancel = function(reason) {
+              return userCancel.call(us, reason);
+            };
+          }
+          const hwm = upstream[kNodeReadable]._hwm;
+          const nativeRS = new NativeReadableStream(
+            nativeSource, hwm > 0 ? { highWaterMark: hwm } : undefined
+          );
+          const nativeTS = new NativeTransformStream(ts._transformer);
+          NativeReadableStream.prototype.pipeTo.call(
+            nativeRS, nativeTS.writable
+          ).catch(noop);
+
+          upstream[kNodeReadable]._onRead = null;
+          upstream[kLock] = 'native-delegate';
+          this[kUpstream] = null;
+          this._upstreamWritable = null;
+          this[kLock] = 'native-delegate';
+          _stats.tier1_getReader++;
+          return NativeReadableStream.prototype.getReader.call(nativeTS.readable);
+        }
+      }
+
       // Single-hop LiteReadable → Transform: direct feed (skip pipeline wrapper)
       // Writes chunks directly from LiteReadable to nodeTransform.write(),
       // eliminating _wrapLiteForPipeline overhead (~4.6x faster).
