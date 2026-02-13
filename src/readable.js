@@ -136,8 +136,52 @@ function _isWritableStream(obj) {
 }
 
 /**
+ * Wrap a LiteReadable in a Node.js Readable so it can participate in pipeline().
+ * LiteReadable lacks pipe()/flowing mode that pipeline needs.
+ * One-time ~10µs cost, then zero-promise pipeline throughput.
+ */
+function _wrapLiteForPipeline(lite, stream) {
+  // Signal the pull coordinator that demand comes from pipeline, not WHATWG reader.
+  // pullFn's desiredSize guard checks this to allow pull without reader demand.
+  if (stream) stream._pipelineDemand = true;
+
+  function drain() {
+    let chunk;
+    while ((chunk = lite.read()) !== null) {
+      if (!nr.push(chunk)) {
+        // Backpressure: wrapper buffer full. Stop pulling until pipeline consumes.
+        if (stream) stream._pipelineDemand = false;
+        return;
+      }
+    }
+    if (lite._ended) { nr.push(null); return; }
+    // Trigger pull to fill buffer. Deferred to avoid re-entrancy
+    // (sync pull → enqueue → push → readable → drain → while still in drain).
+    queueMicrotask(() => {
+      if (!nr.destroyed && !lite._ended) lite.read(0);
+    });
+  }
+
+  const nr = new Readable({
+    objectMode: true,
+    highWaterMark: Math.max(lite._hwm, 1),
+    read() {
+      // Pipeline is ready for more data — restore pull demand
+      if (stream) stream._pipelineDemand = true;
+      drain();
+    },
+  });
+  lite.on('readable', drain);
+  lite.on('end', () => { if (!nr.destroyed) nr.push(null); });
+  lite.on('error', (err) => nr.destroy(err));
+  nr.on('error', noop);
+  return nr;
+}
+
+/**
  * Collect the full pipeline chain by walking upstream links.
  * Returns an array of Node.js streams: [source, ...transforms, dest]
+ * Wraps LiteReadable instances in Node Readable for pipeline compatibility.
  */
 function collectPipelineChain(readable, destination) {
   const chain = [];
@@ -145,7 +189,9 @@ function collectPipelineChain(readable, destination) {
   // Walk upstream from this readable (build forward, reverse once — O(n) vs O(n²))
   let current = readable;
   while (current) {
-    chain.push(current[kNodeReadable]);
+    const nr = current[kNodeReadable];
+    // LiteReadable (byte streams) needs a Node Readable wrapper for pipeline
+    chain.push(nr instanceof LiteReadable ? _wrapLiteForPipeline(nr, current) : nr);
     current = current[kUpstream];
   }
   chain.reverse();
@@ -371,8 +417,10 @@ export class FastReadableStream {
         if (useLite && nodeReadable._isAutoPull && controller.desiredSize !== null && controller.desiredSize <= 0) return;
         if (!useLite) return;
       }
-      // Byte streams: only pull when there's demand (desiredSize > 0 or pending reads)
-      if (useLite && controller.desiredSize !== null && controller.desiredSize <= 0) {
+      // Byte streams: only pull when there's demand (desiredSize > 0 or pending reads).
+      // _pipelineDemand: pipeline mode — demand comes from Node pipeline, not WHATWG reader.
+      // Node Readable HWM provides backpressure; desiredSize guard not needed.
+      if (useLite && !stream._pipelineDemand && controller.desiredSize !== null && controller.desiredSize <= 0) {
         const reader = stream[kLock];
         const hasPendingReads = reader && reader._pendingReadCount && reader._pendingReadCount() > 0;
         const hasPendingPullIntos = controller[kHasPendingPullInto] && controller[kHasPendingPullInto]();
@@ -450,6 +498,7 @@ export class FastReadableStream {
     this._byteSource = type === 'bytes' ? underlyingSource : null;
     this._pullLock = null;
     this._pullFn = pullFn;
+    this._pipelineDemand = false;
     _stats.readableCreated++;
 
     // For byte streams (hwm=0), pull is demand-driven — triggered by pending reads,
@@ -563,16 +612,8 @@ export class FastReadableStream {
         !destination[kNativeOnly] &&
         destination[kNodeWritable]
       ) {
-        // Check that no upstream source uses LiteReadable (byte stream fast path)
-        let hasByteSource = false;
-        let cur = this;
-        while (cur) {
-          if (cur._isByteStream) { hasByteSource = true; break; }
-          cur = cur[kUpstream];
-        }
-        if (!hasByteSource) {
-          return fastPipelineTo(this, destination, signal);
-        }
+        // LiteReadable (byte streams) auto-wrapped by collectPipelineChain
+        return fastPipelineTo(this, destination, signal);
       }
 
       // Tier 0.5: upstream chain exists but can't use full pipeline.
@@ -740,57 +781,33 @@ export class FastReadableStream {
     // Prefer Tier 0 (Node.js pipeline) over specPipeTo — pipeline processes
     // chunks without Promise chains (~3.5µs saved per chunk).
     if (this[kUpstream]) {
-      // Check if we can use pipeline (no byte sources — LiteReadable lacks pipe/flowing)
-      let hasByteSource = false;
-      let cur = this;
-      while (cur) {
-        if (cur._isByteStream) { hasByteSource = true; break; }
-        cur = cur[kUpstream];
+      // Tier 0 for getReader: build pipeline chain, data flows into last
+      // transform's Node buffer. Reader reads from there (Tier 1 sync).
+      // LiteReadable (byte streams) auto-wrapped by collectPipelineChain.
+      _stats.tier0_pipeline++;
+      const chain = [];
+      let current = this;
+      while (current) {
+        const nr = current[kNodeReadable];
+        chain.push(nr instanceof LiteReadable ? _wrapLiteForPipeline(nr, current) : nr);
+        current = current[kUpstream];
       }
-
-      if (!hasByteSource) {
-        // Tier 0 for getReader: build pipeline chain, data flows into last
-        // transform's Node buffer. Reader reads from there (Tier 1 sync).
-        _stats.tier0_pipeline++;
-        const chain = [];
-        let current = this;
-        while (current) {
-          chain.push(current[kNodeReadable]);
-          current = current[kUpstream];
-        }
-        chain.reverse();
-        // Clear all upstream links
-        current = this;
-        while (current[kUpstream]) {
-          const next = current[kUpstream];
-          current[kUpstream] = null;
-          current._upstreamWritable = null;
-          current = next;
-        }
-        // Start pipeline — data flows source → transforms → last transform's buffer
-        pipeline(chain, (err) => {
-          if (err) {
-            this._errored = true;
-            this._storedError = err;
-          }
-        });
-      } else {
-        // Fallback: specPipeTo for each hop (byte streams can't use pipeline)
-        _stats.tier05_upstream++;
-        const hops = [];
-        let current = this;
-        while (current[kUpstream]) {
-          hops.push({ source: current[kUpstream], writable: current._upstreamWritable });
-          const next = current[kUpstream];
-          current[kUpstream] = null;
-          current = next;
-        }
-        for (const hop of hops) {
-          if (hop.source && hop.writable) {
-            specPipeTo(hop.source, hop.writable, {}).catch(noop);
-          }
-        }
+      chain.reverse();
+      // Clear all upstream links
+      current = this;
+      while (current[kUpstream]) {
+        const next = current[kUpstream];
+        current[kUpstream] = null;
+        current._upstreamWritable = null;
+        current = next;
       }
+      // Start pipeline — data flows source → transforms → last transform's buffer
+      pipeline(chain, (err) => {
+        if (err) {
+          this._errored = true;
+          this._storedError = err;
+        }
+      });
     }
 
     _stats.tier1_getReader++;
