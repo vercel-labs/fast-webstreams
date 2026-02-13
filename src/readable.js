@@ -619,14 +619,22 @@ export class FastReadableStream {
         return Promise.reject(new TypeError('WritableStream is locked'));
       }
 
-      // Resolve deferred native source: bridge for pipeTo (enables pipeline chain).
-      // Bridge reads from native (batched Promises), upstream link → pipeline for rest.
-      if (this._nativeSource) {
-        const bridged = _bridgeNativeToFast_fromStream(this._nativeSource);
-        this[kUpstream] = bridged;
-        this._upstreamWritable = this._nativeSourceWritable;
-        this._nativeSource = null;
-        this._nativeSourceWritable = null;
+      // Resolve deferred native sources in upstream chain: bridge for pipeTo
+      // (enables pipeline chain). Walks all upstream nodes because chained
+      // pipeThrough stores _nativeSource on an intermediate readable.
+      {
+        let _cur = this;
+        while (_cur) {
+          if (_cur._nativeSource) {
+            const bridged = _bridgeNativeToFast_fromStream(_cur._nativeSource);
+            bridged[kUpstream] = _cur[kUpstream];
+            _cur[kUpstream] = bridged;
+            if (!_cur._upstreamWritable) _cur._upstreamWritable = _cur._nativeSourceWritable;
+            _cur._nativeSource = null;
+            _cur._nativeSourceWritable = null;
+          }
+          _cur = _cur[kUpstream];
+        }
       }
 
       // Tier 0: pipeThrough chain with upstream links → Node.js pipeline()
@@ -803,16 +811,23 @@ export class FastReadableStream {
       return NativeReadableStream.prototype.getReader.call(materializeReadable(this), options);
     }
 
-    // Resolve deferred native source: use C++ pipeTo for zero-promise first hop.
+    // Resolve deferred native sources: use C++ pipeTo for zero-promise first hop.
     // Data flows: native → materializedWritable → Node Transform → reader reads output.
-    if (this._nativeSource) {
-      _stats.bridge++;
-      const nativeWritable = materializeWritable(this._nativeSourceWritable);
-      NativeReadableStream.prototype.pipeTo.call(
-        this._nativeSource, nativeWritable,
-      ).catch(noop); // errors propagate via Node Transform
-      this._nativeSource = null;
-      this._nativeSourceWritable = null;
+    // Walks all upstream nodes for chained pipeThrough.
+    {
+      let _cur = this;
+      while (_cur) {
+        if (_cur._nativeSource) {
+          _stats.bridge++;
+          const nativeWritable = materializeWritable(_cur._nativeSourceWritable);
+          NativeReadableStream.prototype.pipeTo.call(
+            _cur._nativeSource, nativeWritable,
+          ).catch(noop); // errors propagate via Node Transform
+          _cur._nativeSource = null;
+          _cur._nativeSourceWritable = null;
+        }
+        _cur = _cur[kUpstream];
+      }
     }
 
     // Resolve upstream chain when getReader() is called on pipeThrough result.

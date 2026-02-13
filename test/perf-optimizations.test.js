@@ -309,6 +309,46 @@ describe('opt3b: native first-hop deferred bridge', () => {
     await reader.cancel('done');
     // Should not hang — cancel propagates through native pipe
   });
+
+  it('kNativeOnly → chained pipeThrough → pipeTo resolves all hops', async () => {
+    const { _initNativeReadableShell } = await import('../src/readable.js');
+    const N = 50;
+    let i = 0;
+    const native = new ReadableStream({
+      pull(c) {
+        if (i >= N) { c.close(); return; }
+        c.enqueue(`item-${i++}`);
+      },
+    });
+    const shell = _initNativeReadableShell(Object.create(FastReadableStream.prototype), native);
+    const t1 = new FastTransformStream();
+    const t2 = new FastTransformStream();
+    const result = [];
+    const ws = new FastWritableStream({ write(c) { result.push(c); } });
+    await shell.pipeThrough(t1).pipeThrough(t2).pipeTo(ws);
+    assert.strictEqual(result.length, N);
+    assert.strictEqual(result[0], 'item-0');
+    assert.strictEqual(result[N - 1], `item-${N - 1}`);
+  });
+
+  it('kNativeOnly → chained pipeThrough → getReader resolves all hops', async () => {
+    const { _initNativeReadableShell } = await import('../src/readable.js');
+    const N = 50;
+    let i = 0;
+    const native = new ReadableStream({
+      pull(c) {
+        if (i >= N) { c.close(); return; }
+        c.enqueue(`item-${i++}`);
+      },
+    });
+    const shell = _initNativeReadableShell(Object.create(FastReadableStream.prototype), native);
+    const t1 = new FastTransformStream();
+    const t2 = new FastTransformStream();
+    const chunks = await collectReader(shell.pipeThrough(t1).pipeThrough(t2));
+    assert.strictEqual(chunks.length, N);
+    assert.strictEqual(chunks[0], 'item-0');
+    assert.strictEqual(chunks[N - 1], `item-${N - 1}`);
+  });
 });
 
 // ─── Opt 4: Transform batch writes in specPipeTo ─────────────────────────────
