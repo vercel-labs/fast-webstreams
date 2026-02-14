@@ -39,6 +39,14 @@ const _origHasInstanceRS = Object.getOwnPropertyDescriptor(NativeReadableStream,
 const _origHasInstanceWS = Object.getOwnPropertyDescriptor(NativeWritableStream, Symbol.hasInstance) || _defaultHasInstance;
 const _origHasInstanceTS = Object.getOwnPropertyDescriptor(NativeTransformStream, Symbol.hasInstance) || _defaultHasInstance;
 
+// Save original native prototype methods for patching/unpatching.
+// React's renderToReadableStream() returns a native ReadableStream (created via
+// node:stream/web, not globalThis.ReadableStream). Its .pipeThrough() is the
+// native method, bypassing our fast path entirely. By patching the native prototype,
+// we intercept these calls when the target is a FastTransformStream/FastWritableStream.
+const _origNativePipeThrough = NativeReadableStream.prototype.pipeThrough;
+const _origNativePipeTo = NativeReadableStream.prototype.pipeTo;
+
 /**
  * Replace the global stream constructors with fast alternatives.
  *
@@ -140,6 +148,32 @@ export function patchGlobalWebStreams(options) {
     });
   }
 
+  // Patch native ReadableStream.prototype so that native streams (e.g. from
+  // React's renderToReadableStream, node:stream/web) use our fast path when
+  // piping through FastTransformStreams or to FastWritableStreams.
+  // Without this, the entire Next.js 8-transform SSR pipeline runs through
+  // native JS promise chains (~2 promises/chunk/hop) instead of Node.js pipeline().
+  NativeReadableStream.prototype.pipeThrough = function pipeThrough(transform, options) {
+    if (isFastTransform(transform)) {
+      // Wrap this native stream in a kNativeOnly shell so our pipeThrough
+      // can do deferred resolution → upstream linking → pipeline().
+      const shell = isFastReadable(this)
+        ? this  // already a Fast stream (e.g. from patched constructor)
+        : _initNativeReadableShell(Object.create(FastReadableStream.prototype), this);
+      return FastReadableStream.prototype.pipeThrough.call(shell, transform, options);
+    }
+    return _origNativePipeThrough.call(this, transform, options);
+  };
+  NativeReadableStream.prototype.pipeTo = function pipeTo(dest, options) {
+    if (isFastWritable(dest)) {
+      const shell = isFastReadable(this)
+        ? this
+        : _initNativeReadableShell(Object.create(FastReadableStream.prototype), this);
+      return FastReadableStream.prototype.pipeTo.call(shell, dest, options);
+    }
+    return _origNativePipeTo.call(this, dest, options);
+  };
+
   // Make Fast instances pass instanceof checks against the captured native constructors.
   Object.defineProperty(NativeReadableStream, Symbol.hasInstance, {
     value(instance) {
@@ -183,6 +217,10 @@ export function unpatchGlobalWebStreams() {
   globalThis.TransformStream = NativeTransformStream;
   globalThis.ByteLengthQueuingStrategy = NativeByteLengthQueuingStrategy;
   globalThis.CountQueuingStrategy = NativeCountQueuingStrategy;
+
+  // Restore native prototype methods
+  NativeReadableStream.prototype.pipeThrough = _origNativePipeThrough;
+  NativeReadableStream.prototype.pipeTo = _origNativePipeTo;
 
   // Restore original Response.body getter
   if (_origBodyGetter) {
