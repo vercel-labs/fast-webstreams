@@ -554,6 +554,27 @@ export class FastReadableStreamDefaultReader {
     });
   }
 
+  /**
+   * Try to read synchronously — returns the chunk directly, READ_DONE sentinel
+   * for end-of-stream, or null if no data is available. Avoids {value,done}
+   * object allocation and Promise wrapping. Used by async iterator fast path.
+   */
+  _tryReadSync() {
+    if (this.#released) return null;
+    const stream = this.#stream;
+    if (stream._errored) return null;
+    const nodeReadable = this.#nodeReadable;
+    if (nodeReadable.errored || nodeReadable.destroyed) return null;
+    const chunk = nodeReadable.read();
+    if (chunk !== null) {
+      if (stream._onChunkRead) stream._onChunkRead(chunk);
+      if (stream._onPull) stream._onPull();
+      return chunk;
+    }
+    if (nodeReadable.readableEnded) return READ_DONE;
+    return null;
+  }
+
   cancel(reason) {
     if (this.#released) {
       return Promise.reject(new TypeError('Reader has been released'));

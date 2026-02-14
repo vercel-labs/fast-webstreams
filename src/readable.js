@@ -9,11 +9,11 @@
 import { pipeline, Readable } from 'node:stream';
 import { pipeline as pipelineWithSignal } from 'node:stream/promises';
 import { FastReadableStreamBYOBReader } from './byob-reader.js';
-import { FastReadableStreamDefaultController, kDequeueBytes, kHasPendingPullInto, kGetByobRequest, kCancelPendingPullIntos } from './controller.js';
+import { FastReadableStreamDefaultController, kDequeueBytes, kHasPendingPullInto, kGetByobRequest, kCancelPendingPullIntos, kClosePendingPullIntos, kEnqueueInternal } from './controller.js';
 import { materializeReadable, materializeReadableAsBytes, materializeWritable } from './materialize.js';
 import { NativeReadableStream, NativeTransformStream, NativeWritableStream } from './natives.js';
 import { specPipeTo } from './pipe-to.js';
-import { FastReadableStreamDefaultReader } from './reader.js';
+import { FastReadableStreamDefaultReader, READ_DONE } from './reader.js';
 import {
   isFastReadable,
   isFastTransform,
@@ -62,6 +62,23 @@ function _getAsyncIteratorPrototype() {
 
     // Define methods with correct name, length, and enumerable properties
     async function next() {
+      // Sync fast path: skip chainOperation + Promise when data is buffered
+      // and no prior async operation is pending.
+      // _tryReadSync returns: chunk (any value) | READ_DONE | null (no data)
+      if (!this[kIterDone] && !this[kIterOngoing]) {
+        const reader = this[kIterReader];
+        if (reader._tryReadSync) {
+          const chunk = reader._tryReadSync();
+          if (chunk !== null) {
+            if (chunk === READ_DONE) {
+              this[kIterDone] = true;
+              reader.releaseLock();
+              return { value: undefined, done: true };
+            }
+            return { value: chunk, done: false };
+          }
+        }
+      }
       return chainOperation(this, async () => {
         if (this[kIterDone]) return { value: undefined, done: true };
         try {
@@ -1149,9 +1166,11 @@ export class FastReadableStream {
       throw new TypeError('ReadableStream is locked');
     }
 
-    // For native-only or byte streams, delegate to native tee
-    // (byte streams need native tee to produce byte-type branches)
-    if (this[kNativeOnly] || this._isByteStream) {
+    // For native-only streams, or byte streams with pull (which may use
+    // byobRequest on the source controller), delegate to native tee.
+    // Byte streams without pull (start+enqueue pattern, e.g. React Flight)
+    // use the fast JS readLoop below.
+    if (this[kNativeOnly] || (this._isByteStream && this._pullFn)) {
       // Use native prototype method to avoid recursion for self-referential kMaterialized.
       const nativeStream = this[kNativeOnly]
         ? materializeReadable(this)
@@ -1163,7 +1182,11 @@ export class FastReadableStream {
       ];
     }
 
-    const reader = this.getReader();
+    const isByteTee = this._isByteStream;
+    // For byte streams: use FastReadableStreamDefaultReader directly to bypass
+    // getReader()'s native delegation (we need _readWithCallbacks on the reader).
+    // For default-type: use getReader() to preserve existing behavior.
+    const reader = isByteTee ? new FastReadableStreamDefaultReader(this) : this.getReader();
     let canceled1 = false;
     let canceled2 = false;
     let reason1, reason2;
@@ -1195,8 +1218,13 @@ export class FastReadableStream {
       return cancelPromise;
     }
 
+    // Branch source config — byte tee creates byte-type branches
+    const branchSource = isByteTee
+      ? { type: 'bytes' }
+      : {};
+
     const branch1 = new FastReadableStream(
-      {
+      Object.assign(branchSource, {
         start(c) {
           branch1Controller = c;
         },
@@ -1206,12 +1234,12 @@ export class FastReadableStream {
         cancel(reason) {
           return cancel1Algorithm(reason);
         },
-      },
+      }),
       { highWaterMark: 0 },
     );
 
     const branch2 = new FastReadableStream(
-      {
+      Object.assign(isByteTee ? { type: 'bytes' } : {}, {
         start(c) {
           branch2Controller = c;
         },
@@ -1221,7 +1249,7 @@ export class FastReadableStream {
         cancel(reason) {
           return cancel2Algorithm(reason);
         },
-      },
+      }),
       { highWaterMark: 0 },
     );
 
@@ -1229,7 +1257,9 @@ export class FastReadableStream {
     let readAgain = false;
     function readLoop() {
       if (reading) {
-        readAgain = true;
+        // For byte tee: don't set readAgain — extra source pulls break WPT pull-count tests.
+        // For default-type: set readAgain so concurrent drain works.
+        if (!isByteTee) readAgain = true;
         // Return undefined (not RESOLVED_UNDEFINED) — RESOLVED_UNDEFINED is a thenable
         // which would cause the branch's pullFn to set pullLock and schedule infinite
         // re-reads via microtasks while reading is still true.
@@ -1240,27 +1270,48 @@ export class FastReadableStream {
       // Promise.resolve({value,done}) triggers ECMAScript thenable check on the object,
       // which is observable when Object.prototype.then is patched (WPT then-interception test).
       return reader._readWithCallbacks(
-        (value) => {
-          const ra = readAgain;
-          readAgain = false;
-          try {
-            if (!canceled1 && branch1Controller) branch1Controller.enqueue(value);
-          } catch {}
-          try {
-            if (!canceled2 && branch2Controller) branch2Controller.enqueue(value);
-          } catch {}
-          reading = false;
-          if (ra) readLoop();
-        },
+        isByteTee
+          ? (value) => {
+              // Byte tee: use _enqueueInternal (skips buffer.transfer) and clone for branch2
+              if (!canceled1 && !canceled2) {
+                try { branch1Controller[kEnqueueInternal](value); } catch {}
+                try { branch2Controller[kEnqueueInternal](value.slice(0)); } catch {}
+              } else if (!canceled1) {
+                try { branch1Controller[kEnqueueInternal](value); } catch {}
+              } else if (!canceled2) {
+                try { branch2Controller[kEnqueueInternal](value); } catch {}
+              }
+              reading = false;
+            }
+          : (value) => {
+              const ra = readAgain;
+              readAgain = false;
+              try {
+                if (!canceled1 && branch1Controller) branch1Controller.enqueue(value);
+              } catch {}
+              try {
+                if (!canceled2 && branch2Controller) branch2Controller.enqueue(value);
+              } catch {}
+              reading = false;
+              if (ra) readLoop();
+            },
         () => {
           reading = false;
+          // For byte tee: close pending BYOB pull-intos before close
+          // (close doesn't auto-resolve them; respond(0) path doesn't apply in tee context)
+          if (isByteTee) {
+            try { if (!canceled1 && branch1Controller) branch1Controller[kClosePendingPullIntos]?.(); } catch {}
+            try { if (!canceled2 && branch2Controller) branch2Controller[kClosePendingPullIntos]?.(); } catch {}
+          }
           try {
             if (!canceled1 && branch1Controller) branch1Controller.close();
           } catch {}
           try {
             if (!canceled2 && branch2Controller) branch2Controller.close();
           } catch {}
-          cancelResolve(undefined);
+          // Don't resolve cancelPromise when both branches are already canceled —
+          // the cancel algorithm handles cancelResolve with the source's cancel result.
+          if (!(canceled1 && canceled2)) cancelResolve(undefined);
         },
         (r) => {
           reading = false;
@@ -1270,7 +1321,7 @@ export class FastReadableStream {
           try {
             if (!canceled2 && branch2Controller) branch2Controller.error(r);
           } catch {}
-          cancelResolve(undefined);
+          if (!(canceled1 && canceled2)) cancelResolve(undefined);
         },
       );
     }
@@ -1279,13 +1330,17 @@ export class FastReadableStream {
     reader.closed.then(
       () => {
         // Source closed — close both branches
+        if (isByteTee) {
+          try { if (!canceled1 && branch1Controller) branch1Controller[kClosePendingPullIntos]?.(); } catch {}
+          try { if (!canceled2 && branch2Controller) branch2Controller[kClosePendingPullIntos]?.(); } catch {}
+        }
         try {
           if (!canceled1 && branch1Controller) branch1Controller.close();
         } catch {}
         try {
           if (!canceled2 && branch2Controller) branch2Controller.close();
         } catch {}
-        cancelResolve(undefined);
+        if (!(canceled1 && canceled2)) cancelResolve(undefined);
       },
       (r) => {
         // Source errored — error both branches
@@ -1295,7 +1350,7 @@ export class FastReadableStream {
         try {
           if (!canceled2 && branch2Controller) branch2Controller.error(r);
         } catch {}
-        cancelResolve(undefined);
+        if (!(canceled1 && canceled2)) cancelResolve(undefined);
       },
     );
 

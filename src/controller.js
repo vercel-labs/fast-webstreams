@@ -16,10 +16,12 @@ export const kHasPendingPullInto = Symbol('hasPendingPullInto');
 export const kGetByobRequest = Symbol('getByobRequest');
 export const kReleasePullIntoReads = Symbol('releasePullIntoReads');
 export const kCancelPendingPullIntos = Symbol('cancelPendingPullIntos');
+export const kClosePendingPullIntos = Symbol('closePendingPullIntos');
 export const kWirePullIntoRead = Symbol('wirePullIntoRead');
 export const kTrySyncFillPullInto = Symbol('trySyncFillPullInto');
 export const kEnqueueRemainder = Symbol('enqueueRemainder');
 export const kGetNodeReadable = Symbol('getNodeReadable');
+export const kEnqueueInternal = Symbol('enqueueInternal');
 
 // Shared unwrap helper — used by reader.js, writable.js
 export function unwrapError(err) {
@@ -70,6 +72,25 @@ export class FastReadableStreamDefaultController {
     this.#originalHWM = originalHWM !== undefined ? originalHWM : nodeReadable.readableHighWaterMark;
   }
 
+  /**
+   * Internal enqueue — skips byte validation and buffer.transfer() on the chunk.
+   * Used by tee() where the caller owns the chunk and no transfer is needed.
+   * Still fills pending BYOB pull-into descriptors (for BYOB readers on branches).
+   * Keyed by Symbol to avoid appearing in getOwnPropertyNames (WPT checks prototype shape).
+   */
+  [kEnqueueInternal](chunk) {
+    if (this.#closed || this.#errored) return;
+    if (this._stream && this._stream._isByteStream && chunk != null) {
+      // Fill pending BYOB pull-into descriptors if any
+      if (this.#pendingPullIntos && this.#pendingPullIntos.length > 0) {
+        this.#fillPendingPullIntosFromEnqueue(chunk);
+        return;
+      }
+      this.#byteQueueSize += chunk.byteLength || 0;
+    }
+    this.#nodeReadable.push(chunk);
+  }
+
   enqueue(chunk) {
     if (this.#errored) {
       throw new TypeError('Cannot enqueue to an errored stream');
@@ -79,6 +100,23 @@ export class FastReadableStreamDefaultController {
     }
     // Byte streams: validate and convert per spec
     if (this._stream && this._stream._isByteStream) {
+      // Fast path: Uint8Array with valid buffer, no pending BYOB descriptors.
+      // Covers the common React Flight pattern (start+enqueue with Uint8Array).
+      // Skips SharedArrayBuffer check, zero-length check (both are rare edge cases
+      // that are still caught — transfer() throws on SharedArrayBuffer, and
+      // zero-length buffers have byteLength === 0 which fails the guard).
+      if (chunk instanceof Uint8Array && chunk.byteLength > 0 &&
+          (!this.#pendingPullIntos || this.#pendingPullIntos.length === 0)) {
+        const off = chunk.byteOffset, len = chunk.byteLength;
+        let transferred;
+        try { transferred = chunk.buffer.transfer(); }
+        catch { throw new TypeError('Cannot enqueue a chunk with a non-transferable buffer'); }
+        const u8 = new Uint8Array(transferred, off, len);
+        this.#byteQueueSize += len;
+        this.#nodeReadable.push(u8);
+        return;
+      }
+
       if (ArrayBuffer.isView(chunk)) {
         // Check for detached buffer
         if (chunk.buffer.detached) {
@@ -614,6 +652,15 @@ export class FastReadableStreamDefaultController {
     }
     this.#pendingPullIntos = null;
     this.#byobRequest = null;
+  }
+
+  /**
+   * Close all pending BYOB pull-into descriptors with done:true and proper typed views.
+   * Used by tee close path where respond(0) isn't available.
+   */
+  [kClosePendingPullIntos]() {
+    if (!this.#pendingPullIntos || this.#pendingPullIntos.length === 0) return;
+    this.#processRemainingPullIntosClosed();
   }
 
   /**
