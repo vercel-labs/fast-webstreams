@@ -1,4 +1,5 @@
 import { Suspense } from "react";
+import { setImmediate } from "timers";
 
 async function DataSection({
   id,
@@ -9,10 +10,21 @@ async function DataSection({
   rowCount: number;
   delayMs: number;
 }) {
-  // Real setTimeout to force React to flush separate streaming chunks.
-  // Stagger by id so components resolve at different ticks — without this
-  // React batches everything into one chunk and stream overhead disappears.
-  await new Promise((r) => setTimeout(r, delayMs));
+  // Force React to flush a separate streaming chunk for this boundary.
+  // delay=0: use setImmediate (next I/O tick, ~0.1ms — avoids setTimeout's
+  // 1-15ms timer coalescing overhead while still creating a separate flush).
+  // delay>0: use setTimeout for explicit ms stagger.
+  if (delayMs <= 0) {
+    await new Promise<void>((r) => setImmediate(r));
+  } else {
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+
+  // rows=0: minimal render mode — just a short string, no table.
+  // Minimizes React CPU time to isolate streaming overhead.
+  if (rowCount <= 0) {
+    return <div data-id={id}>s{id}</div>;
+  }
 
   const rows = Array.from({ length: rowCount }, (_, j) => {
     const idx = id * rowCount + j;
@@ -55,18 +67,18 @@ export default async function BenchPage({
 }) {
   const params = await searchParams;
   const count = Math.min(parseInt(params.n || "200"), 500);
-  const rowCount = Math.min(parseInt(params.rows || "20"), 100);
+  const rowCount = parseInt(params.rows || "20");
   // How many distinct resolution times (spreads components across ticks)
   const groups = Math.min(parseInt(params.groups || "50"), count);
-  // Base delay per group in ms
-  const delay = Math.max(parseInt(params.delay || "1"), 1);
+  // Base delay per group in ms (0 = setImmediate, >0 = setTimeout)
+  const delay = parseInt(params.delay || "1");
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 p-8 max-w-4xl mx-auto">
       <h1 className="text-2xl font-bold mb-1">Streaming Benchmark</h1>
       <p className="text-zinc-500 text-sm mb-6">
         {count} Suspense boundaries x {rowCount} rows | {groups} groups x{" "}
-        {delay}ms delay
+        {delay === 0 ? "setImmediate" : `${delay}ms`} delay
       </p>
       {Array.from({ length: count }, (_, i) => (
         <Suspense
@@ -76,7 +88,7 @@ export default async function BenchPage({
           <DataSection
             id={i}
             rowCount={rowCount}
-            delayMs={(i % groups) * delay + 1}
+            delayMs={delay === 0 ? 0 : (i % groups) * delay + 1}
           />
         </Suspense>
       ))}
