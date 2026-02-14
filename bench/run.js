@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const RESULTS_DIR = join(__dirname, 'results');
+const RESULTS_DIR = join(__dirname, '..', 'bench-results');
 
 // Default parameters
 const DEFAULTS = {
@@ -98,6 +98,9 @@ function parseArgs() {
       case 'no-markdown':
         opts.noMarkdown = true;
         break;
+      case 'description':
+        opts.description = value;
+        break;
       default:
         console.error(`Unknown flag: --${key}`);
         process.exit(1);
@@ -123,6 +126,7 @@ Options:
   --total-bytes=BYTES  Total bytes per iteration (default: ${DEFAULTS.totalBytes})
   --json-only          Skip console output, write JSON only
   --no-markdown        Skip markdown output
+  --description=TEXT   Plain-text description stored in the JSON output
   --help, -h           Show this help
 `);
 }
@@ -218,12 +222,13 @@ async function main() {
   }
 
   // Write output files
+  const suffix = opts.scenario ?? 'all';
   console.log('\n' + '='.repeat(62));
-  const jsonPath = await writeJSON(allResults, RESULTS_DIR);
+  const jsonPath = await writeJSON(allResults, RESULTS_DIR, suffix, opts.description);
   console.log(`JSON results: ${jsonPath}`);
 
   if (!opts.noMarkdown) {
-    const mdPath = await writeMarkdown(allResults, RESULTS_DIR);
+    const mdPath = await writeMarkdown(allResults, RESULTS_DIR, suffix);
     console.log(`Markdown report: ${mdPath}`);
   }
 

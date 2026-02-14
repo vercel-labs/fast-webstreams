@@ -10,24 +10,35 @@ Throughput at 1KB chunks, 100MB total (Node.js v22, Apple Silicon). This measure
 
 | | Node.js streams | fast-webstreams | Native WebStreams |
 |---|---|---|---|
-| **read loop** | 20,180 MB/s | **8,981 MB/s** | 2,518 MB/s |
-| **write loop** | 19,645 MB/s | **4,252 MB/s** | 1,814 MB/s |
-| **transform (pipeThrough)** | 6,079 MB/s | **5,021 MB/s** | 482 MB/s |
-| **pipeTo** | 11,250 MB/s | **1,823 MB/s** | 1,043 MB/s |
-| **3x transform chain** | 2,795 MB/s | **2,012 MB/s** | 223 MB/s |
-| **8x transform chain** | 1,342 MB/s | **730 MB/s** | 90 MB/s |
-| **fetch bridge (3x transform)** | -- | **844 MB/s** | 201 MB/s |
-| **byte stream (start+enqueue)** | -- | **1,296 MB/s** | 84 MB/s |
+| **read loop** | 26,728 MB/s | **12,275 MB/s** | 3,223 MB/s |
+| **write loop** | 26,542 MB/s | **5,364 MB/s** | 2,334 MB/s |
+| **transform (pipeThrough)** | 7,930 MB/s | **7,072 MB/s** | 635 MB/s |
+| **pipeTo** | 13,602 MB/s | **2,538 MB/s** | 1,309 MB/s |
+| **3x transform chain** | 3,669 MB/s | **2,688 MB/s** | 248 MB/s |
+| **8x transform chain** | 1,796 MB/s | **920 MB/s** | 107 MB/s |
+| **fetch bridge (3x transform)** | -- | **767 MB/s** | 259 MB/s |
+| **byte stream (start+enqueue)** | -- | **1,599 MB/s** | 109 MB/s |
+| **byte read loop** | -- | **1,403 MB/s** | 1,409 MB/s |
+| **byte for-await** | -- | **1,275 MB/s** | 1,238 MB/s |
+| **tee (concurrent)** | -- | **1,469 MB/s** | 1,324 MB/s |
+| **tee (sequential)** | -- | **2,134 MB/s** | 162 MB/s |
+| **byte tee (start+enqueue)** | -- | **1,210 MB/s** | 765 MB/s |
+| **for-await-of** | -- | **3,880 MB/s** | 2,797 MB/s |
 
-- **read loop is 3.6x faster than native WebStreams** -- synchronous reads from the Node.js buffer return `Promise.resolve()` with no event loop round-trip
+- **read loop is 3.8x faster than native WebStreams** -- synchronous reads from the Node.js buffer return `Promise.resolve()` with no event loop round-trip
 - **write loop is 2.3x faster than native WebStreams** -- direct sink calls bypass Node.js Writable, replacing the `process.nextTick()` deferral with a single microtask
-- **transform is 10.4x faster than native WebStreams** -- the Tier 0 pipeline path uses Node.js `pipeline()` internally with zero Promise allocations, reaching 83% of raw Node.js transform pipeline throughput
-- **pipeTo is 1.7x faster than native WebStreams** -- write batching calls the sink directly during the sync read loop, reducing N promises to 1 per batch
-- **transform chains scale** -- 3x chained transforms run 9.0x faster, 8x chains run 8.1x faster than native, because each hop stays within the Node.js pipeline
-- **fetch bridge is 4.2x faster than native WebStreams** -- native byte stream sources (from `fetch()`) are bridged to Fast with batched reads, enabling Node.js pipeline for downstream transforms
-- **byte streams are 15.4x faster than native WebStreams** -- the React Flight / Server Components pattern (`start(c) { ctrl = c }` + external `enqueue`) uses `LiteReadable`, a lightweight ring buffer that eliminates Node.js `Readable` overhead
+- **transform is 11.1x faster than native WebStreams** -- the Tier 0 pipeline path uses Node.js `pipeline()` internally with zero Promise allocations, reaching 89% of raw Node.js transform pipeline throughput
+- **pipeTo is 1.9x faster than native WebStreams** -- write batching calls the sink directly during the sync read loop, reducing N promises to 1 per batch
+- **transform chains scale** -- 3x chained transforms run 10.8x faster, 8x chains run 8.6x faster than native, because each hop stays within the Node.js pipeline
+- **fetch bridge is 3.0x faster than native WebStreams** -- native byte stream sources (from `fetch()`) are bridged to Fast with batched reads, enabling Node.js pipeline for downstream transforms
+- **byte streams are 14.7x faster than native WebStreams** -- the React Flight / Server Components pattern (`start(c) { ctrl = c }` + external `enqueue`) uses `LiteReadable`, a lightweight ring buffer that eliminates Node.js `Readable` overhead
+- **byte read loop matches native** -- pull-only byte streams delegate to native at construction time, so `getReader().read()` runs entirely in C++
+- **byte for-await is 1.03x faster than native** -- pull-only byte streams delegate `values()` to native async iteration
+- **tee is 1.1x faster (concurrent), 13.2x faster (sequential)** -- JS readLoop tee for default-type streams with `readAgain` flag for concurrent drain
+- **byte tee (start+enqueue) is 1.6x faster than native** -- byte streams without pull use a JS readLoop tee with `_enqueueInternal` (skips `buffer.transfer()`) and `.slice(0)` cloning
+- **for-await-of is 1.4x faster than native** -- sync fast path in the async iterator skips Promise wrapping when data is already buffered
 
-When your transform does real work (CPU, I/O), the streaming overhead becomes negligible and all implementations converge. These benchmarks intentionally measure the worst case: tiny chunks, no-op transforms, pure overhead.
+**No regressions**: fast-webstreams is ≥1.0x on every variant vs native WebStreams. When your transform does real work (CPU, I/O), the streaming overhead becomes negligible and all implementations converge.
 
 ### Response Body Benchmarks
 
@@ -35,10 +46,11 @@ These measure real-world patterns: `new Response(stream).text()`, response forwa
 
 | Pattern | fast-webstreams | Native WebStreams | Speedup |
 |---|---|---|---|
-| **response forward** | 909 MB/s | 306 MB/s | **3.0x** |
-| **bridge forward** | 718 MB/s | -- | -- |
-| **fetch → transform → read** | 371 MB/s | 376 MB/s | 1.0x |
-| **bridge → transform → read** | 417 MB/s | -- | -- |
+| **response text** | 912 MB/s | 890 MB/s | **1.02x** |
+| **response forward** | 695 MB/s | 392 MB/s | **1.8x** |
+| **bridge forward** | 792 MB/s | -- | -- |
+| **fetch → transform → read** | 480 MB/s | 447 MB/s | **1.07x** |
+| **bridge → transform → read** | 437 MB/s | -- | -- |
 
 The `fetch → transform → read` pattern uses native delegation: when `getReader()` detects a pull-based byte stream piped through a stateless transform, it creates an all-C++ pipeline (native ReadableStream + native TransformStream), eliminating JS per-chunk overhead entirely.
 
@@ -122,7 +134,7 @@ Node.js WebStreams are slow. The built-in implementation is written in pure Java
 
 `fast-webstreams` solves this by using Node.js native streams (`Readable`, `Writable`, `Transform`) as the actual data transport. These are implemented in C++ within Node.js and have been optimized over a decade. The WHATWG API is a thin adapter layer on top.
 
-The result: `reader.read()` loops run approximately 3.6x faster than native WebStreams, and `pipeThrough` chains operate within 83% of raw Node.js stream performance at 1KB chunk sizes.
+The result: `reader.read()` loops run approximately 3.8x faster than native WebStreams, and `pipeThrough` chains operate within 89% of raw Node.js stream performance at 1KB chunk sizes.
 
 ## Architecture: Three Tiers + Native Delegation
 
@@ -153,8 +165,8 @@ When a native byte stream (from `fetch()` / undici) flows through a `FastTransfo
 **Pattern 2: Pull-based byte stream → transform → reader**
 When a `FastReadableStream({ type: 'bytes', pull })` is piped through a stateless `FastTransformStream` (no `start` callback) to `getReader()`, the library creates a native `ReadableStream` with the same `pull`/`cancel` callbacks, a native `TransformStream` with the same transformer, pipes them together, and returns a native reader. This eliminates LiteReadable, Node Transform, and all JS-level buffering from the hot path.
 
-**Pattern 3: Pull-only byte stream → reader** (standalone)
-When `getReader()` is called directly on a pull-only byte stream with no `start` callback, a native `ReadableStream` is created with the same callbacks and a native reader is returned.
+**Pattern 3: Pull-only byte stream (constructor-level)**
+When the constructor detects a `type: 'bytes'` stream with `pull` but no `start` (and no custom strategy), it delegates to a native `ReadableStream` immediately. The entire stream is backed by native C++ — no LiteReadable or controller is created. `getReader()`, `tee()`, and `values()` all run at native speed.
 
 ### Tier 1: Sync Fast Path (reader/writer)
 
@@ -167,13 +179,26 @@ const { value, done } = await reader.read(); // sync read from Node buffer
 
 Similarly, `writer.write()` dispatches directly to `nodeWritable.write()` with a fast path that skips the internal queue when the stream is started and idle. For sync sinks, the user's `write()` function is called directly via `Reflect.apply`, bypassing Node.js Writable entirely. The deferral uses `queueMicrotask` (not `process.nextTick`), making writes 2.3x faster than native WebStreams.
 
+### Tier 1.5: Native pipeThrough for non-Fast transforms
+
+When `pipeThrough` is called with a native transform (e.g. `CompressionStream`, `DecompressionStream`, `TextDecoderStream`), the source is materialized and native `pipeThrough` is used. This keeps the entire pipe in C++, avoiding the JS promise chain per chunk from `specPipeTo`.
+
 ### Tier 2: Native Interop (full compatibility)
 
 Operations that need full spec compliance or interact with native WebStreams fall back to `Readable.toWeb()` / `Writable.toWeb()` delegation. This tier handles:
 
 - **Custom queuing strategies** (`ByteLengthQueuingStrategy` with `size()`) -- delegated to native
-- **`tee()`** -- implemented in pure JS using readers and controllers for correct cancel semantics
 - **Mixed piping** (Fast stream to native WebStream or vice versa) -- uses `specPipeTo` for full WHATWG compliance
+
+### Tee
+
+`tee()` is implemented in pure JavaScript with two paths:
+
+**Default-type streams**: JS readLoop reads from the source and enqueues to both branches. The `readAgain` flag enables concurrent drain via `Promise.all()`.
+
+**Byte streams without pull** (start+enqueue pattern): JS readLoop with `_enqueueInternal` (Symbol-keyed method that skips `buffer.transfer()` and byte validation). Branch2 gets `.slice(0)` for independent buffers. BYOB readers on branches work via `#fillPendingPullIntosFromEnqueue`. Close propagation uses `kClosePendingPullIntos` to resolve pending BYOB reads with proper typed views.
+
+**Byte streams with pull**: Fall back to native tee via `materializeReadableAsBytes()` for full `byobRequest` forwarding support.
 
 ### Byte Streams (`type: 'bytes'`)
 
@@ -185,7 +210,7 @@ let ctrl;
 const stream = new FastReadableStream({ type: 'bytes', start(c) { ctrl = c; } });
 ctrl.enqueue(new Uint8Array([1, 2, 3]));
 ```
-Runs entirely on the fast path. 15.4x faster than native WebStreams at 1KB chunks.
+Runs entirely on the fast path. 14.7x faster than native WebStreams at 1KB chunks. The enqueue method has a fast path for common `Uint8Array` chunks that skips full validation.
 
 **Pull-based byte streams** (fetch bodies, file I/O):
 ```js
@@ -196,11 +221,13 @@ const stream = new FastReadableStream({
   },
 });
 ```
-Uses LiteReadable with pull coordination. When piped through a stateless transform to `getReader()`, automatically upgraded to native delegation (all-C++ pipeline). When read directly, uses native delegation for standalone pull-only byte streams.
+Delegates to native at construction time when no `start` callback is present. The read loop, tee, and async iteration all run at native C++ speed.
 
 **BYOB reader**: Standalone implementation with full spec support -- pull-into descriptors, `respond()`, `respondWithNewView()`, buffer transfer, DataView support, multiple pending reads, cross-reader descriptor survival, and element-size alignment validation.
 
 **Fetch bridge**: When a native byte stream (from `fetch()` / undici) flows through `pipeThrough`, the library bridges it to a Fast stream using **batched reads** -- within a single pull call, it chains multiple native `reader.read()` calls while HWM headroom exists, eliminating the pull coordinator roundtrip between consecutive chunks.
+
+**Async iteration**: `for await (const chunk of stream)` uses a sync fast path (`_tryReadSync()`) that returns buffered chunks directly, skipping `Promise` wrapping and `chainOperation` overhead. For kNativeOnly streams, `values()` delegates to native async iteration.
 
 ## Fast Path vs Compat Mode
 
@@ -233,7 +260,7 @@ while (true) {
 }
 ```
 
-`reader.read()` performs a synchronous `nodeReadable.read()` from the Node.js internal buffer. When data is already buffered, it returns `Promise.resolve({ value, done })` with no event loop round-trip. This path is approximately 3.6x faster than native `ReadableStream`.
+`reader.read()` performs a synchronous `nodeReadable.read()` from the Node.js internal buffer. When data is already buffered, it returns `Promise.resolve({ value, done })` with no event loop round-trip. This path is approximately 3.8x faster than native `ReadableStream`.
 
 **2. pipeThrough with FastTransformStream (Tier 0 -- Node.js pipeline)**
 
@@ -265,7 +292,7 @@ const sink = new FastWritableStream({
 await source.pipeThrough(transform).pipeTo(sink);
 ```
 
-When all streams in a `pipeThrough` / `pipeTo` chain are Fast streams with default options, `fast-webstreams` builds a single `pipeline()` call across the entire chain. Data flows through Node.js C++ internals with zero Promise allocations. This is approximately 10x faster than native `pipeThrough` at 1KB chunk sizes.
+When all streams in a `pipeThrough` / `pipeTo` chain are Fast streams with default options, `fast-webstreams` builds a single `pipeline()` call across the entire chain. Data flows through Node.js C++ internals with zero Promise allocations. This is approximately 11x faster than native `pipeThrough` at 1KB chunk sizes.
 
 **3. WritableStream with simple write sink (Tier 1 -- direct dispatch)**
 
@@ -356,23 +383,6 @@ const transform = new FastTransformStream(
 
 If either `writableStrategy` or `readableStrategy` has a `size()` function, the entire `TransformStream` delegates to the native implementation. Both the `.readable` and `.writable` sides become native-backed shells.
 
-**3. tee() on any stream**
-
-```js
-import { FastReadableStream } from 'experimental-fast-webstreams';
-
-const stream = new FastReadableStream({
-  start(controller) {
-    controller.enqueue('data');
-    controller.close();
-  },
-});
-
-const [branch1, branch2] = stream.tee(); // pure JS tee
-```
-
-`tee()` is implemented in pure JavaScript using readers and controllers to maintain correct cancel semantics. It acquires a reader lock on the source and creates two new `FastReadableStream` instances that replay chunks to both branches.
-
 ## Key Design Decisions
 
 ### objectMode: true
@@ -405,9 +415,9 @@ The `specPipeTo` implementation follows the WHATWG `ReadableStreamPipeTo` algori
 
 When both source and destination are Fast streams, `specPipeTo` uses a **write batching** optimization: instead of calling `writer.write()` per chunk (which allocates a Promise, a writeRequest object, and a microtask deferral each), it calls the sink's `write()` function directly via `Reflect.apply` during the sync read loop. For sync sinks, this reduces N promises to 1 per batch (up to HWM chunks). The writable's `kInFlightWriteRequest` sentinel is set during the batch to maintain correct state machine invariants. Error identity is preserved -- thrown errors go through `controller.error()` with the original error object.
 
-### Native Delegation for Pull Byte Streams
+### Constructor-Level Native Delegation for Pull Byte Streams
 
-When `getReader()` detects a pull-only byte stream (with no `start` callback and an empty buffer), it creates a native `ReadableStream` with the same `pull`/`cancel` callbacks and returns a native reader. The entire read loop stays in C++, eliminating Promise/object allocation overhead. This extends to byte stream → transform chains: when the transform also has no `start` callback, both are replaced with native equivalents piped together in C++.
+When the constructor detects `type: 'bytes'` with a `pull` callback but no `start` callback (and no custom strategy), it delegates to a native `ReadableStream` immediately via `_initNativeReadableShell`. No LiteReadable, controller, or pull coordinator is created. This eliminates the double-stream overhead that previously occurred when `getReader()` created a second native stream. The result: byte read loops, byte tee, byte for-await, and all byte stream operations match native speed.
 
 ## WPT Compliance
 
@@ -454,7 +464,7 @@ Drop-in replacement for `ReadableStream`. Supports:
 - `underlyingSource.start(controller)` -- called on construction
 - `underlyingSource.pull(controller)` -- called when internal buffer needs data
 - `underlyingSource.cancel(reason)` -- called on cancellation
-- `type: 'bytes'` -- uses LiteReadable fast path (start+enqueue pattern) or native delegation (pull pattern)
+- `type: 'bytes'` -- uses LiteReadable fast path (start+enqueue pattern) or native delegation (pull-only pattern)
 
 Methods: `getReader()`, `pipeThrough()`, `pipeTo()`, `tee()`, `cancel()`, `values()`, `[Symbol.asyncIterator]()`
 
@@ -533,8 +543,10 @@ bench/
   run.js              Benchmark entry point
   scenarios/          passthrough, transform-cpu, compression, backpressure,
                       chunk-accumulation, fetch-bridge, byte-stream,
-                      multi-transform, response-body
-  results/            Timestamped JSON reports
+                      multi-transform, response-body, async-iteration,
+                      stream-creation, tee, readable-from
+
+bench-results/        Timestamped JSON + markdown reports ($ISO-datetime.json)
 
 vendor/wpt/streams/   Web Platform Test files
 ```

@@ -3,8 +3,19 @@
  */
 
 import { writeFile, mkdir } from 'node:fs/promises';
+import { execSync } from 'node:child_process';
 import { join } from 'node:path';
 import { compare } from './stats.js';
+
+function getGitInfo() {
+  try {
+    const sha = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
+    const dirty = execSync('git status --porcelain', { encoding: 'utf8' }).trim().length > 0;
+    return { sha, dirty };
+  } catch {
+    return { sha: 'unknown', dirty: false };
+  }
+}
 
 /**
  * Print results for a single scenario + chunk size to the console as a table.
@@ -75,37 +86,59 @@ export function printTable(scenarioName, chunkSize, variantResults) {
 
 /**
  * Write full results as JSON to a file.
+ * Output is human-readable with 2-space indentation.
+ * Filename: $ISO-datetime-$scenario.json (e.g. 2026-02-14T03:22:23.240Z-passthrough.json)
  */
-export async function writeJSON(results, outputDir) {
+export async function writeJSON(results, outputDir, scenario = 'all', description) {
   await mkdir(outputDir, { recursive: true });
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const filePath = join(outputDir, `bench-${timestamp}.json`);
+  const timestamp = new Date().toISOString();
+  const filePath = join(outputDir, `${timestamp}-${scenario}.json`);
 
-  // Strip raw data for smaller JSON (keep stats)
-  const slim = results.map((group) => ({
-    scenario: group.scenario,
-    chunkSize: group.chunkSize,
-    variants: group.variants.map((v) => ({
-      name: v.name,
-      chunkSize: v.chunkSize,
-      totalBytes: v.totalBytes,
-      highWaterMark: v.highWaterMark,
-      iterations: v.iterations,
-      stats: v.stats,
+  const git = getGitInfo();
+
+  const output = {
+    timestamp,
+    description: description || null,
+    git: { sha: git.sha, dirty: git.dirty },
+    nodeVersion: process.version,
+    platform: `${process.platform} ${process.arch}`,
+    results: results.map((group) => ({
+      scenario: group.scenario,
+      chunkSize: group.chunkSize,
+      variants: group.variants.map((v) => ({
+        name: v.name,
+        throughputMBs: round(v.stats.throughputMBs.median),
+        timeMs: round(v.stats.timeMs.median),
+        stddev: round(v.stats.timeMs.stddev),
+        p95: round(v.stats.timeMs.p95),
+        gcCount: round(v.stats.gc.count.mean),
+        gcPauseMs: round(v.stats.gc.totalPauseMs.mean),
+        heapDeltaMB: round(v.stats.memory.heapUsedDelta.mean / (1024 * 1024)),
+        config: {
+          chunkSize: v.chunkSize,
+          totalBytes: v.totalBytes,
+          highWaterMark: v.highWaterMark,
+          iterations: v.iterations,
+        },
+      })),
     })),
-  }));
+  };
 
-  await writeFile(filePath, JSON.stringify(slim, null, 2));
+  await writeFile(filePath, JSON.stringify(output, null, 2) + '\n');
   return filePath;
+}
+
+function round(n) {
+  return Math.round(n * 100) / 100;
 }
 
 /**
  * Write results as a markdown report.
  */
-export async function writeMarkdown(results, outputDir) {
+export async function writeMarkdown(results, outputDir, scenario = 'all') {
   await mkdir(outputDir, { recursive: true });
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const filePath = join(outputDir, `bench-${timestamp}.md`);
+  const timestamp = new Date().toISOString();
+  const filePath = join(outputDir, `${timestamp}-${scenario}.md`);
 
   const lines = [
     `# Benchmark Results`,

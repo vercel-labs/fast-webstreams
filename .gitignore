@@ -1,6 +1,6 @@
 node_modules/
-bench/results/*.json
-bench/results/*.md
+bench-results/
 todo/
 .vercel
 .next/
+bench/results/

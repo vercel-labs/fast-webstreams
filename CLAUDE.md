@@ -71,18 +71,49 @@ npm run bench
 
 ### Comparing before/after
 
-Results are saved to `bench/results/` as JSON. To compare, run the benchmark before and after your change at the same chunk size, and compare the `fast-*` variant throughput relative to the `web-*` baseline (not absolute numbers, which vary with system load).
+Results are saved to `bench-results/` as readable JSON. Filenames are `$ISO-datetime-$scenario.json` (e.g. `2026-02-14T03:22:23.240Z-passthrough.json` or `2026-02-14T04:01:22.406Z-all.json`).
+
+**Always use `--description` to document what is being tested.** This is stored in the JSON and makes it possible to understand results later.
+
+To compare before/after a change:
+
+```bash
+# 1. Run benchmark BEFORE your change
+node --expose-gc bench/run.js --scenario=passthrough --chunk-size=1024 --iterations=7 --warmup=3 --no-markdown \
+  --description="baseline before optimizing byte tee"
+
+# 2. Make your change
+
+# 3. Run benchmark AFTER your change (same flags)
+node --expose-gc bench/run.js --scenario=passthrough --chunk-size=1024 --iterations=7 --warmup=3 --no-markdown \
+  --description="after byte tee JS readLoop optimization"
+
+# 4. Compare the two most recent JSON files in bench-results/
+#    Look at throughputMBs for fast-* variants relative to web-* baselines.
+#    Absolute numbers vary with system load — compare ratios, not absolutes.
+```
+
+Each JSON file contains `timestamp`, `description`, `git` (`sha`, `dirty`), `nodeVersion`, `platform`, and a `results` array. Each result has `scenario`, `chunkSize`, and `variants` with `name`, `throughputMBs`, `timeMs`, `stddev`, `p95`, `gcCount`, `gcPauseMs`, `heapDeltaMB`.
+
+### Performance invariant
+
+**No regressions vs native**: every `fast-*` variant must be ≥1.0x throughput vs its `web-*` counterpart. If a benchmark shows fast < web, either fix the regression or fall back to native for that code path.
 
 ### Current performance targets (1KB chunks)
 
 | Variant | Throughput | vs Native |
 |---------|-----------|-----------|
-| `fast-pipeThrough` | ~5000-6700 MB/s | ~10x faster |
-| `fast-read-loop` | ~8000-11000 MB/s | ~3x faster |
-| `fast-pipeTo` | ~1700-2400 MB/s | ~2x faster |
-| `fast-response-forward` | ~1100-1250 MB/s | ~3x faster |
-| `fast-bridge-forward` | ~700 MB/s | ~1.8x faster |
-| `fast-write-loop` | ~3800-5300 MB/s | ~2.5x faster |
+| `fast-pipeThrough` | ~7,000 MB/s | ~11x faster |
+| `fast-read-loop` | ~12,000 MB/s | ~3.8x faster |
+| `fast-pipeTo` | ~2,500 MB/s | ~1.9x faster |
+| `fast-write-loop` | ~5,400 MB/s | ~2.3x faster |
+| `fast-for-await` | ~3,900 MB/s | ~1.4x faster |
+| `fast-response-forward` | ~700-1,200 MB/s | ~1.8x faster |
+| `fast-byte-tee-enqueue` | ~1,200 MB/s | ~1.6x faster |
+| `fast-start-enqueue` | ~1,600 MB/s | ~14.7x faster |
+| `fast-tee-read` | ~1,400 MB/s | ~1.1x faster |
+| `fast-byte-read-loop` | ~1,400 MB/s | ~1.0x (matches native) |
+| `fast-byte-for-await` | ~1,300 MB/s | ~1.0x (matches native) |
 
 ## Architecture
 
