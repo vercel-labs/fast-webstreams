@@ -4,19 +4,36 @@ WHATWG ReadableStream/WritableStream/TransformStream backed by Node.js streams f
 
 ## Testing
 
-### All tests (run before committing)
+**Run all three checks before committing — unit tests, WPT, lint/knip:**
 
 ```bash
-npm test
+pnpm run test:unit                # Unit tests (185/185 must pass)
+pnpm run test:wpt                 # WPT spec compliance (1100/1116 must pass)
+pnpm run lint                     # Biome lint
+pnpm run knip                     # Unused exports/dependencies
 ```
 
-This runs `node --test test/*.test.js` (custom tests) then `node test/run-wpt.js --mode=fast` (WPT spec compliance).
+Or all at once:
+
+```bash
+npm test                          # unit tests + WPT
+```
+
+**IMPORTANT**: Always run `pnpm run test:unit` during development, not just WPT. Unit tests catch regressions in fetch integration, body locking, Response construction, pipeThrough chains, and byte stream pipelines that WPT doesn't cover.
+
+### Unit tests
+
+```bash
+pnpm run test:unit                # All unit tests (185 tests)
+```
+
+Baseline: **185/185 pass, 0 fail**. Any change must maintain this.
 
 ### WPT (Web Platform Tests) — spec compliance
 
 ```bash
-npm run test:wpt                  # Fast mode
-npm run test:wpt:native           # Native baseline
+pnpm run test:wpt                 # Fast mode
+pnpm run test:wpt:native          # Native baseline
 
 # Filter to a specific test area
 node test/run-wpt.js --mode=fast --filter=piping
@@ -30,10 +47,11 @@ node test/run-wpt-file.js native vendor/wpt/streams/piping/close-propagation-for
 
 Baseline: **1100/1116 fast, 1099/1116 native**. Any change must maintain 1100 fast.
 
-### Custom tests only
+### Lint and knip
 
 ```bash
-npm run test:unit
+pnpm run lint                     # Biome check on src/
+pnpm run knip                     # Unused exports (vendor/ is excluded)
 ```
 
 ## Benchmarking

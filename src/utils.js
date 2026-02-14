@@ -19,10 +19,10 @@ export const noop = () => {};
 export const isThenable = (v) => v instanceof Promise || (v != null && typeof v.then === 'function');
 export const RESOLVED_UNDEFINED = Promise.resolve(undefined);
 
-// Instance checks
-export const isFastReadable = (s) => s != null && kNodeReadable in s;
-export const isFastWritable = (s) => s != null && kNodeWritable in s;
-export const isFastTransform = (s) => s != null && kNodeTransform in s;
+// Instance checks (typeof guard: `in` throws on primitives)
+export const isFastReadable = (s) => s != null && typeof s === 'object' && kNodeReadable in s;
+export const isFastWritable = (s) => s != null && typeof s === 'object' && kNodeWritable in s;
+export const isFastTransform = (s) => s != null && typeof s === 'object' && kNodeTransform in s;
 
 // Extract highWaterMark from a strategy, converting via ToNumber per spec.
 // WHATWG default is CountQueuingStrategy with highWaterMark = 1.

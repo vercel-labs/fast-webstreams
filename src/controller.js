@@ -17,10 +17,10 @@ export const kGetByobRequest = Symbol('getByobRequest');
 export const kReleasePullIntoReads = Symbol('releasePullIntoReads');
 export const kCancelPendingPullIntos = Symbol('cancelPendingPullIntos');
 export const kClosePendingPullIntos = Symbol('closePendingPullIntos');
-export const kWirePullIntoRead = Symbol('wirePullIntoRead');
+const kWirePullIntoRead = Symbol('wirePullIntoRead');
 export const kTrySyncFillPullInto = Symbol('trySyncFillPullInto');
 export const kEnqueueRemainder = Symbol('enqueueRemainder');
-export const kGetNodeReadable = Symbol('getNodeReadable');
+const kGetNodeReadable = Symbol('getNodeReadable');
 export const kEnqueueInternal = Symbol('enqueueInternal');
 
 // Shared unwrap helper — used by reader.js, writable.js

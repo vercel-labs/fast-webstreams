@@ -1444,7 +1444,12 @@ export class FastReadableStream {
   }
 
   get locked() {
-    if (this[kNativeOnly] && this[kMaterialized] && this[kMaterialized] !== this) return this[kMaterialized].locked;
+    if (this[kNativeOnly]) {
+      // Self-referential shell (patch.js): native internal slots on `this` — use native getter
+      if (this[kMaterialized] === this) return _nativeLockedGetter.call(this);
+      // Wrapper shell: delegate to the wrapped native stream
+      if (this[kMaterialized]) return this[kMaterialized].locked;
+    }
     return this[kLock] !== null;
   }
 
