@@ -26,6 +26,7 @@ export const isFastTransform = (s) => s != null && typeof s === 'object' && kNod
 
 // Extract highWaterMark from a strategy, converting via ToNumber per spec.
 // WHATWG default is CountQueuingStrategy with highWaterMark = 1.
+// Clamps Infinity to 0x7fffffff (Node.js Readable/Writable/Transform don't accept Infinity).
 export function resolveHWM(strategy, defaultHWM = 1) {
   if (!strategy) return defaultHWM;
   if (!('highWaterMark' in strategy)) return defaultHWM;
@@ -33,7 +34,7 @@ export function resolveHWM(strategy, defaultHWM = 1) {
   if (Number.isNaN(h) || h < 0) {
     throw new RangeError('Invalid highWaterMark');
   }
-  return h;
+  return h === Infinity ? 0x7fffffff : h;
 }
 
 /**
@@ -214,7 +215,6 @@ export const _stats = {
   nativeOnlyWritable: 0,
   nativeOnlyTransform: 0,
   tier0_pipeline: 0,
-  tier05_upstream: 0,
   tier1_getReader: 0,
   tier2_specPipeTo: 0,
   tier2_materializeReadable: 0,

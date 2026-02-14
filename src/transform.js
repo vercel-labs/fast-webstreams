@@ -114,8 +114,8 @@ export class FastTransformStream {
 
     const nodeTransform = new Transform({
       objectMode: true,
-      readableHighWaterMark: readableHWM === Infinity ? 0x7fffffff : readableHWM,
-      writableHighWaterMark: writableHWM === Infinity ? 0x7fffffff : writableHWM,
+      readableHighWaterMark: readableHWM,
+      writableHighWaterMark: writableHWM,
       transform(chunk, encoding, callback) {
         const doTransform = () => {
           if (!transform) {

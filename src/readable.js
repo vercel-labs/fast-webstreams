@@ -1,9 +1,18 @@
 /**
  * FastReadableStream — WHATWG ReadableStream API backed by Node.js Readable.
  *
- * Tier 0: pipeTo/pipeThrough between Fast streams → pipeline() internally
- * Tier 1: getReader().read() → sync read from Node buffer
- * Tier 2: tee(), native interop → Readable.toWeb() delegation
+ * Tier 0:   pipeThrough + pipeTo between Fast streams → Node.js pipeline(), zero promises
+ * Tier 0.5: Upstream chain exists but can't use pipeline → retroactive specPipeTo per hop
+ * Tier 1:   getReader().read() → sync read from Node buffer via Promise.resolve()
+ * Tier 1.5: pipeThrough with non-Fast transform (e.g. CompressionStream) → native pipeThrough
+ * Tier 2:   Mixed piping, custom strategies → specPipeTo or Readable.toWeb()/Writable.toWeb()
+ *
+ * Constructor-level native delegation:
+ *   type:'bytes' + pull + no start → delegates to native ReadableStream immediately
+ *
+ * Tee:
+ *   Default-type and byte streams without pull → JS readLoop with _enqueueInternal
+ *   Byte streams with pull → native tee via materializeReadableAsBytes
  */
 
 import { pipeline, Readable } from 'node:stream';
@@ -150,6 +159,72 @@ function _isWritableStream(obj) {
   if (obj == null) return false;
   if (typeof obj !== 'object' && typeof obj !== 'function') return false;
   return isFastWritable(obj) || obj instanceof NativeWritableStream;
+}
+
+/**
+ * Bolt Fast prototype methods onto a native stream instance.
+ * Used by the constructor (for autoAllocateChunkSize/custom-size byte streams)
+ * and by patch.js (for _PatchedReadableStream byte streams with pull).
+ *
+ * @param {object} target - The native stream to augment
+ * @param {boolean} conditionalPipe - If true, pipeTo/pipeThrough fall back to
+ *   native when the counterpart is not a Fast stream. Used by patch.js where
+ *   the target has native internal slots that native pipeTo/pipeThrough need.
+ */
+export function _boltFastMethods(target, conditionalPipe) {
+  target.getReader = function(opts) { return FastReadableStream.prototype.getReader.call(this, opts); };
+  target.tee = function() { return FastReadableStream.prototype.tee.call(this); };
+  target.cancel = function(r) { return FastReadableStream.prototype.cancel.call(this, r); };
+  target._cancelInternal = FastReadableStream.prototype._cancelInternal;
+  target.values = function(opts) { return FastReadableStream.prototype.values.call(this, opts); };
+  target[Symbol.asyncIterator] = FastReadableStream.prototype[Symbol.asyncIterator];
+  if (conditionalPipe) {
+    target.pipeTo = function(dest, opts) {
+      if (!isFastWritable(dest)) return NativeReadableStream.prototype.pipeTo.call(this, dest, opts);
+      return FastReadableStream.prototype.pipeTo.call(this, dest, opts);
+    };
+    target.pipeThrough = function(t, opts) {
+      if (!isFastTransform(t)) return NativeReadableStream.prototype.pipeThrough.call(this, t, opts);
+      return FastReadableStream.prototype.pipeThrough.call(this, t, opts);
+    };
+  } else {
+    target.pipeTo = function(dest, opts) { return FastReadableStream.prototype.pipeTo.call(this, dest, opts); };
+    target.pipeThrough = function(t, opts) { return FastReadableStream.prototype.pipeThrough.call(this, t, opts); };
+  }
+  const lockedDesc = Object.getOwnPropertyDescriptor(FastReadableStream.prototype, 'locked');
+  if (lockedDesc) {
+    Object.defineProperty(target, 'locked', {
+      get() { return lockedDesc.get.call(this); },
+      configurable: true,
+    });
+  }
+}
+
+/**
+ * Parse and validate pipe options (shared by pipeTo and pipeThrough).
+ * Accesses option getters in spec order (alphabetical per Web IDL).
+ */
+function _parsePipeOptions(options) {
+  let preventAbort = false,
+    preventCancel = false,
+    preventClose = false,
+    signal;
+  if (options !== undefined && options !== null && (typeof options === 'object' || typeof options === 'function')) {
+    preventAbort = !!options.preventAbort;
+    preventCancel = !!options.preventCancel;
+    preventClose = !!options.preventClose;
+    signal = options.signal;
+  }
+  if (signal !== undefined) {
+    try {
+      if (signal === null || typeof signal !== 'object' || typeof signal.aborted !== 'boolean') {
+        throw new TypeError('options.signal must be an AbortSignal');
+      }
+    } catch {
+      throw new TypeError('options.signal must be an AbortSignal');
+    }
+  }
+  return { preventAbort, preventCancel, preventClose, signal };
 }
 
 /**
@@ -390,7 +465,10 @@ function fastPipelineTo(source, dest, signal) {
  */
 export function _initNativeReadableShell(target, nativeStream) {
   _stats.nativeOnlyReadable++;
-  // Property order must match FastReadableStream constructor for monomorphic hidden class
+  // V8 hidden class alignment: property order and set must match
+  // FastReadableStream constructor exactly. This ensures native-only shells
+  // and Fast streams share the same hidden class, keeping inline caches
+  // monomorphic in functions that handle both types.
   target[kNodeReadable] = null;
   target[kLock] = null;
   target[kMaterialized] = nativeStream;
@@ -406,8 +484,12 @@ export function _initNativeReadableShell(target, nativeStream) {
   target._byteSource = null;
   target._pullLock = null;
   target._pullFn = null;
+  target._pipelineDemand = false;
   target._onChunkRead = null;
   target._byteStreamSyncPull = false;
+  target._nativeSource = null;
+  target._nativeSourceWritable = null;
+  target._upstreamWritable = null;
   return target;
 }
 
@@ -426,30 +508,6 @@ function _bridgeNativeToFast_fromStream(nativeStream) {
       return nativeReader.read().then(function pump({ value, done }) {
         if (done) { controller.close(); return; }
         controller.enqueue(value);
-        if (controller.desiredSize > 0) {
-          return nativeReader.read().then(pump);
-        }
-      });
-    },
-    cancel(reason) {
-      return nativeReader.cancel(reason);
-    },
-  }, { highWaterMark: 64 });
-}
-
-function _bridgeNativeToFast(nativeOnlyStream) {
-  _stats.bridge++;
-  const nativeStream = materializeReadable(nativeOnlyStream);
-  const nativeReader = nativeStream.getReader();
-  return new FastReadableStream({
-    pull(controller) {
-      return nativeReader.read().then(function pump({ value, done }) {
-        if (done) { controller.close(); return; }
-        controller.enqueue(value);
-        // Batch: drain native reader while HWM headroom exists.
-        // Chains reads within a single pull call, eliminating the
-        // pull coordinator roundtrip (queueMicrotask + read(0) + pullFn)
-        // between consecutive chunks.
         if (controller.desiredSize > 0) {
           return nativeReader.read().then(pump);
         }
@@ -524,21 +582,7 @@ export class FastReadableStream {
         const native = new NativeReadableStream(underlyingSource, strategy);
         const shell = Object.create(native);
         _initNativeReadableShell(shell, native);
-        shell.getReader = function(opts) { return FastReadableStream.prototype.getReader.call(this, opts); };
-        shell.pipeTo = function(dest, opts) { return FastReadableStream.prototype.pipeTo.call(this, dest, opts); };
-        shell.pipeThrough = function(t, opts) { return FastReadableStream.prototype.pipeThrough.call(this, t, opts); };
-        shell.tee = function() { return FastReadableStream.prototype.tee.call(this); };
-        shell.cancel = function(r) { return FastReadableStream.prototype.cancel.call(this, r); };
-        shell._cancelInternal = FastReadableStream.prototype._cancelInternal;
-        shell.values = function(opts) { return FastReadableStream.prototype.values.call(this, opts); };
-        shell[Symbol.asyncIterator] = FastReadableStream.prototype[Symbol.asyncIterator];
-        const lockedDesc = Object.getOwnPropertyDescriptor(FastReadableStream.prototype, 'locked');
-        if (lockedDesc) {
-          Object.defineProperty(shell, 'locked', {
-            get() { return lockedDesc.get.call(this); },
-            configurable: true,
-          });
-        }
+        _boltFastMethods(shell, false);
         return shell;
       }
       // Otherwise: use fast Node.js path, mark as byte-capable
@@ -617,7 +661,7 @@ export class FastReadableStream {
         }
       }
       try {
-        const result = pull.call(underlyingSource, controller);
+        const result = Reflect.apply(pull, underlyingSource, [controller]);
         if (isThenable(result)) {
           stream._pullLock = result;
           result.then(
@@ -770,30 +814,7 @@ export class FastReadableStream {
         throw new TypeError('pipeTo destination must be a WritableStream');
       }
 
-      // Access option getters in spec order (alphabetical per Web IDL)
-      let preventAbort = false,
-        preventCancel = false,
-        preventClose = false,
-        signal;
-      if (options !== undefined && options !== null) {
-        if (typeof options !== 'object' && typeof options !== 'function') {
-          throw new TypeError('options must be an object');
-        }
-        preventAbort = !!options.preventAbort;
-        preventCancel = !!options.preventCancel;
-        preventClose = !!options.preventClose;
-        signal = options.signal;
-      }
-
-      if (signal !== undefined) {
-        try {
-          if (signal === null || typeof signal !== 'object' || typeof signal.aborted !== 'boolean') {
-            throw new TypeError('options.signal must be an AbortSignal');
-          }
-        } catch {
-          throw new TypeError('options.signal must be an AbortSignal');
-        }
-      }
+      const { preventAbort, preventCancel, preventClose, signal } = _parsePipeOptions(options);
 
       // Tier 0: kNativeOnly source → delegate to native pipeTo (C++ speed)
       // Use NativeReadableStream.prototype.pipeTo directly to avoid recursion
@@ -804,6 +825,7 @@ export class FastReadableStream {
         return NativeReadableStream.prototype.pipeTo.call(nativeSrc, nativeDst, { preventAbort, preventCancel, preventClose, signal });
       }
 
+      // Per spec: pipeTo returns rejected promise (not throw) for lock checks
       if (this[kLock]) {
         return Promise.reject(new TypeError('ReadableStream is locked'));
       }
@@ -898,6 +920,7 @@ export class FastReadableStream {
       throw new TypeError('transform.writable must be a WritableStream');
     }
 
+    // Per spec: pipeThrough throws synchronously (not rejected promise) for lock checks
     if (this[kLock]) {
       throw new TypeError('ReadableStream is locked');
     }
@@ -906,27 +929,7 @@ export class FastReadableStream {
       throw new TypeError('WritableStream is locked');
     }
 
-    // Eagerly access option getters per Web IDL (alphabetical order)
-    let preventAbort = false,
-      preventCancel = false,
-      preventClose = false,
-      signal;
-    if (options !== undefined && options !== null && (typeof options === 'object' || typeof options === 'function')) {
-      preventAbort = !!options.preventAbort;
-      preventCancel = !!options.preventCancel;
-      preventClose = !!options.preventClose;
-      signal = options.signal;
-    }
-
-    if (signal !== undefined) {
-      try {
-        if (signal === null || typeof signal !== 'object' || typeof signal.aborted !== 'boolean') {
-          throw new TypeError('options.signal must be an AbortSignal');
-        }
-      } catch {
-        throw new TypeError('options.signal must be an AbortSignal');
-      }
-    }
+    const { preventAbort, preventCancel, preventClose, signal } = _parsePipeOptions(options);
 
     // Tier 0: kNativeOnly source → deferred resolution for transform
     if (this[kNativeOnly]) {

@@ -940,9 +940,6 @@ export function _closeFromWriter(stream) {
 }
 
 /**
- * Get the desiredSize for the stream.
- */
-/**
  * Initialize a native-only writable shell (delegates everything to native WritableStream).
  */
 export function _initNativeWritableShell(target, nativeStream) {

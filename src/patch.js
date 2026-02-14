@@ -13,7 +13,7 @@
  */
 
 import { FastReadableStream, FastTransformStream, FastWritableStream } from './index.js';
-import { _initNativeReadableShell } from './readable.js';
+import { _initNativeReadableShell, _boltFastMethods } from './readable.js';
 import {
   NativeByteLengthQueuingStrategy,
   NativeCountQueuingStrategy,
@@ -74,29 +74,7 @@ function _PatchedReadableStream(underlyingSource, strategy) {
     // per-object, not inherited. Instead, add Fast methods directly.
     const native = new NativeReadableStream(underlyingSource, strategy);
     _initNativeReadableShell(native, native);
-    native.getReader = function(opts) { return FastReadableStream.prototype.getReader.call(this, opts); };
-    // Delegate to native when counterpart isn't Fast — this object has native
-    // internal slots so native pipeThrough/pipeTo work correctly.
-    native.pipeTo = function(dest, opts) {
-      if (!isFastWritable(dest)) return NativeReadableStream.prototype.pipeTo.call(this, dest, opts);
-      return FastReadableStream.prototype.pipeTo.call(this, dest, opts);
-    };
-    native.pipeThrough = function(t, opts) {
-      if (!isFastTransform(t)) return NativeReadableStream.prototype.pipeThrough.call(this, t, opts);
-      return FastReadableStream.prototype.pipeThrough.call(this, t, opts);
-    };
-    native.tee = function() { return FastReadableStream.prototype.tee.call(this); };
-    native.cancel = function(r) { return FastReadableStream.prototype.cancel.call(this, r); };
-    native._cancelInternal = FastReadableStream.prototype._cancelInternal;
-    native.values = function(opts) { return FastReadableStream.prototype.values.call(this, opts); };
-    native[Symbol.asyncIterator] = FastReadableStream.prototype[Symbol.asyncIterator];
-    const lockedDesc = Object.getOwnPropertyDescriptor(FastReadableStream.prototype, 'locked');
-    if (lockedDesc) {
-      Object.defineProperty(native, 'locked', {
-        get() { return lockedDesc.get.call(this); },
-        configurable: true,
-      });
-    }
+    _boltFastMethods(native, true);
     return native;
   }
   return new FastReadableStream(underlyingSource, strategy);

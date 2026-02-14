@@ -237,24 +237,8 @@ export class FastReadableStreamDefaultController {
         this.#byteQueueSize += rest.byteLength;
         this.#nodeReadable.push(rest);
       }
-      // Schedule re-pull for partial fill (double-deferred: first microtask waits
-      // for pullLock to clear, second microtask triggers the actual re-pull)
       if (d._resolve) {
-        const controller = this;
-        queueMicrotask(() => {
-          queueMicrotask(() => {
-            if (d._resolve === null) return;
-            if (controller.#closed || controller.#errored) return;
-            const stream = controller._stream;
-            if (!stream || !stream._pullFn) return;
-            const nr = controller.#nodeReadable;
-            if (nr && !nr.destroyed && nr._onRead && !nr._readableState.ended) {
-              if (stream._pullLock) return;
-              nr._readableState.reading = false;
-              nr.read(0);
-            }
-          });
-        });
+        this.#scheduleDeferredRepull(d);
       }
     }
   }
@@ -295,6 +279,30 @@ export class FastReadableStreamDefaultController {
         break;
       }
     }
+  }
+
+  /**
+   * Schedule a double-deferred re-pull for a pending BYOB descriptor.
+   * First microtask waits for sync pullLock to clear, second triggers the pull.
+   * @param {object|null} descriptor - The descriptor to check, or null to check the first pending one.
+   */
+  #scheduleDeferredRepull(descriptor) {
+    const controller = this;
+    queueMicrotask(() => {
+      queueMicrotask(() => {
+        const d = descriptor || controller.#pendingPullIntos?.[0];
+        if (!d || d._resolve === null) return;
+        if (controller.#closed || controller.#errored) return;
+        const stream = controller._stream;
+        if (!stream || !stream._pullFn) return;
+        const nr = controller.#nodeReadable;
+        if (nr && !nr.destroyed && nr._onRead && !nr._readableState.ended) {
+          if (stream._pullLock) return;
+          nr._readableState.reading = false;
+          nr.read(0);
+        }
+      });
+    });
   }
 
   /**
@@ -532,39 +540,11 @@ export class FastReadableStreamDefaultController {
           // After commit, trigger pull for remaining pending descriptors
           if (controller.#pendingPullIntos && controller.#pendingPullIntos.length > 0 &&
               controller.#pendingPullIntos[0]._resolve) {
-            queueMicrotask(() => {
-              queueMicrotask(() => {
-                const next = controller.#pendingPullIntos?.[0];
-                if (!next || next._resolve === null) return;
-                if (controller.#closed || controller.#errored) return;
-                const stream = controller._stream;
-                if (!stream || !stream._pullFn) return;
-                const nr = controller.#nodeReadable;
-                if (nr && !nr.destroyed && nr._onRead && !nr._readableState.ended) {
-                  if (stream._pullLock) return;
-                  nr._readableState.reading = false;
-                  nr.read(0);
-                }
-              });
-            });
+            controller.#scheduleDeferredRepull(null);
           }
         } else if (d._resolve) {
-          // Partial respond with pending descriptor: double-deferred re-pull
-          // (first microtask waits for sync pullLock to clear, second triggers pull)
-          queueMicrotask(() => {
-            queueMicrotask(() => {
-              if (d._resolve === null) return;
-              if (controller.#closed || controller.#errored) return;
-              const stream = controller._stream;
-              if (!stream || !stream._pullFn) return;
-              const nr = controller.#nodeReadable;
-              if (nr && !nr.destroyed && nr._onRead && !nr._readableState.ended) {
-                if (stream._pullLock) return;
-                nr._readableState.reading = false;
-                nr.read(0);
-              }
-            });
-          });
+          // Partial respond — schedule re-pull
+          controller.#scheduleDeferredRepull(d);
         }
       }
     };
@@ -616,6 +596,9 @@ export class FastReadableStreamDefaultController {
         controller.#commitPullIntoDescriptor(d);
         controller.#pendingPullIntos.shift();
         controller.#processRemainingPullIntos();
+        // Note: no re-pull trigger here (unlike respond()). respondWithNewView
+        // replaces the entire buffer, so partial fills don't apply and the caller
+        // is responsible for providing the complete data in the new view.
       }
     };
 
