@@ -503,6 +503,17 @@ export class FastReadableStream {
 
     // Validate type
     if (type === 'bytes') {
+      // Pure-pull byte streams (no start, no custom size, no autoAllocate):
+      // Delegate entirely to native. The read loop stays in C++ with zero
+      // JS-layer overhead. Avoids creating a LiteReadable + controller that
+      // getReader() would immediately discard in favor of a native stream.
+      // Streams with start() are excluded because the user saves the controller
+      // for external enqueue (React Flight pattern) — these need our fast path.
+      if (pull && !start && !strategySize && underlyingSource.autoAllocateChunkSize === undefined) {
+        _initNativeReadableShell(this, new NativeReadableStream(underlyingSource, strategy));
+        return;
+      }
+
       // Delegate to native only when the pull callback needs a real
       // ReadableByteStreamController (byobRequest/respond/respondWithNewView),
       // or when autoAllocateChunkSize or custom size() is used.
@@ -951,6 +962,18 @@ export class FastReadableStream {
     if (isDefaultOpts && isFastTransform(transform)) {
       readable[kUpstream] = this;
       readable._upstreamWritable = writable; // for retroactive specPipeTo
+      return readable;
+    }
+
+    // Tier 1.5: Non-Fast transform with native readable/writable (e.g. CompressionStream).
+    // Materialize the source and use native pipeThrough — keeps entire pipe in C++,
+    // avoiding the JS promise chain per chunk from specPipeTo.
+    if (!isFastReadable(readable) && !isFastWritable(writable)) {
+      const nativeSrc = materializeReadable(this);
+      NativeReadableStream.prototype.pipeThrough.call(nativeSrc,
+        { writable, readable },
+        { preventAbort, preventCancel, preventClose, signal },
+      );
       return readable;
     }
 
@@ -1427,6 +1450,11 @@ export class FastReadableStream {
 
   // Async iteration support — uses our reader for proper cancel wiring
   values(options) {
+    // For kNativeOnly streams, delegate to native values() for C++ iterator speed
+    if (this[kNativeOnly]) {
+      return NativeReadableStream.prototype.values.call(materializeReadable(this), options);
+    }
+
     const preventCancel = !!(options && options.preventCancel);
     const reader = this.getReader();
 

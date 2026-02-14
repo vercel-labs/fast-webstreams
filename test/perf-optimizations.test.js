@@ -759,7 +759,6 @@ describe('opt5: byte stream pipeline via LiteReadable wrapper', () => {
         if (i >= N) { c.close(); return; }
         c.enqueue(i++);
       },
-      type: 'bytes',
     });
 
     const t1 = new FastTransformStream({
