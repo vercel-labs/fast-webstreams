@@ -37,6 +37,9 @@ const REDUCED_TOTAL = {
   compression: 10 * 1024 * 1024,     // 10MB for compression (CompressionStream is slow at small chunks)
   'byte-stream': 50 * 1024 * 1024,   // 50MB for byte-stream (pre-buffered, memory-heavy)
   'response-body': 20 * 1024 * 1024, // 20MB for response-body (avoids string concat GC)
+  'tee': 20 * 1024 * 1024,           // 20MB for tee (doubles memory)
+  'stream-creation': 10 * 1024 * 1024, // 10MB for stream-creation (count = totalBytes/chunkSize)
+  'readable-from': 20 * 1024 * 1024, // 20MB for readable-from (array variants pre-allocate)
 };
 
 // Smart filtering: skip combinations that don't make sense
@@ -47,6 +50,10 @@ const CHUNK_FILTERS = {
   'multi-transform': (chunkSize) => chunkSize >= 1024,                           // Skip < 1KB (per-chunk overhead dominates)
   'response-body': (chunkSize) => chunkSize <= 65536,                            // ≤64KB (fetch-transform needs small chunks; text concat at 1MB is trivially fast)
   'byte-stream': (chunkSize) => chunkSize >= 1024,                               // Skip < 1KB (pre-buffering tiny Uint8Arrays not representative)
+  'async-iteration': (chunkSize) => chunkSize <= 16384,                            // Iterator overhead negligible at 64KB+
+  'stream-creation': (chunkSize) => chunkSize === 1024,                            // chunkSize only controls stream count
+  'tee': (chunkSize) => chunkSize >= 1024,                                         // Skip tiny chunks
+  'readable-from': (chunkSize) => chunkSize <= 65536,                              // Trivial at 1MB
 };
 
 function parseArgs() {

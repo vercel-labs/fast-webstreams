@@ -11,6 +11,10 @@ import fetchBridge from './fetch-bridge.js';
 import byteStream from './byte-stream.js';
 import multiTransform from './multi-transform.js';
 import responseBody from './response-body.js';
+import asyncIteration from './async-iteration.js';
+import streamCreation from './stream-creation.js';
+import tee from './tee.js';
+import readableFrom from './readable-from.js';
 
 const scenarios = [
   passthrough,
@@ -22,6 +26,10 @@ const scenarios = [
   byteStream,
   multiTransform,
   responseBody,
+  asyncIteration,
+  streamCreation,
+  tee,
+  readableFrom,
 ];
 
 export const scenarioMap = new Map(scenarios.map((s) => [s.name, s]));

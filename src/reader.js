@@ -359,6 +359,21 @@ export class FastReadableStreamDefaultReader {
         nodeReadable._readableState.reading = false;
       }
       nodeReadable.read(0);
+
+      // If close happened synchronously during read(0) (e.g., tee close propagation),
+      // resolve immediately instead of waiting for nextTick 'end' event.
+      if (nodeReadable.readableEnded || nodeReadable.destroyed) {
+        cleanup();
+        removePending();
+        if (stream._errored) {
+          reject(stream._storedError);
+        } else if (nodeReadable.errored) {
+          reject(unwrapError(nodeReadable.errored));
+        } else {
+          resolve(DONE_RESULT);
+        }
+        return;
+      }
     });
   }
 

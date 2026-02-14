@@ -1226,21 +1226,31 @@ export class FastReadableStream {
     );
 
     let reading = false;
+    let readAgain = false;
     function readLoop() {
-      if (reading) return RESOLVED_UNDEFINED;
+      if (reading) {
+        readAgain = true;
+        // Return undefined (not RESOLVED_UNDEFINED) — RESOLVED_UNDEFINED is a thenable
+        // which would cause the branch's pullFn to set pullLock and schedule infinite
+        // re-reads via microtasks while reading is still true.
+        return;
+      }
       reading = true;
       // Use _readWithCallbacks to avoid {value,done} objects in promise resolution.
       // Promise.resolve({value,done}) triggers ECMAScript thenable check on the object,
       // which is observable when Object.prototype.then is patched (WPT then-interception test).
       return reader._readWithCallbacks(
         (value) => {
-          reading = false;
+          const ra = readAgain;
+          readAgain = false;
           try {
             if (!canceled1 && branch1Controller) branch1Controller.enqueue(value);
           } catch {}
           try {
             if (!canceled2 && branch2Controller) branch2Controller.enqueue(value);
           } catch {}
+          reading = false;
+          if (ra) readLoop();
         },
         () => {
           reading = false;
