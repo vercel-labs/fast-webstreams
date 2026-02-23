@@ -54,6 +54,10 @@ These measure real-world patterns: `new Response(stream).text()`, response forwa
 
 The `fetch → transform → read` pattern uses native delegation: when `getReader()` detects a pull-based byte stream piped through a stateless transform, it creates an all-C++ pipeline (native ReadableStream + native TransformStream), eliminating JS per-chunk overhead entirely.
 
+## Requirements
+
+- Node.js >= 20.19.0
+
 ## Installation
 
 ```bash
