@@ -483,6 +483,7 @@ export function _initNativeReadableShell(target, nativeStream) {
   target._controller = null;
   target._byteSource = null;
   target._pullLock = null;
+  target._pullAgain = false;
   target._pullFn = null;
   target._pipelineDemand = false;
   target._onChunkRead = null;
@@ -640,9 +641,12 @@ export class FastReadableStream {
       }
       if (stream._pullLock) {
         // Async pull in progress (Promise): always wait for it to complete.
-        // Per spec, pull must not be called again until its promise fulfills.
-        // The .then() handler will trigger read(0) when the pull resolves.
-        if (stream._pullLock !== true) return;
+        // Per spec ([[pullAgain]]), pull must not be called again until its
+        // promise fulfills. Mark _pullAgain so the .then() handler re-pulls.
+        if (stream._pullLock !== true) {
+          stream._pullAgain = true;
+          return;
+        }
         // Sync pull lock (true): only block auto-pulls with no HWM headroom.
         // Demand-driven reader.read() bypasses sync lock (pull already completed).
         if (useLite && nodeReadable._isAutoPull && controller.desiredSize !== null && controller.desiredSize <= 0) return;
@@ -667,11 +671,20 @@ export class FastReadableStream {
           result.then(
             () => {
               stream._pullLock = null;
-              nodeReadable._readableState.reading = false;
-              if (!nodeReadable.destroyed) nodeReadable.read(0);
+              // Per spec [[pullAgain]]: only re-pull if something requested
+              // a pull while the previous one was in progress (e.g., enqueue
+              // triggered maybeReadMore, or reader.read() called read(0)).
+              // Without this guard, the .then() → read(0) → pullFn chain
+              // creates an infinite microtask loop.
+              if (stream._pullAgain) {
+                stream._pullAgain = false;
+                nodeReadable._readableState.reading = false;
+                if (!nodeReadable.destroyed) nodeReadable.read(0);
+              }
             },
             (err) => {
               stream._pullLock = null;
+              stream._pullAgain = false;
               if (!nodeReadable.destroyed) controller.error(err);
             },
           );
@@ -728,6 +741,7 @@ export class FastReadableStream {
     this._isByteStream = type === 'bytes';
     this._byteSource = type === 'bytes' ? underlyingSource : null;
     this._pullLock = null;
+    this._pullAgain = false;
     this._pullFn = pullFn;
     this._pipelineDemand = false;
 
